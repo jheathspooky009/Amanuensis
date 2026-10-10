@@ -1,0 +1,8 @@
+# Changes to these paths need a review from the maintainer.
+# (Turn on "Require review from Code Owners" in the branch protection rules.)
+*                      @jheathspooky009
+/.github/              @jheathspooky009
+/scripts/              @jheathspooky009
+/amanuensis.spec       @jheathspooky009
+/pyproject.toml        @jheathspooky009
+/uv.lock               @jheathspooky009

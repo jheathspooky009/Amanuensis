@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default. No job in this file needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Syntax, lint and code security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Syntax check (py_compile)
+        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py
+
+      - name: Lint check (pyflakes)
+        run: uv run pyflakes Amanuensis.py scripts/security_check.py
+
+      # Medium and high severity findings fail the build. The low findings
+      # (random numbers used for typing delays, best-effort try/except) are
+      # expected in this app and are not security problems.
+      - name: Code security scan (bandit)
+        run: uvx bandit@1.9.4 -q -ll -r Amanuensis.py scripts
+
+  repo-hygiene:
+    name: Personal data and secrets check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Run the repository security check
+        run: python scripts/security_check.py
+
+  dependency-audit:
+    name: Dependency vulnerability scan
+    # Windows, because that is where the app runs and where the release is built.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Export the locked dependency list
+        run: uv export --locked --no-emit-project -o requirements-audit.txt
+
+      - name: Scan for known vulnerabilities (pip-audit)
+        run: uvx pip-audit@2.10.1 -r requirements-audit.txt --no-deps --disable-pip --progress-spinner off

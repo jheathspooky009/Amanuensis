@@ -1,0 +1,89 @@
+name: Release
+
+# Releases are ONLY built here, on GitHub's own machines, from a pushed tag.
+# Never upload an .exe you built on your own computer.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: windows-latest
+    permissions:
+      contents: write       # create the GitHub Release and attach files
+      id-token: write       # lets GitHub sign the build attestation
+      attestations: write   # stores the build attestation
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked
+
+      - name: Repository security check (also checks the tag matches the app version)
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: uv run python scripts/security_check.py --tag "$TAG_NAME"
+
+      - name: Scan dependencies for known vulnerabilities
+        shell: bash
+        run: |
+          uv export --locked --no-emit-project -o requirements-audit.txt
+          uvx pip-audit@2.10.1 -r requirements-audit.txt --no-deps --disable-pip --progress-spinner off
+
+      - name: Build executable
+        run: uv run pyinstaller amanuensis.spec
+
+      - name: Write SHA-256 checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum amanuensis.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create build attestation (proves GitHub built this file from this repo)
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/amanuensis.exe
+
+      # Optional. Skipped until the maintainer adds two repository secrets:
+      # GPG_PRIVATE_KEY (armored private key) and GPG_PASSPHRASE.
+      - name: Sign the checksums with GPG (only if a signing key is configured)
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "No GPG key configured, so no GPG signature is made for this release."
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --armor --detach-sign --output dist/SHA256SUMS.txt.asc dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: |
+            dist/amanuensis.exe
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.asc

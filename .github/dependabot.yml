@@ -1,0 +1,15 @@
+# Dependabot opens pull requests when a dependency or a GitHub Action has a
+# newer version or a security fix. Review each one before merging.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

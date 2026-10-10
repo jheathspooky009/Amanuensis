@@ -1,0 +1,54 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyInstaller build output (amanuensis.spec itself stays tracked).
+# Never publish a locally built .exe. Releases are built by GitHub Actions.
+build/
+dist/
+*.exe
+*.part
+
+# IDE
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Amanuensis runtime data. These files are created by the app on your own
+# computer and can hold folder names, file names, or pieces of your text.
+# They must never be committed.
+profiles/
+last_settings.json
+resume_state.json
+resume_state.json.tmp
+*.csv
+*.log
+input.txt
+_pasted_input.txt
+amanuensis_log_*
+amanuensis_mistakes*.txt
+
+# Local-only agent notes
+AGENTS.md
+
+# Secrets and keys. Nothing in this project needs them, so keep them out.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.gpg
+*.asc
+!maintainer-public-key.asc
+secrets.*
+credentials.*
