@@ -9,6 +9,12 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.0.1 (2026-10-10) -- Guard invalid saved settings (bugfix)
+#   - Fixed: Malformed or non-dictionary saved settings/profile JSON is now
+#     ignored instead of crashing the app or leaving a broken state behind.
+#   - Fixed: Invalid saved values are skipped when applying a profile so the
+#     app falls back to safe defaults without disrupting the current session.
+#
 # v5.0.0 (2026-10-10) -- Public release preparation (Update #25, major)
 #   - Added: Safer logs. Exported session logs now stop spreadsheet programs
 #     from running log text as a formula, and the log records only the input
@@ -44,25 +50,6 @@
 #     background thread. No dialog appears while a run is active. If the
 #     repository is private, GitHub answers 404 and the check reports that no
 #     public release was found.
-#
-# v4.3.0 (2026-10-09) -- Leave Mistakes For Me (Update #24)
-#   - Added: "Leave Mistakes For Me" card on the Mistakes tab. When on, the
-#     typer purposely leaves a few mistakes in the text for the person to
-#     fix by hand: typos (wrong, swapped, doubled, or missing letters, and
-#     words run together), missing commas, and missing punctuation (end
-#     periods, ? and !, apostrophes). Off by default.
-#   - Added: A "Mistakes Left For You" report window that opens when the run
-#     ends (or is stopped). It lists every mistake with its line number and
-#     what is on screen versus what it should be. It can be copied or saved
-#     as a .txt file, and reopened with "View Last Mistake List".
-#   - Added: A live "Mistakes left" count in the status line during a run.
-#   - Added: Five new settings, each wired into validate_settings(), the
-#     settings dict, both snapshot functions, and the Reset This Section list.
-#   - Notes: Mistakes are chosen before typing starts, spread across the
-#     file, and never touch [[protected text]], web addresses, emails, paths,
-#     numbers, or pause-marker spots. Sentence reworks skip the words around
-#     a left mistake, so the typer never "fixes" it by accident. On a resumed
-#     run only the mistakes left in the current session are listed.
 # ============================================
 
 import pyautogui
@@ -4047,7 +4034,11 @@ def get_current_settings_snapshot():
 def apply_settings_snapshot(data, include_files=True):
     """Puts saved settings into the window. include_files=False ignores the
     folder paths in the data (the batch queue), which is what loading a
-    shared profile does."""
+    shared profile does. Malformed or non-dictionary data is ignored so a
+    damaged profile or hand-edited settings file cannot crash the app."""
+    if not isinstance(data, dict):
+        return
+
     min_delay_var.set(data.get("min_delay", "0.05"))
     max_delay_var.set(data.get("max_delay", "0.15"))
     hotkey_start_var.set(data.get("hotkey_start", "f8"))
@@ -4092,7 +4083,7 @@ def apply_settings_snapshot(data, include_files=True):
     enable_update_check_var.set(bool(data.get("enable_update_check", True)))
     skipped_update_version_var.set(str(data.get("skipped_update_version", "")))
     saved_theme = data.get("theme", "light")
-    if saved_theme in ("light", "dark"):
+    if isinstance(saved_theme, str) and saved_theme in ("light", "dark"):
         theme_var.set(saved_theme)
         if "btn_theme_toggle" in globals():
             btn_theme_toggle.configure(text=f"Theme: {saved_theme.capitalize()}")
@@ -5557,7 +5548,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.0.1",
+        "date": "2026-10-10",
+        "title": "Guard invalid saved settings",
+        "changes": [
+            "Fixed: malformed or non-dictionary saved settings/profile JSON is ignored instead of crashing the app.",
+            "Fixed: invalid saved profile values are skipped before applying them, so the app falls back to safe defaults.",
+        ],
+    },
+    {
         "version": "5.0.0",
+
         "date": "2026-10-10",
         "title": "Public release preparation",
         "changes": [
