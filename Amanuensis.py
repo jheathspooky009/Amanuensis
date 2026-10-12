@@ -9,6 +9,14 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.2.0 (2026-10-12) -- Resume across sessions (Update #18)
+#   - Added: resume_state.json v2 format with atomic writes (.tmp + os.replace)
+#     and thread safety, storing progress per file keyed by canonical path.
+#   - Added: SHA-256 prefix hash validation to detect if text before the saved
+#     checkpoint was edited, and automatic checkpoint autosave at sentence ends.
+#   - Added: Saved progress status label and "Clear Saved Progress" button in the
+#     Input File card with confirmation dialog and trace auto-refresh.
+#
 # v5.1.0 (2026-10-11) -- Target time till completion (Update #27)
 #   - Added: A "Target Time" card on the Speed tab. Pick how long the whole run
 #     should take (hours and minutes). Amanuensis fills the spare time with
@@ -30,12 +38,6 @@
 #     missing or its version does not match the tag. CI also checks on every
 #     pull request that the notes can be built.
 #   - Notes: No change to how the app works, no new settings, no new packages.
-#
-# v5.0.1 (2026-10-10) -- Guard invalid saved settings (bugfix)
-#   - Fixed: Malformed or non-dictionary saved settings/profile JSON is now
-#     ignored instead of crashing the app or leaving a broken state behind.
-#   - Fixed: Invalid saved values are skipped when applying a profile so the
-#     app falls back to safe defaults without disrupting the current session.
 # ============================================
 
 import pyautogui
@@ -4914,11 +4916,42 @@ def refresh_resume_status():
     if saved_at_str:
         try:
             saved_dt = datetime.fromisoformat(saved_at_str)
-            date_str = f" (saved {saved_dt.strftime('%b %d, %I:%M %p')})"
+            time_part = saved_dt.strftime("%I:%M %p").lstrip("0")
+            date_str = f" (saved {saved_dt.strftime('%b')} {saved_dt.day}, {time_part})"
         except Exception:
             date_str = ""
 
     resume_status_var.set(f"Saved progress: {pct_str}'{file_name}'{date_str}.")
+
+
+def clear_saved_progress():
+    """Clear resume progress entries for the current queue or single input file,
+    after asking the user for confirmation. Does nothing while typing is running."""
+    if state.is_running:
+        return
+
+    queue_files = get_queue_files()
+    if queue_files:
+        if not messagebox.askyesno(
+            "Clear Saved Progress?",
+            f"Clear saved progress for all {len(queue_files)} queued files?",
+        ):
+            return
+        for fpath in queue_files:
+            clear_resume_state(fpath)
+    else:
+        input_path = input_path_var.get().strip()
+        if not input_path:
+            return
+        file_name = os.path.basename(input_path)
+        if not messagebox.askyesno(
+            "Clear Saved Progress?",
+            f"Clear saved progress for '{file_name}'?",
+        ):
+            return
+        clear_resume_state(input_path)
+
+    refresh_resume_status()
 
 
 # --------------------------------------------
@@ -6063,6 +6096,18 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.2.0",
+        "date": "2026-10-12",
+        "title": "Resume across sessions",
+        "changes": [
+            "Added: resume_state.json v2 format storing typing progress per file, keyed by normalized path.",
+            "Added: SHA-256 prefix hash validation to detect if text before the stopping point changed.",
+            "Added: autosave checkpoint at sentence-ending punctuation (. ! ? and newlines) while typing, so recovery works even if the app closes unexpectedly.",
+            "Added: saved progress status line and Clear Saved Progress button with confirmation in the Input File card.",
+            "Added: atomic writes using temporary files and a background-thread lock to prevent file corruption.",
+        ],
+    },
+    {
         "version": "5.1.0",
         "date": "2026-10-11",
         "title": "Target time till completion",
@@ -6504,6 +6549,12 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+modern_label(frame_file, textvariable=resume_status_var, kind="muted", wraplength=420).grid(
+    row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
+)
+modern_button(frame_file, "Clear Saved Progress", clear_saved_progress, kind="neutral").grid(
+    row=12, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
 
 
 # --- Target window lock ---
@@ -7018,6 +7069,9 @@ for _section_name, _section_card in SECTION_CARDS.items():
 # loops. Auto-save happens on close via on_close(), registered below.
 calculate_window_sizes()
 load_last_settings()
+input_path_var.trace_add("write", lambda *args: refresh_resume_status())
+file_queue_var.trace_add("write", lambda *args: refresh_resume_status())
+refresh_resume_status()
 apply_hotkeys()
 window.protocol("WM_DELETE_WINDOW", on_close)
 window.after(UPDATE_STARTUP_DELAY_MS, run_startup_update_check)
