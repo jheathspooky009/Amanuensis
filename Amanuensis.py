@@ -9,47 +9,33 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.1.0 (2026-10-11) -- Target time till completion (Update #27)
+#   - Added: A "Target Time" card on the Speed tab. Pick how long the whole run
+#     should take (hours and minutes). Amanuensis fills the spare time with
+#     long "session breaks" at paragraph or sentence starts, so a longer target
+#     means longer, more spread out breaks (an hour or more at a time).
+#   - Added: Break lengths adjust as the run goes, so the run finishes close to
+#     the target. The pre-start estimate describes the plan, and a warning
+#     appears when the target is shorter than the typing time.
+#   - Added: Three new settings (enable, hours, minutes).
+#   - Notes: Preview ignores the target. Amanuensis never types faster than the
+#     speed settings, so a target that is too short cannot be reached. Keep the
+#     computer awake during a long run, and use Target Window Lock.
+#
+# v5.0.2 (2026-10-11) -- Release notes from version history (maintenance)
+#   - Added: The GitHub release description is now written automatically from
+#     the newest VERSION_HISTORY entry (scripts/release_notes.py), so the code,
+#     the app's History tab, and the release page always match.
+#   - Modified: A release now stops before publishing if the newest entry is
+#     missing or its version does not match the tag. CI also checks on every
+#     pull request that the notes can be built.
+#   - Notes: No change to how the app works, no new settings, no new packages.
+#
 # v5.0.1 (2026-10-10) -- Guard invalid saved settings (bugfix)
 #   - Fixed: Malformed or non-dictionary saved settings/profile JSON is now
 #     ignored instead of crashing the app or leaving a broken state behind.
 #   - Fixed: Invalid saved values are skipped when applying a profile so the
 #     app falls back to safe defaults without disrupting the current session.
-#
-# v5.0.0 (2026-10-10) -- Public release preparation (Update #25, major)
-#   - Added: Safer logs. Exported session logs now stop spreadsheet programs
-#     from running log text as a formula, and the log records only the input
-#     file's name instead of its full folder path.
-#   - Added: Saved profiles no longer include folder paths (the input file
-#     and the batch queue), and loading a profile ignores them, so a profile
-#     can be shared without leaking local folder names.
-#   - Modified: A damaged or hand-edited settings or profile file is now
-#     rejected with a message (or quietly ignored at startup) instead of
-#     crashing the app. The update prompt re-checks the GitHub address right
-#     before opening it in the browser.
-#   - Fixed: Removed an unused variable that made the pyflakes check in CI
-#     report a warning.
-#   - Notes: No new settings and no new packages. Repository work for the
-#     public release lives outside this file: SECURITY.md, CONTRIBUTING.md,
-#     scripts/security_check.py, dependency and code scanning in CI, release
-#     checksums and build attestations, and a stricter .gitignore.
-#
-# v4.4.0 (2026-10-10) -- Update prompts (Update #25)
-#   - Added: "Updates" card on the Data tab. When on, the app asks GitHub for
-#     the newest release a few seconds after it starts. "Check for Updates
-#     Now" checks on demand and always shows an answer.
-#   - Added: An update prompt with Download Update, Visit GitHub Page, Skip
-#     This Version, and Later. Download saves the new .exe as a separate file
-#     (next to the app when possible, otherwise in Downloads), checks it
-#     against GitHub's published SHA-256, and never replaces or restarts the
-#     app. Running from source only offers the GitHub page.
-#   - Added: Two new settings (enable_update_check, skipped_update_version),
-#     each wired into validate_settings(), the settings dict, both snapshot
-#     functions, and the Reset This Section list ("Updates").
-#   - Notes: Standard library only (urllib), no new package. HTTPS to GitHub
-#     hosts only, and redirects elsewhere are refused. Network work runs on a
-#     background thread. No dialog appears while a run is active. If the
-#     repository is private, GitHub answers 404 and the check reports that no
-#     public release was found.
 # ============================================
 
 import pyautogui
@@ -167,6 +153,9 @@ class TyperState:
         self.clean_text = ""  # set by type_text() after parse_input_markers(); used by stop_typing()
         self.left_mistakes = []  # mistakes purposely left in the text this run (Update #24)
         self.left_mistakes_resumed = False  # True if a resumed file may hide earlier-session mistakes
+        self.blocked_seconds = 0.0  # total time paused by the person, auto-pause, or lost focus (Update #27)
+        self.target_end_time = 0.0  # when the run should finish under a target time (0 = no target)
+        self.session_breaks_left = 0  # long session breaks still ahead in the current file
 
 
 state = TyperState()
@@ -1738,8 +1727,11 @@ def _activity_watcher(sensitivity):
             break
 
         # During countdown, the user is switching to the target window -- don't pause,
-        # just keep updating last_pos to the user's cursor position.
-        if state.status.startswith("Starting in") or state.status == "Countdown...":
+        # just keep updating last_pos to the user's cursor position. The same goes for
+        # a long session break (target time): the person is expected to be away or
+        # busy, and may click back into the document when the break is ending.
+        if (state.status.startswith("Starting in") or state.status == "Countdown..."
+                or state.status.startswith("Session break")):
             try:
                 last_pos = pyautogui.position()
             except Exception:
@@ -1769,6 +1761,244 @@ def _activity_watcher(sensitivity):
             log_event("activity_pause", f"mouse moved {dist:.1f}px")
             run_on_main_thread(lambda: btn_pause.configure(text="Resume Typing"))
             last_pos = curr_pos
+
+
+# --------------------------------------------
+# TARGET TIME TILL COMPLETION (Update #27)
+# --------------------------------------------
+# The person picks how long the whole run should take. Amanuensis first
+# estimates how long the typing itself will take. The spare time that is left
+# goes into long "session breaks", the way a person writes a long piece over
+# several sittings instead of in one go. A longer target means longer breaks
+# (an hour or more at a time for a target of several hours).
+#
+# How it works:
+#   1. plan_session_breaks() runs once before typing starts. It decides how
+#      many breaks there are, where they happen (paragraph starts first, then
+#      sentence starts), and how big each break is compared to the others
+#      (its "weight").
+#   2. Right before each break, compute_session_break_seconds() works out its
+#      real length from the time that is actually left. If typing ran slower or
+#      faster than estimated, the later breaks absorb the difference, so the
+#      run finishes close to the target.
+#   3. Time the person spends paused is not counted against the target.
+#
+# Safety rules (do not weaken these):
+#   * A break never happens inside [[protected text]].
+#   * Amanuensis never types faster than the speed settings. A target that is
+#     shorter than the typing time simply cannot be reached.
+#   * Preview runs ignore the target, so a preview never waits for hours.
+TARGET_TIME_MIN_SECONDS = 60.0
+TARGET_TIME_MAX_HOURS = 48
+SESSION_BREAK_MIN_BUDGET_SECONDS = 120.0  # spare time needed before any break is planned
+SESSION_BREAK_MIN_SECONDS = 30.0  # a break that would be shorter than this is skipped
+SESSION_BREAK_MAX_SECONDS = 6 * 3600.0  # no single break is longer than this
+SESSION_BREAK_MAX_COUNT = 60
+SESSION_BREAK_EDGE_FRACTION = 0.03  # keep breaks away from the very start and very end
+SESSION_BREAK_RESUME_SECONDS = 10  # warning countdown after a break when no window is locked
+SESSION_PACE_MIN_ESTIMATE_SECONDS = 60.0  # too little typing so far to judge the pace
+
+
+def format_duration_text(seconds):
+    """Turns seconds into short text such as '45s', '12m 05s', or '7h 30m'."""
+    total = max(int(seconds + 0.5), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def estimate_active_seconds(text, settings, protection_mask, pause_map, start, end):
+    """Rough typing time for text[start:end], using the same estimate as the
+    pre-start time estimate. Inline {{pause:N}} markers inside the range count
+    too. Session breaks are NOT included, because they are what is being planned."""
+    if end <= start:
+        return 0.0
+    segment = text[start:end]
+    segment_mask = protection_mask[start:end]
+    marker_seconds = sum(secs for pos, secs in pause_map.items() if start <= pos < end)
+    _words, _chars, seconds = estimate_typing_time(segment, settings, segment_mask, marker_seconds)
+    return seconds
+
+
+def plan_session_break_count(spare_seconds):
+    """How many long breaks to plan for this much spare time. The count grows
+    with the square root of the spare time, so a longer target gets more breaks
+    and each break is longer too (about 5 breaks for 1 hour of spare time and
+    about 11 for 6 hours)."""
+    if spare_seconds < SESSION_BREAK_MIN_BUDGET_SECONDS:
+        return 0
+    minutes = spare_seconds / 60.0
+    count = int(round(0.6 * (minutes ** 0.5)))
+    return min(max(count, 1), SESSION_BREAK_MAX_COUNT)
+
+
+def _session_break_whitespace_before(text, index):
+    """Looks at the run of whitespace just before `index`. Returns how many
+    newlines it holds and the character right before the run."""
+    newline_count = 0
+    cursor = index
+    while cursor > 0 and text[cursor - 1].isspace():
+        cursor -= 1
+        if text[cursor] == "\n":
+            newline_count += 1
+    previous_char = text[cursor - 1] if cursor > 0 else ""
+    return newline_count, previous_char
+
+
+def _session_break_is_real_sentence_end(punct, previous_token):
+    """False when a period only ends an abbreviation ("Dr.", "e.g."), a single
+    initial, a list number, or a web address, so a break never lands there."""
+    if not punct.endswith("."):
+        return True  # ! and ? always end a sentence
+    token = previous_token.strip(SMART_TRAILING_PUNCT + "([\"'").lower()
+    if not token:
+        return False
+    if token in SMART_ABBREVIATIONS or token in SMART_ROMAN_NUMERALS:
+        return False
+    if len(token) == 1 and token.isalpha():
+        return False
+    if "." in token or _smart_looks_technical(token):
+        return False
+    return True
+
+
+def find_session_break_candidates(text, protection_mask, start_index):
+    """Finds the places where a person would naturally stop for a while.
+    Returns (paragraph_starts, sentence_starts). Each number is the index of the
+    first character of the next paragraph or sentence, and the break happens
+    just before that character is typed. Spots inside [[protected text]], near
+    the very start or end, or in the middle of a hard-wrapped line are skipped."""
+    paragraph_starts = []
+    sentence_starts = []
+    text_length = len(text)
+    edge = int((text_length - start_index) * SESSION_BREAK_EDGE_FRACTION)
+    first_allowed = start_index + edge
+    last_allowed = text_length - 1 - edge
+    for index, punct, previous_token in _smart_sentence_starts(text):
+        if index <= first_allowed or index > last_allowed or index >= text_length:
+            continue
+        if protection_mask[index - 1] and protection_mask[index]:
+            continue  # inside protected text
+        newline_count, previous_char = _session_break_whitespace_before(text, index)
+        if newline_count > 0:
+            # A new paragraph: a blank line, or a line that ended a sentence.
+            # A single newline after a word is a hard-wrapped line, so skip it.
+            if newline_count >= 2 or previous_char in ".!?:\"'\u201d\u2019)":
+                paragraph_starts.append(index)
+        elif punct and _session_break_is_real_sentence_end(punct, previous_token):
+            sentence_starts.append(index)
+    return paragraph_starts, sentence_starts
+
+
+def _nearest_unused_position(candidates, ideal, used, max_distance):
+    """The candidate closest to `ideal` that is not already used, or None if
+    there is none (or none within max_distance, when a limit is given)."""
+    best = None
+    best_distance = None
+    for candidate in candidates:
+        if candidate in used:
+            continue
+        distance = abs(candidate - ideal)
+        if max_distance is not None and distance > max_distance:
+            continue
+        if best is None or distance < best_distance:
+            best = candidate
+            best_distance = distance
+    return best
+
+
+def choose_session_break_positions(paragraph_starts, sentence_starts, count, start_index, text_length, rng=random):
+    """Picks where the breaks go. They are spread across the text with some
+    random jitter, snapped to a paragraph start when one is close and to a
+    sentence start otherwise. Fewer breaks than `count` are returned when the
+    text has too few good spots."""
+    span = text_length - start_index
+    pool = sorted(set(paragraph_starts) | set(sentence_starts))
+    count = min(count, len(pool))
+    if count <= 0 or span <= 0:
+        return []
+    gap = span / (count + 1)
+    used = set()
+    for number in range(1, count + 1):
+        ideal = start_index + gap * number + rng.uniform(-0.3, 0.3) * gap
+        pick = _nearest_unused_position(paragraph_starts, ideal, used, 0.45 * gap)
+        if pick is None:
+            pick = _nearest_unused_position(pool, ideal, used, None)
+        # Never put two breaks right next to each other.
+        if pick is not None and all(abs(pick - other) >= 0.25 * gap for other in used):
+            used.add(pick)
+    return sorted(used)
+
+
+def make_session_break_weights(count, rng=random):
+    """Relative size of each break. Most are ordinary and some are much
+    longer, like a meal, a walk, or sleeping on it. With four or more breaks
+    at least one is a long one."""
+    weights = []
+    any_long = False
+    for _ in range(count):
+        weight = max(rng.lognormvariate(0.0, 0.45), 0.3)
+        if rng.random() < 0.25:
+            weight *= 2.5
+            any_long = True
+        weights.append(weight)
+    if count >= 4 and not any_long:
+        weights[rng.randrange(count)] *= 2.5
+    return weights
+
+
+def plan_session_breaks(text, protection_mask, pause_map, settings, start_index, target_seconds, rng=random):
+    """Plans the long session breaks for one file. Returns (breaks, spare_seconds,
+    typing_seconds). `breaks` is a list of {"position", "weight"} dicts in text
+    order. It is empty when the target leaves no spare time (or the text has no
+    good place to stop)."""
+    typing_seconds = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, start_index, len(text)
+    )
+    spare_seconds = target_seconds - typing_seconds
+    count = plan_session_break_count(spare_seconds)
+    if count == 0:
+        return [], spare_seconds, typing_seconds
+    paragraph_starts, sentence_starts = find_session_break_candidates(text, protection_mask, start_index)
+    positions = choose_session_break_positions(
+        paragraph_starts, sentence_starts, count, start_index, len(text), rng
+    )
+    weights = make_session_break_weights(len(positions), rng)
+    breaks = [{"position": position, "weight": weight} for position, weight in zip(positions, weights)]
+    return breaks, spare_seconds, typing_seconds
+
+
+def compute_session_break_seconds(text, settings, protection_mask, pause_map, start_index, position,
+                                  target_seconds, elapsed_active, break_seconds_so_far,
+                                  this_weight, total_weight):
+    """Works out how long the break at `position` should last, from the time
+    that is actually left. `elapsed_active` is the time spent typing so far
+    (breaks and the person's own pauses left out). The pace so far is compared
+    with the estimate, so a slower or faster run changes the later breaks.
+    Returns 0.0 when the break should be skipped (running behind the target, or
+    the break would be too short to be worth it)."""
+    estimate_done = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, start_index, position
+    )
+    estimate_left = estimate_active_seconds(
+        text, settings, protection_mask, pause_map, position, len(text)
+    )
+    if estimate_done >= SESSION_PACE_MIN_ESTIMATE_SECONDS:
+        pace = min(max(elapsed_active / estimate_done, 0.5), 3.0)
+    else:
+        pace = 1.0
+    predicted_left = estimate_left * pace
+    spare_seconds = target_seconds - elapsed_active - break_seconds_so_far - predicted_left
+    if spare_seconds <= 0 or total_weight <= 0:
+        return 0.0
+    seconds = spare_seconds * this_weight / total_weight
+    if seconds < SESSION_BREAK_MIN_SECONDS:
+        return 0.0
+    return min(seconds, SESSION_BREAK_MAX_SECONDS)
 
 
 # --------------------------------------------
@@ -2037,6 +2267,68 @@ def _type_left_mistake(settings, entry, input_path):
     )
 
 
+def _note_blocked_time(seconds):
+    """Records time spent paused (by the person, by activity auto-pause, or
+    because focus was lost). That time is left out of the live WPM and ETA, is
+    not counted against a target time, and moves the target finish time later
+    by the same amount (Update #27)."""
+    state.paused_duration += seconds
+    state.blocked_seconds += seconds
+    if state.target_end_time > 0:
+        state.target_end_time += seconds
+
+
+def _wait_for_session_break(seconds, break_number, break_total):
+    """Waits `seconds` for a long session break (target time), in small steps
+    so Stop and Pause still work. While paused, the countdown freezes and picks
+    up where it left off. The status line always starts with "Session break":
+    the activity auto-pause watcher relies on that to ignore mouse movement,
+    because the person is expected to be away from the keyboard during a break.
+    Returns True when the wait finished, or False if Stop was requested."""
+    remaining = float(seconds)
+    last_tick = time.time()
+    while remaining > 0:
+        if stop_event.is_set():
+            return False
+
+        if pause_event.is_set():
+            block_start = time.time()
+            while pause_event.is_set():
+                if stop_event.is_set():
+                    return False
+                if not state.status.startswith("Activity detected"):
+                    state.status = "Paused"
+                time.sleep(0.2)
+            _note_blocked_time(time.time() - block_start)
+            last_tick = time.time()
+            continue
+
+        state.status = (
+            f"Session break {break_number} of {break_total} "
+            f"({format_duration_text(remaining)} left)..."
+        )
+        time.sleep(min(0.25, remaining))
+        now = time.time()
+        elapsed = now - last_tick
+        last_tick = now
+        remaining -= elapsed
+        state.paused_duration += elapsed
+    return True
+
+
+def _session_break_resume_countdown():
+    """A short warning countdown after a session break, used when no target
+    window is locked. It gives the person a moment to click back into the right
+    window before typing starts again. Returns False if Stop was requested."""
+    for seconds_left in range(SESSION_BREAK_RESUME_SECONDS, 0, -1):
+        if stop_event.is_set():
+            return False
+        state.status = f"Session break over, typing again in {seconds_left}s..."
+        time.sleep(1)
+        state.paused_duration += 1
+    return True
+
+
 def _wait_for_pause_marker(seconds):
     """Waits `seconds` for an inline {{pause:N}} marker, in small steps so
     Stop, Pause, and the activity auto-pause all still work during the
@@ -2059,7 +2351,7 @@ def _wait_for_pause_marker(seconds):
                 if not state.status.startswith("Activity detected"):
                     state.status = "Paused"
                 time.sleep(0.2)
-            state.paused_duration += time.time() - block_start
+            _note_blocked_time(time.time() - block_start)
             last_tick = time.time()
             continue
 
@@ -2174,6 +2466,36 @@ def type_text(settings, is_batch=False, is_last=True):
     state.start_time = time.time()
     log_event("typing_start", "")
 
+    # TARGET TIME (Update #27): plan the long session breaks. Preview runs
+    # skip this so a preview never waits for hours. If planning ever fails,
+    # the file is simply typed without session breaks.
+    session_plan = []
+    session_break_index = 0
+    session_break_total = 0.0  # time spent in session breaks so far
+    file_target_seconds = settings.get("target_seconds_for_file", 0.0)
+    plan_start_time = time.time()
+    plan_blocked_start = state.blocked_seconds
+    state.target_end_time = 0.0
+    state.session_breaks_left = 0
+    if file_target_seconds > 0 and not settings.get("preview_mode"):
+        try:
+            session_plan, spare_seconds, typing_seconds = plan_session_breaks(
+                text, protection_mask, pause_map, settings, resume_from, file_target_seconds
+            )
+        except Exception:
+            session_plan = []
+            spare_seconds = 0.0
+            typing_seconds = 0.0
+            log_event("target_time_failed", "could not plan session breaks; typing without them")
+        state.target_end_time = plan_start_time + file_target_seconds
+        state.session_breaks_left = len(session_plan)
+        log_event(
+            "target_time_plan",
+            f"target={format_duration_text(file_target_seconds)}, "
+            f"estimated typing={format_duration_text(typing_seconds)}, "
+            f"spare={format_duration_text(max(spare_seconds, 0))}, breaks={len(session_plan)}",
+        )
+
     word_count = 0
     para_count = 0
     next_mistake_target = random.randint(mistake_min, mistake_max) if enable_mistakes else None
@@ -2213,6 +2535,49 @@ def type_text(settings, is_batch=False, is_last=True):
             return
         if idx < left_skip_until:
             continue
+
+        # --------------------------------
+        # SESSION BREAK (target time, Update #27)
+        # A long break at a planned paragraph or sentence start. Its length
+        # is worked out now from the time that is really left, so the run
+        # finishes close to the target. Like the pause marker below, this runs
+        # BEFORE the focus-lock check, so after a long wait the check runs
+        # right away and catches a window switch before anything is typed.
+        # --------------------------------
+        if session_break_index < len(session_plan) and idx >= session_plan[session_break_index]["position"]:
+            planned_break = session_plan[session_break_index]
+            weights_left = [item["weight"] for item in session_plan[session_break_index:]]
+            elapsed_active = (
+                time.time() - plan_start_time - session_break_total
+                - (state.blocked_seconds - plan_blocked_start)
+            )
+            break_seconds = compute_session_break_seconds(
+                text, settings, protection_mask, pause_map, resume_from, idx,
+                file_target_seconds, elapsed_active, session_break_total,
+                planned_break["weight"], sum(weights_left),
+            )
+            session_break_index += 1
+            state.session_breaks_left = len(session_plan) - session_break_index
+            if break_seconds > 0:
+                log_event(
+                    "session_break_start",
+                    f"~{format_duration_text(break_seconds)}, break {session_break_index} of {len(session_plan)}",
+                )
+                break_started = time.time()
+                blocked_before_break = state.blocked_seconds
+                break_finished = _wait_for_session_break(break_seconds, session_break_index, len(session_plan))
+                if break_finished and not settings.get("preview_mode") and not (locked_window and HAS_PYGETWINDOW):
+                    break_finished = _session_break_resume_countdown()
+                # The person's own pauses during the break are counted separately.
+                session_break_total += (time.time() - break_started) - (state.blocked_seconds - blocked_before_break)
+                if not break_finished:
+                    return
+                log_event("session_break_end", "")
+                if enable_fatigue:
+                    fatigue_chars = 0  # a long rest fully recovers from fatigue
+                state.status = "Typing..."
+            else:
+                log_event("session_break_skipped", "no spare time left for this break")
 
         # --------------------------------
         # INLINE PAUSE MARKER ({{pause:N}})
@@ -2267,7 +2632,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if not state.status.startswith("Activity detected"):
                         state.status = "Paused"
                 time.sleep(0.2)
-            state.paused_duration += time.time() - block_start
+            _note_blocked_time(time.time() - block_start)
             state.status = "Typing..."
 
         # --------------------------------
@@ -2819,6 +3184,35 @@ def validate_settings():
         )
         return None
 
+    enable_target_time = bool(enable_target_time_var.get())
+    target_seconds = 0.0
+    if enable_target_time:
+        try:
+            target_hours = int(target_hours_var.get())
+            target_minutes = int(target_minutes_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Target time hours and minutes must be whole numbers.")
+            return None
+        if target_hours < 0 or target_minutes < 0 or target_minutes > 59:
+            messagebox.showerror(
+                "Invalid Input",
+                "Target time hours cannot be negative, and minutes must be between 0 and 59.",
+            )
+            return None
+        if target_hours > TARGET_TIME_MAX_HOURS:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Target time cannot be longer than {TARGET_TIME_MAX_HOURS} hours.",
+            )
+            return None
+        target_seconds = float(target_hours * 3600 + target_minutes * 60)
+        if target_seconds < TARGET_TIME_MIN_SECONDS or target_seconds > TARGET_TIME_MAX_HOURS * 3600:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Target time must be between 1 minute and {TARGET_TIME_MAX_HOURS} hours.",
+            )
+            return None
+
     enable_update_check = bool(enable_update_check_var.get())
     skipped_update_version = skipped_update_version_var.get().strip()
     if skipped_update_version and parse_version_text(skipped_update_version) is None:
@@ -2847,6 +3241,8 @@ def validate_settings():
         "activity_sensitivity": activity_sensitivity,
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
+        "enable_target_time": enable_target_time,
+        "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
         "enable_smart_fixes": enable_smart_fixes,
         "smart_fix_spacing": smart_fix_spacing,
@@ -2872,6 +3268,77 @@ def validate_settings():
         "sentence_pause_max": sentence_pause_max,
         "theme": theme,
     }
+
+
+TARGET_TIME_TOO_SHORT_FACTOR = 1.05  # typing estimate over the target by more than 5% counts as too short
+
+
+def describe_target_time_plan(settings, estimated_seconds):
+    """A short phrase for the pre-start estimate that says what the target
+    time will do. Returns an empty string when no target time is set."""
+    if not settings.get("enable_target_time"):
+        return ""
+    target = settings.get("target_seconds", 0.0)
+    target_text = format_duration_text(target)
+    if estimated_seconds > target * TARGET_TIME_TOO_SHORT_FACTOR:
+        return f" \u2022 Target {target_text} is shorter than the typing time, so it cannot be reached"
+    spare_seconds = target - estimated_seconds
+    break_count = plan_session_break_count(spare_seconds)
+    if break_count == 0:
+        return f" \u2022 Target {target_text}: no long breaks needed"
+    return (
+        f" \u2022 Target {target_text}: about {format_duration_text(spare_seconds)} "
+        f"of long breaks (~{break_count} breaks)"
+    )
+
+
+def estimate_total_active_seconds(files, settings):
+    """Rough typing time (without session breaks) for the text still to be
+    typed in `files`, counting from any saved resume point. Returns None when a
+    file cannot be read; type_text() reports unreadable files itself."""
+    total_seconds = 0.0
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+        except OSError:
+            return None
+        if not raw_text:
+            continue
+        prepared = prepare_input_text(raw_text, settings)
+        text = prepared.clean_text
+        protection_mask = build_protection_mask(len(text), prepared.protected_ranges)
+        resume_chars = load_resume_state_for(fpath) or 0
+        total_seconds += estimate_active_seconds(
+            text, settings, protection_mask, prepared.pause_map, resume_chars, len(text)
+        )
+        total_seconds += estimate_smart_fix_seconds(prepared, settings, resume_chars)
+    return total_seconds
+
+
+def confirm_target_time_plan(files, settings):
+    """When a target time is set but is shorter than the estimated typing time,
+    says so BEFORE typing starts, because the target cannot be reached.
+    Returns True if it is OK to start, False if the person chose to change
+    the settings first."""
+    if not settings.get("enable_target_time"):
+        return True
+    estimated_seconds = estimate_total_active_seconds(files, settings)
+    if estimated_seconds is None:
+        return True  # unreadable files are reported when typing starts
+    target = settings.get("target_seconds", 0.0)
+    if estimated_seconds <= target * TARGET_TIME_TOO_SHORT_FACTOR:
+        return True
+    return messagebox.askokcancel(
+        "Target Time Too Short",
+        f"Your target time is {format_duration_text(target)}, but typing this text with your "
+        f"current speed and pause settings is estimated to take about "
+        f"{format_duration_text(estimated_seconds)}.\n\n"
+        "Amanuensis never types faster than your speed settings, so no long breaks will be "
+        "added and the run will take about the estimated time.\n\n"
+        "Click OK to start anyway, or Cancel to raise the target time or speed up your "
+        "typing settings first.",
+    )
 
 
 def preview_estimate():
@@ -2925,6 +3392,7 @@ def preview_estimate():
         preview_result_var.set(
             f"Queue ({len(queue_files)} files): ~{total_words:,} words \u2022 {total_chars:,} characters{fixes_note} \u2022 "
             f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
+            f"{describe_target_time_plan(settings, total_seconds)}"
         )
         return
 
@@ -2961,6 +3429,7 @@ def preview_estimate():
     preview_result_var.set(
         f"{word_count:,} words \u2022 {char_count:,} characters{resume_note}{fixes_note} \u2022 "
         f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
+        f"{describe_target_time_plan(settings, est_seconds)}"
     )
 
 
@@ -2977,11 +3446,36 @@ def notify_finished():
         messagebox.showinfo("Amanuensis", "Typing session finished!")
 
 
+def split_target_time_across_files(settings, files, resume_dict):
+    """Returns one target time (in seconds) for each file in `files`, in the
+    same order. With one file it is the whole target. With a batch queue the
+    target is for the whole run, shared between the files by how much text
+    each one still has to type. Returns zeros when no target time is set or
+    when the run is a preview."""
+    if not settings.get("enable_target_time") or settings.get("preview_mode"):
+        return [0.0] * len(files)
+    total_target = settings.get("target_seconds", 0.0)
+    if len(files) == 1:
+        return [total_target]
+    remaining_chars = []
+    for fpath in files:
+        clean_text = get_clean_text_for_file(fpath, settings)
+        if clean_text is None:
+            remaining_chars.append(0)
+        else:
+            remaining_chars.append(max(len(clean_text) - resume_dict.get(fpath, 0), 0))
+    total_chars = sum(remaining_chars)
+    if total_chars <= 0:
+        return [0.0] * len(files)
+    return [total_target * chars / total_chars for chars in remaining_chars]
+
+
 def run_typing_worker(settings, files, resume_dict):
     """Processes a list of files sequentially. Each file runs through
     type_text() completely (including its own 10-second countdown).
     Stops if stop_event is set or if typing is no longer running."""
     total_files = len(files)
+    target_shares = split_target_time_across_files(settings, files, resume_dict)
     for idx, file_path in enumerate(files):
         if stop_event.is_set() or not state.is_running:
             break
@@ -2989,6 +3483,7 @@ def run_typing_worker(settings, files, resume_dict):
         file_settings = dict(settings)
         file_settings["input_path"] = file_path
         file_settings["resume_from"] = resume_dict.get(file_path, 0)
+        file_settings["target_seconds_for_file"] = target_shares[idx]
         state.settings = file_settings
 
         is_last = (idx == total_files - 1)
@@ -3052,6 +3547,9 @@ def start_typing():
     files_to_run = queue_files if queue_files else [settings["input_path"]]
 
     if not confirm_pause_marker_warnings(files_to_run, settings):
+        return
+
+    if not confirm_target_time_plan(files_to_run, settings):
         return
 
     resume_dict = {}
@@ -4013,6 +4511,9 @@ def get_current_settings_snapshot():
         "activity_sensitivity": activity_sensitivity_var.get(),
         "enable_fatigue": enable_fatigue_var.get(),
         "fatigue_strength": fatigue_strength_var.get(),
+        "enable_target_time": enable_target_time_var.get(),
+        "target_time_hours": target_hours_var.get(),
+        "target_time_minutes": target_minutes_var.get(),
         "enable_pause_markers": enable_pause_markers_var.get(),
         "enable_smart_fixes": enable_smart_fixes_var.get(),
         "smart_fix_spacing": smart_fix_spacing_var.get(),
@@ -4068,6 +4569,9 @@ def apply_settings_snapshot(data, include_files=True):
     activity_sensitivity_var.set(str(data.get("activity_sensitivity", "20")))
     enable_fatigue_var.set(data.get("enable_fatigue", False))
     fatigue_strength_var.set(str(data.get("fatigue_strength", "15")))
+    enable_target_time_var.set(bool(data.get("enable_target_time", False)))
+    target_hours_var.set(str(data.get("target_time_hours", "2")))
+    target_minutes_var.set(str(data.get("target_time_minutes", "0")))
     enable_pause_markers_var.set(data.get("enable_pause_markers", True))
     enable_smart_fixes_var.set(data.get("enable_smart_fixes", False))
     smart_fix_spacing_var.set(data.get("smart_fix_spacing", True))
@@ -4653,6 +5157,12 @@ def update_gui():
                 avg_break_seconds = (settings["break_duration_min"] + settings["break_duration_max"]) / 2
                 mins_left += (estimated_breaks_remaining * avg_break_seconds) / 60
 
+            # With a target time and long breaks still ahead, the plan knows the
+            # finish time better than the typing pace does (Update #27).
+            if state.target_end_time > 0 and (
+                    state.session_breaks_left > 0 or state.status.startswith("Session break")):
+                mins_left = max(mins_left, (state.target_end_time - time.time()) / 60)
+
             eta_var.set(f"{int(mins_left)}m {int((mins_left * 60) % 60)}s")
 
         if state.settings.get("enable_mistakes"):
@@ -4920,6 +5430,10 @@ target_wpm_var = tk.StringVar(value="")
 enable_fatigue_var = tk.BooleanVar(value=False)
 fatigue_strength_var = tk.StringVar(value="15")
 
+enable_target_time_var = tk.BooleanVar(value=False)
+target_hours_var = tk.StringVar(value="2")
+target_minutes_var = tk.StringVar(value="0")
+
 paragraph_pause_min_var = tk.StringVar(value="10")
 paragraph_pause_max_var = tk.StringVar(value="20")
 sentence_pause_min_var = tk.StringVar(value="5")
@@ -4989,6 +5503,7 @@ resume_status_var = tk.StringVar(value="")
 SECTION_RESET_VARS = {
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
     "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
+    "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
     "Natural Pauses": [
         paragraph_pause_min_var,
@@ -5548,6 +6063,30 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.1.0",
+        "date": "2026-10-11",
+        "title": "Target time till completion",
+        "changes": [
+            "Added: a Target Time card on the Speed tab. Pick how long the whole run should take, in hours and minutes. The spare time is spent on long session breaks, like someone writing over several sittings instead of all at once.",
+            "Added: a longer target means more and longer breaks. A target of several hours can include breaks of an hour or more. Breaks happen at the start of a paragraph or sentence, never inside protected text.",
+            "Added: break lengths adjust as the run goes, so the run finishes close to your target. Time you spend paused yourself is not counted.",
+            "Added: the pre-start time estimate describes the plan, and a warning appears before typing starts if the target is shorter than the typing time.",
+            "Added: three new settings (enable, hours, minutes), saved with your profiles and restored on launch.",
+            "Modified: with a batch queue, the target is for the whole run and is shared between the files by size. The ETA follows the plan while long breaks are still ahead.",
+            "Notes: Preview ignores the target. Amanuensis never types faster than your speed settings, so a target that is too short cannot be reached. Keep the computer awake during a long run, and turn on Target Window Lock so typing never lands in the wrong window after a break.",
+        ],
+    },
+    {
+        "version": "5.0.2",
+        "date": "2026-10-11",
+        "title": "Release notes from version history",
+        "changes": [
+            "Added: the description on each GitHub release page is now written automatically from the newest version history entry, so the code, this History tab, and the release page always match.",
+            "Modified: a release now stops before publishing if the newest history entry is missing or its version does not match the tag.",
+            "Notes: no change to how the app works, no new settings, and no new packages.",
+        ],
+    },
+    {
         "version": "5.0.1",
         "date": "2026-10-10",
         "title": "Guard invalid saved settings",
@@ -5866,6 +6405,7 @@ frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
 
 # --- Tab: Speed (how fast and how steadily it types) ---
 frame_settings = make_modern_card(tab_speed, "Typing Speed")
+frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 
@@ -6043,6 +6583,34 @@ modern_label(
     "and will bring your overall session average below this number.",
     kind="muted",
 ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Target time (Update #27) ---
+modern_checkbox(
+    frame_target_time, "Enable target time till completion", enable_target_time_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_target_time, "Hours").grid(row=1, column=0, sticky="w")
+modern_label(frame_target_time, "Minutes").grid(row=1, column=1, sticky="w", padx=(16, 0))
+entry_target_hours = modern_entry(frame_target_time, target_hours_var, width=8)
+entry_target_hours.grid(row=2, column=0, sticky="w", pady=(4, 0))
+entry_target_minutes = modern_entry(frame_target_time, target_minutes_var, width=8)
+entry_target_minutes.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(4, 0))
+
+modern_label(
+    frame_target_time,
+    "Sets how long the whole run should take, from the first key to the last. "
+    "The spare time is spent on long breaks, like someone writing over several "
+    "sittings. The longer the target, the longer the breaks: a target of several "
+    "hours can have breaks of an hour or more.\n\n"
+    "Breaks happen at the start of a paragraph or sentence, never inside protected "
+    "text. Time you spend paused yourself does not count. Amanuensis never types "
+    "faster than your speed settings, so a target that is too short cannot be "
+    "reached. Preview ignores this setting.\n\n"
+    "Tip: turn on Target Window Lock (Window tab) so typing never lands in the "
+    "wrong window after a break, and keep the computer awake during a long run.",
+    kind="muted",
+    wraplength=420,
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Fatigue drift ---
 modern_checkbox(
@@ -6416,6 +6984,7 @@ for _release_index, _release in enumerate(_past_releases):
 SECTION_CARDS = {
     "Activity Auto-Pause": frame_activity,
     "Typing Speed": frame_settings,
+    "Target Time": frame_target_time,
     "Fatigue Drift": frame_fatigue,
     "Natural Pauses": frame_pauses,
     "Character Typos": frame_typos,

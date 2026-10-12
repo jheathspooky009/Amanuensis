@@ -21,6 +21,7 @@ Amanuensis reads text from a file and types it into whatever window currently ha
 - **Sentence reworks** — occasionally pauses, deletes the last few words just typed, and retypes them, simulating real hesitation (final text always stays exactly correct)
 - **Adjacent-key typos** — a configurable per-letter chance of a realistic, physically-nearby keyboard typo that gets caught and corrected
 - **Research breaks** — configurable frequency and duration for longer pauses every few paragraphs
+- **Target time till completion** — an optional setting (off by default) for how long the whole run should take, in hours and minutes. The spare time becomes long session breaks at paragraph or sentence starts, never inside `[[protected text]]`. The longer the target, the longer and more spread out the breaks (a 7-hour target can have breaks of an hour or more). Break lengths adjust as the run goes so it finishes close to the target, and time you spend paused is not counted. It never types faster than your speed settings, so a target that is too short cannot be reached (you get a warning first). Preview ignores it
 - **Target window lock** — pick a specific window from a list; typing auto-pauses if focus moves elsewhere
 - **Resume where you left off** — stopping partway through a file saves a checkpoint; next time, choose to resume or start over
 - **Pre-start time estimate** — preview word/character count and a rough total duration before clicking Start

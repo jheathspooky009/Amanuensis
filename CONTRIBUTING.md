@@ -20,8 +20,8 @@ uv run python Amanuensis.py
 Run all of these. A pull request that fails them will not be merged.
 
 ```
-uv run python -m py_compile Amanuensis.py scripts/security_check.py
-uv run pyflakes Amanuensis.py scripts/security_check.py
+uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py
+uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py
 uvx bandit@1.9.4 -q -ll -r Amanuensis.py scripts
 uv run python scripts/security_check.py
 uv export --locked --no-emit-project -o requirements-audit.txt
@@ -51,8 +51,8 @@ Never write those words into any file in the repository. The same checks run aut
 ## For maintainers: making a release
 
 1. Make sure CI is green on `main`.
-2. Make sure `pyproject.toml`, `uv.lock`, and the newest `VERSION_HISTORY` entry all show the same version.
-3. Create and push a tag such as `v5.0.0`. The Release workflow checks the tag against the app version, scans dependencies, builds the `.exe`, writes `SHA256SUMS.txt`, creates the build attestation, signs the checksums when a GPG key is configured, and publishes the release.
+2. Make sure `pyproject.toml`, `uv.lock`, and the newest `VERSION_HISTORY` entry all show the same version. The newest entry also becomes the release description on GitHub (`scripts/release_notes.py` builds it), so fill in its title and change lines before you tag. Lines that start with `Added:`, `Modified:`, `Fixed:`, `Removed:`, or `Notes:` are grouped under headings. To preview it, run `uv run python scripts/release_notes.py --output release_notes.md`.
+3. Create and push a tag such as `v5.0.0`. The Release workflow checks the tag against the app version, scans dependencies, builds the `.exe`, writes `SHA256SUMS.txt`, creates the build attestation, signs the checksums when a GPG key is configured, writes the release description from the newest `VERSION_HISTORY` entry, and publishes the release.
 4. Download the release and check it yourself using the steps in [SECURITY.md](SECURITY.md).
 
 ## License

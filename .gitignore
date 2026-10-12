@@ -37,6 +37,9 @@ _pasted_input.txt
 amanuensis_log_*
 amanuensis_mistakes*.txt
 
+# Preview file made by scripts/release_notes.py (CI makes its own copy)
+release_notes.md
+
 # Local-only agent notes
 AGENTS.md
 

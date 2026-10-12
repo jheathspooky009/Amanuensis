@@ -79,10 +79,20 @@ jobs:
           echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
             --armor --detach-sign --output dist/SHA256SUMS.txt.asc dist/SHA256SUMS.txt
 
+      # The release description comes from the newest VERSION_HISTORY entry in
+      # Amanuensis.py (the same text the app's History tab shows). The script
+      # also fails the release if the tag and the app version do not match.
+      - name: Write the release description from the version history
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: uv run python scripts/release_notes.py --tag "$TAG_NAME" --output release_notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
+          body_path: release_notes.md
           files: |
             dist/amanuensis.exe
             dist/SHA256SUMS.txt

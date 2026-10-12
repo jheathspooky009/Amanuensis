@@ -37,10 +37,10 @@ jobs:
         run: uv sync --locked --group dev
 
       - name: Syntax check (py_compile)
-        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py
+        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py
 
       - name: Lint check (pyflakes)
-        run: uv run pyflakes Amanuensis.py scripts/security_check.py
+        run: uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py
 
       # Medium and high severity findings fail the build. The low findings
       # (random numbers used for typing delays, best-effort try/except) are
@@ -65,6 +65,11 @@ jobs:
 
       - name: Run the repository security check
         run: python scripts/security_check.py
+
+      # Proves the newest VERSION_HISTORY entry can be turned into release notes,
+      # so a bad entry is caught before a tag is ever pushed.
+      - name: Check the release notes can be built
+        run: python scripts/release_notes.py --output release_notes.md
 
   dependency-audit:
     name: Dependency vulnerability scan
