@@ -31,7 +31,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Install dependencies
         run: uv sync --locked --group dev
@@ -88,7 +88,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       - name: Export the locked dependency list
         run: uv export --locked --no-emit-project -o requirements-audit.txt
