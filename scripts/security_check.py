@@ -239,7 +239,7 @@ def scan_line_for_problems(line, rel_path, private_terms):
             problems.append("a user home folder path")
     for match in EMAIL_PATTERN.finditer(line):
         domain = match.group(1).lower()
-        if domain in SAFE_EMAIL_DOMAINS or domain.endswith("noreply.github.com"):
+        if domain in SAFE_EMAIL_DOMAINS or domain == "noreply.github.com" or domain.endswith(".noreply.github.com"):
             continue
         problems.append("an email address")
     if rel_path != "uv.lock":
