@@ -9,6 +9,25 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.4.0 (2026-10-13) -- Formatting markers (Update #29)
+#   - Added: Formatting markers for bold and italic. Wrap text in [[b]]...[[/b]]
+#     or [[i]]...[[/i]] and Amanuensis presses Ctrl+B or Ctrl+I at those spots,
+#     so the text comes out bold or italic in Google Docs or Word. The markers
+#     themselves are never typed.
+#   - Added: A "Formatting Markers" card on the Speed tab with one new setting
+#     (enable_format_markers), on by default, saved with profiles and restored
+#     on launch. When it is off the markers are still removed, but no shortcuts
+#     are pressed (handy for plain web forms).
+#   - Added: A warning before typing starts if a marker has no partner (a stray
+#     [[/b]], a repeated [[b]], or one that is never closed).
+#   - Modified: The pre-start time estimate includes the time for each shortcut.
+#     Reworks never delete the first formatted word of a span, and no typo,
+#     paraphrase, or left mistake can ever lose or move a formatting change.
+#   - Notes: [[b]], [[/b]], [[i]], and [[/i]] (any capitals) are now reserved, so
+#     protected text cannot be exactly b or i. Preview does not press shortcuts.
+#     An unclosed marker is closed after the last character. When resuming, click
+#     right after the last typed character so the formatting carries on.
+#
 # v5.3.0 (2026-10-12) -- Finger and hand timing (Update #28)
 #   - Added: A "Finger & Hand Timing" card on the Speed tab. Two letters typed
 #     with opposite hands in a row go slightly faster, and two different letters
@@ -28,19 +47,6 @@
 #     checkpoint was edited, and automatic checkpoint autosave at sentence ends.
 #   - Added: Saved progress status label and "Clear Saved Progress" button in the
 #     Input File card with confirmation dialog and trace auto-refresh.
-#
-# v5.1.0 (2026-10-11) -- Target time till completion (Update #27)
-#   - Added: A "Target Time" card on the Speed tab. Pick how long the whole run
-#     should take (hours and minutes). Amanuensis fills the spare time with
-#     long "session breaks" at paragraph or sentence starts, so a longer target
-#     means longer, more spread out breaks (an hour or more at a time).
-#   - Added: Break lengths adjust as the run goes, so the run finishes close to
-#     the target. The pre-start estimate describes the plan, and a warning
-#     appears when the target is shorter than the typing time.
-#   - Added: Three new settings (enable, hours, minutes).
-#   - Notes: Preview ignores the target. Amanuensis never types faster than the
-#     speed settings, so a target that is too short cannot be reached. Keep the
-#     computer awake during a long run, and use Target Window Lock.
 # ============================================
 
 import pyautogui
@@ -363,43 +369,158 @@ def strip_pause_markers(raw_text):
     return "".join(kept_parts), pause_positions, invalid_markers, clamped_markers
 
 
+# --------------------------------------------
+# INLINE FORMATTING MARKERS: [[b]]...[[/b]] and [[i]]...[[/i]] (Update #29)
+# --------------------------------------------
+# [[b]] starts bold and [[/b]] ends it. [[i]] and [[/i]] do the same for
+# italic (any capitals work). The markers are never typed. Where one sits,
+# Amanuensis presses Ctrl+B or Ctrl+I, which TOGGLES the style in Google Docs
+# and Word, so a valid pair turns it on and then off again.
+#
+# These are removed BEFORE [[protected markers]] are read, because [[b]] would
+# otherwise look like protected text. That makes these four spellings
+# reserved. Each marker is stored as a position in the FINAL clean text,
+# meaning "press the shortcut before typing the character at this index",
+# exactly like pauses, so it stays in step with resume checkpoints.
+#
+# A marker with no partner is never typed as text. A stray [[/b]] or a
+# repeated [[b]] is ignored, and a style still open at the end of the file is
+# closed after the last character. Each case is reported before typing starts.
+FORMAT_MARKER_PATTERN = re.compile(r"\[\[(/?)([bi])\]\]", re.IGNORECASE)
+FORMAT_KIND_FOR_LETTER = {"b": "bold", "i": "italic"}
+FORMAT_SHORTCUT_LETTER = {"bold": "b", "italic": "i"}
+FORMAT_KIND_ORDER = ("bold", "italic")
+# Average time of one shortcut press (reaching for the keys, then pressing).
+FORMAT_TOGGLE_ESTIMATE_SECONDS = 0.33
+
+
+def shift_position_through_removals(position, removed_spans):
+    """Converts an index in a text to the matching index after the sorted,
+    non-overlapping (start, end) spans were cut out of it."""
+    shift = 0
+    for span_start, span_end in removed_spans:
+        if span_start >= position:
+            break
+        shift += min(span_end, position) - span_start
+    return position - shift
+
+
+def normalize_format_map(format_map):
+    """Cancels a style that is toggled twice at the very same spot (it would
+    press the shortcut twice for no change) and drops empty entries."""
+    cleaned = {}
+    for position, kinds in format_map.items():
+        kept = [kind for kind in dict.fromkeys(kinds) if kinds.count(kind) % 2 == 1]
+        if kept:
+            cleaned[position] = kept
+    return cleaned
+
+
+def strip_format_markers(raw_text):
+    """Removes [[b]], [[/b]], [[i]], and [[/i]] from raw_text.
+
+    Returns (stripped_text, format_positions, removed_spans, problems):
+    - stripped_text: raw_text with every formatting marker removed.
+    - format_positions: {index into stripped_text: [style, ...]} where each
+      style is "bold" or "italic" and means "press that shortcut before the
+      character at this index". An index equal to len(stripped_text) is
+      after the last character (this also holds the automatic close of any
+      style left open).
+    - removed_spans: (start, end) of each marker in raw_text, so other
+      positions can be shifted with shift_position_through_removals().
+    - problems: plain-English notes about markers that have no partner."""
+    kept_parts = []
+    format_positions = {}
+    removed_spans = []
+    problems = []
+    open_markers = {}  # style -> the marker text that opened it
+    last_end = 0
+    stripped_length = 0
+
+    for match in FORMAT_MARKER_PATTERN.finditer(raw_text):
+        before = raw_text[last_end:match.start()]
+        kept_parts.append(before)
+        stripped_length += len(before)
+        removed_spans.append((match.start(), match.end()))
+        last_end = match.end()
+
+        marker_text = match.group(0)
+        is_closing = match.group(1) == "/"
+        kind = FORMAT_KIND_FOR_LETTER[match.group(2).lower()]
+        if is_closing:
+            if kind not in open_markers:
+                problems.append(f"{marker_text}  (no matching opening marker, ignored)")
+                continue
+            del open_markers[kind]
+        else:
+            if kind in open_markers:
+                problems.append(f"{marker_text}  ({kind} is already on, ignored)")
+                continue
+            open_markers[kind] = marker_text
+        format_positions.setdefault(stripped_length, []).append(kind)
+
+    tail = raw_text[last_end:]
+    kept_parts.append(tail)
+    stripped_length += len(tail)
+
+    for kind in FORMAT_KIND_ORDER:
+        if kind in open_markers:
+            problems.append(f"{open_markers[kind]}  (never closed, will be turned off after the last character)")
+            format_positions.setdefault(stripped_length, []).append(kind)
+
+    return "".join(kept_parts), normalize_format_map(format_positions), removed_spans, problems
+
+
 def parse_input_markers(raw_text, enable_pause_markers=True):
     """Parses every marker type in the input file in one place.
 
-    Returns (clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers):
+    Returns (clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
     - clean_text: the exact text that will be typed (no markers left in it).
     - protected_ranges: (start, end) ranges in clean_text for [[protected text]].
     - pause_map: {index into clean_text: seconds to wait before typing that
       character}. An index equal to len(clean_text) is a pause at the very end.
+    - format_map: {index into clean_text: ["bold" or "italic", ...]} shortcuts
+      to press before typing that character (see strip_format_markers()).
     When enable_pause_markers is False, {{pause:N}} is left in the text and
-    typed like any other text."""
+    typed like any other text. Formatting markers are always removed from the
+    text (the caller decides whether to press the shortcuts)."""
     if enable_pause_markers:
         stripped, stripped_pauses, invalid_markers, clamped_markers = strip_pause_markers(raw_text)
     else:
         stripped, stripped_pauses, invalid_markers, clamped_markers = raw_text, {}, [], []
 
+    # Formatting markers go before [[protected markers]] are read. Pause
+    # positions so far point into the text with the formatting markers still
+    # in it, so shift them to match.
+    stripped, format_positions, format_removed_spans, _format_problems = strip_format_markers(stripped)
+    if format_removed_spans and stripped_pauses:
+        shifted_pauses = {}
+        for position, seconds in stripped_pauses.items():
+            new_position = shift_position_through_removals(position, format_removed_spans)
+            shifted_pauses[new_position] = shifted_pauses.get(new_position, 0.0) + seconds
+        stripped_pauses = shifted_pauses
+
     clean_text, protected_ranges = parse_protected_spans(stripped)
 
-    # Pause positions so far point into `stripped`, which still has the
-    # [[ and ]] characters in it. Shift each one left by however many
+    # Pause and format positions so far point into `stripped`, which still has
+    # the [[ and ]] characters in it. Shift each one left by however many
     # bracket characters sit before it, so it points into clean_text.
     pause_map = {}
-    if stripped_pauses:
-        removed_spans = []
+    format_map = {}
+    if stripped_pauses or format_positions:
+        bracket_spans = []
         for match in PROTECTED_MARKER_PATTERN.finditer(stripped):
-            removed_spans.append((match.start(), match.start() + 2))
-            removed_spans.append((match.end() - 2, match.end()))
+            bracket_spans.append((match.start(), match.start() + 2))
+            bracket_spans.append((match.end() - 2, match.end()))
 
         for position, seconds in stripped_pauses.items():
-            shift = 0
-            for span_start, span_end in removed_spans:
-                if span_start >= position:
-                    break
-                shift += min(span_end, position) - span_start
-            clean_position = position - shift
+            clean_position = shift_position_through_removals(position, bracket_spans)
             pause_map[clean_position] = pause_map.get(clean_position, 0.0) + seconds
+        for position, kinds in format_positions.items():
+            clean_position = shift_position_through_removals(position, bracket_spans)
+            format_map.setdefault(clean_position, []).extend(kinds)
 
-    return clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers
+    return clean_text, protected_ranges, pause_map, normalize_format_map(format_map), invalid_markers, clamped_markers
 
 
 # --------------------------------------------
@@ -525,10 +646,11 @@ class PreparedText:
     about one input file, after markers and smart fixes are handled.
     All positions refer to clean_text (the exact text that gets typed)."""
 
-    def __init__(self, clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers):
+    def __init__(self, clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
         self.clean_text = clean_text
         self.protected_ranges = protected_ranges
         self.pause_map = pause_map
+        self.format_map = format_map    # {index in clean_text: ["bold" / "italic", ...]} (Update #29)
         self.invalid_markers = invalid_markers
         self.clamped_markers = clamped_markers
         self.source_text = clean_text   # the text before smart fixes
@@ -917,10 +1039,13 @@ def prepare_input_text(raw_text, settings):
     the markers, then (when smart fixes are on) applies them. This is the
     one place every caller goes through, so typing, estimates, and resume
     checks always agree on exactly what the text is."""
-    clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers = parse_input_markers(
+    clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers = parse_input_markers(
         raw_text, settings.get("enable_pause_markers", True)
     )
-    prepared = PreparedText(clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers)
+    if not settings.get("enable_format_markers", True):
+        # The markers are still removed from the text, but no shortcuts get pressed.
+        format_map = {}
+    prepared = PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
 
     options = get_smart_fix_options(settings)
     if options is None or not clean_text:
@@ -948,14 +1073,20 @@ def prepare_input_text(raw_text, settings):
             new_position = map_position_through_fixes(pause_position, fixes)
             new_pause_map[new_position] = new_pause_map.get(new_position, 0.0) + seconds
 
+        new_format_map = {}
+        for format_position, kinds in format_map.items():
+            new_position = map_position_through_fixes(format_position, fixes)
+            new_format_map.setdefault(new_position, []).extend(kinds)
+
         prepared.clean_text = new_text
         prepared.protected_ranges = new_ranges
         prepared.pause_map = new_pause_map
+        prepared.format_map = normalize_format_map(new_format_map)
         prepared.fixes = fixes
         prepared.fix_actions = build_fix_actions(fixes, new_starts)
     except Exception:
         # Default to safety: if the fixer ever fails, type the original text.
-        return PreparedText(clean_text, protected_ranges, pause_map, invalid_markers, clamped_markers)
+        return PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
     return prepared
 
 
@@ -1767,6 +1898,34 @@ def _send_ctrl_backspace(settings):
         pyautogui.hotkey("ctrl", "backspace")
 
 
+def _send_format_toggle(settings, kind):
+    """Presses Ctrl+B (bold) or Ctrl+I (italic), which toggles that style in
+    Google Docs and Word. In preview mode nothing is pressed, because the
+    shortcut would go to whatever window has focus instead of the preview."""
+    if settings.get("preview_mode"):
+        return
+    pyautogui.hotkey("ctrl", FORMAT_SHORTCUT_LETTER[kind])
+
+
+def _press_format_toggles(settings, kinds, active_formats):
+    """Presses the shortcut for each style in `kinds`, with a short human
+    pause before and after, and keeps the `active_formats` set (the styles
+    that are on right now) up to date. Returns False if Stop was requested."""
+    for kind in kinds:
+        if stop_event.is_set():
+            return False
+        time.sleep(random.uniform(0.15, 0.35))  # reaching for the shortcut
+        _send_format_toggle(settings, kind)
+        if kind in active_formats:
+            active_formats.discard(kind)
+            log_event("format_off", kind)
+        else:
+            active_formats.add(kind)
+            log_event("format_on", kind)
+        time.sleep(random.uniform(0.05, 0.12))
+    return not stop_event.is_set()
+
+
 def _fail_and_stop(title, message):
     """Runs on the main thread (via run_on_main_thread). Shows an
     error dialog, then stops the session -- kept separate from
@@ -2499,6 +2658,7 @@ def type_text(settings, is_batch=False, is_last=True):
     text = prepared.clean_text
     protected_ranges = prepared.protected_ranges
     pause_map = prepared.pause_map
+    format_map = prepared.format_map
     fix_actions = prepared.fix_actions
     state.clean_text = text  # stored so stop_typing() can compute the prefix hash
     protection_mask = build_protection_mask(len(text), protected_ranges)
@@ -2514,8 +2674,11 @@ def type_text(settings, is_batch=False, is_last=True):
         if resume_from > 0:
             state.left_mistakes_resumed = True
         try:
+            # A format shortcut may not sit inside a two-character mistake, so
+            # those spots are handled like pause markers.
             left_mistake_map = plan_left_mistakes(
-                text, protection_mask, settings, resume_from, pause_map, set(fix_actions.keys())
+                text, protection_mask, settings, resume_from,
+                set(pause_map) | set(format_map), set(fix_actions.keys())
             )
         except Exception:
             left_mistake_map = {}
@@ -2605,6 +2768,15 @@ def type_text(settings, is_batch=False, is_last=True):
     # break, so a sentence rework never deletes or retypes the mistake.
     left_skip_until = 0
     rework_hold = False
+
+    # Formatting markers (Update #29): the styles that are on right now. When
+    # resuming, every shortcut before the resume point counts as already
+    # pressed, so the person should click right after the last typed character.
+    active_formats = set()
+    for format_position in sorted(format_map):
+        if format_position >= resume_from:
+            break
+        active_formats ^= set(format_map[format_position])
 
     # CHARACTER TYPING LOOP
     for idx in range(resume_from, len(text)):
@@ -2717,7 +2889,9 @@ def type_text(settings, is_batch=False, is_last=True):
         # --------------------------------
         # PARAGRAPH-ENDING PARAPHRASE-THEN-CORRECT (Idea #10)
         # --------------------------------
-        if enable_paraphrase and idx in paraphrase_map and not is_protected:
+        # Skipped while a style is on: deleting the drafted sentence could drop
+        # the bold or italic from the cursor in some editors (Update #29).
+        if enable_paraphrase and idx in paraphrase_map and not is_protected and not active_formats:
             candidate = paraphrase_map.pop(idx, None)
             if candidate and random.uniform(0, 100) < paraphrase_chance:
                 _end_idx, paraphrased_text, original_text = candidate
@@ -2771,6 +2945,11 @@ def type_text(settings, is_batch=False, is_last=True):
                     # Never redo them, or the mistake would be erased.
                     words_in_buffer = []
                 redo_count = min(random.randint(2, 4), len(words_in_buffer))
+                if active_formats:
+                    # Keep at least one word of the formatted text, so the first
+                    # formatted character is never deleted (an editor could drop
+                    # the style when that happens). Update #29.
+                    redo_count = min(redo_count, len(words_in_buffer) - 1)
                 if redo_count > 0:
                     redo_text = " ".join(words_in_buffer[-redo_count:])
                     state.status = "Reworking last words..."
@@ -2881,7 +3060,8 @@ def type_text(settings, is_batch=False, is_last=True):
                             and not protection_mask[idx + 1]
                             and char != text[idx + 1]):
                         candidates.append("swap")
-                    if char.isalpha():
+                    if char.isalpha() and idx not in format_map:
+                        # (not at a format shortcut: the doubled letter stays on screen)
                         candidates.append("double")
                     if (char == " "
                             and idx > 0 and text[idx - 1].isalpha()
@@ -2922,6 +3102,21 @@ def type_text(settings, is_batch=False, is_last=True):
             fatigue_chars += 1
 
         left_entry = left_mistake_map.get(idx)
+
+        # --------------------------------
+        # FORMATTING MARKERS ([[b]] / [[i]], Update #29)
+        # Pressed right before the character is typed, AFTER any typo or
+        # slip has been typed and backspaced. That order matters: backspacing
+        # the first character after a shortcut could drop the style. The
+        # rework buffer is cleared so a rework never reaches back across a
+        # style change.
+        # --------------------------------
+        format_kinds = format_map.get(idx)
+        if format_kinds:
+            if not _press_format_toggles(settings, format_kinds, active_formats):
+                return
+            recent_typed_buffer = ""
+
         if left_entry is not None:
             # Purposely left mistake: type the wrong text instead of this
             # character (and skip any extra character it replaces).
@@ -2981,6 +3176,12 @@ def type_text(settings, is_batch=False, is_last=True):
             if not pause_event.is_set():
                 state.status = "Typing..."
 
+    # Formatting shortcuts at the very end of the file (this includes the
+    # automatic close of any style left open) come after the last character.
+    trailing_format = format_map.get(len(text))
+    if trailing_format and not _press_format_toggles(settings, trailing_format, active_formats):
+        return
+
     # A {{pause:N}} marker at the very end of the file waits after the last character.
     trailing_pause = pause_map.get(len(text))
     if trailing_pause:
@@ -3011,6 +3212,13 @@ def estimate_smart_fix_seconds(prepared, settings, start_index=0):
         return 0.0
     acted_count = sum(len(acts) for index, acts in prepared.fix_actions.items() if index >= start_index)
     return acted_count * (chance / 100.0) * 1.0
+
+
+def estimate_format_toggle_seconds(prepared, start_index=0):
+    """Rough time for the bold and italic shortcuts (Update #29) from
+    start_index onward. Each press takes about a third of a second."""
+    press_count = sum(len(kinds) for index, kinds in prepared.format_map.items() if index >= start_index)
+    return press_count * FORMAT_TOGGLE_ESTIMATE_SECONDS
 
 
 def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seconds=0.0, extra_seconds=0.0):
@@ -3229,6 +3437,7 @@ def validate_settings():
 
     enable_finger_timing = bool(enable_finger_timing_var.get())
     enable_pause_markers = bool(enable_pause_markers_var.get())
+    enable_format_markers = bool(enable_format_markers_var.get())
 
     enable_smart_fixes = bool(enable_smart_fixes_var.get())
     smart_fix_spacing = bool(smart_fix_spacing_var.get())
@@ -3333,6 +3542,7 @@ def validate_settings():
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
+        "enable_format_markers": enable_format_markers,
         "enable_smart_fixes": enable_smart_fixes,
         "smart_fix_spacing": smart_fix_spacing,
         "smart_fix_punctuation": smart_fix_punctuation,
@@ -3402,6 +3612,7 @@ def estimate_total_active_seconds(files, settings):
             text, settings, protection_mask, prepared.pause_map, resume_chars, len(text)
         )
         total_seconds += estimate_smart_fix_seconds(prepared, settings, resume_chars)
+        total_seconds += estimate_format_toggle_seconds(prepared, resume_chars)
     return total_seconds
 
 
@@ -3462,9 +3673,10 @@ def preview_estimate():
             remaining_text = text[resume_chars:] if resume_chars else text
             remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
             marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
-            fix_seconds = estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+            extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+                             + estimate_format_toggle_seconds(prepared, resume_chars or 0))
             w_count, c_count, est_sec = estimate_typing_time(
-                remaining_text, settings, remaining_mask, marker_seconds, fix_seconds
+                remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
             )
             total_fixes += len(prepared.fixes)
             total_words += w_count
@@ -3506,10 +3718,11 @@ def preview_estimate():
     remaining_text = text[resume_chars:] if resume_chars else text
     remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
     marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
-    fix_seconds = estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+    extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
+                     + estimate_format_toggle_seconds(prepared, resume_chars or 0))
 
     word_count, char_count, est_seconds = estimate_typing_time(
-        remaining_text, settings, remaining_mask, marker_seconds, fix_seconds
+        remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
     )
     est_mins = int(est_seconds // 60)
     est_secs = int(est_seconds % 60)
@@ -3621,6 +3834,41 @@ def confirm_pause_marker_warnings(files, settings):
     )
 
 
+def confirm_format_marker_warnings(files, settings):
+    """Update #29: checks every file about to be typed for bold or italic
+    markers with no partner (a stray [[/b]], a repeated [[b]], or one that is
+    never closed), BEFORE typing starts. Nothing is typed as text either way,
+    but the person may have made a mistake. Returns True if it is OK to start,
+    False if they chose to go fix the file first."""
+    if not settings.get("enable_format_markers", True):
+        return True
+
+    problems = []
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+        except OSError:
+            continue  # type_text() already reports unreadable files
+        _stripped, _positions, _spans, file_problems = strip_format_markers(raw_text)
+        file_name = os.path.basename(fpath)
+        for problem in file_problems[:5]:
+            problems.append(f"{file_name}: {problem}")
+        if len(file_problems) > 5:
+            problems.append(f"{file_name}: ...and {len(file_problems) - 5} more")
+
+    if not problems:
+        return True
+
+    return messagebox.askokcancel(
+        "Formatting Marker Warning",
+        "Some bold or italic markers need attention:\n\n"
+        + "\n".join(problems)
+        + "\n\nA pair looks like [[b]]bold text[[/b]] or [[i]]italic text[[/i]].\n\n"
+        "Click OK to start anyway, or Cancel to fix the file first.",
+    )
+
+
 def start_typing():
     if state.is_running:
         messagebox.showinfo("Already Running", "The typer is already running.")
@@ -3636,6 +3884,9 @@ def start_typing():
     files_to_run = queue_files if queue_files else [settings["input_path"]]
 
     if not confirm_pause_marker_warnings(files_to_run, settings):
+        return
+
+    if not confirm_format_marker_warnings(files_to_run, settings):
         return
 
     if not confirm_target_time_plan(files_to_run, settings):
@@ -4605,6 +4856,7 @@ def get_current_settings_snapshot():
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
         "enable_pause_markers": enable_pause_markers_var.get(),
+        "enable_format_markers": enable_format_markers_var.get(),
         "enable_smart_fixes": enable_smart_fixes_var.get(),
         "smart_fix_spacing": smart_fix_spacing_var.get(),
         "smart_fix_punctuation": smart_fix_punctuation_var.get(),
@@ -4664,6 +4916,7 @@ def apply_settings_snapshot(data, include_files=True):
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
     enable_pause_markers_var.set(data.get("enable_pause_markers", True))
+    enable_format_markers_var.set(bool(data.get("enable_format_markers", True)))
     enable_smart_fixes_var.set(data.get("enable_smart_fixes", False))
     smart_fix_spacing_var.set(data.get("smart_fix_spacing", True))
     smart_fix_punctuation_var.set(data.get("smart_fix_punctuation", True))
@@ -5562,6 +5815,7 @@ paragraph_pause_max_var = tk.StringVar(value="20")
 sentence_pause_min_var = tk.StringVar(value="5")
 sentence_pause_max_var = tk.StringVar(value="7")
 enable_pause_markers_var = tk.BooleanVar(value=True)
+enable_format_markers_var = tk.BooleanVar(value=True)
 
 enable_mistakes_var = tk.BooleanVar(value=True)
 mistake_min_var = tk.StringVar(value="100")
@@ -5636,6 +5890,7 @@ SECTION_RESET_VARS = {
         sentence_pause_max_var,
         enable_pause_markers_var,
     ],
+    "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
         enable_mistakes_var,
@@ -6187,6 +6442,18 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.4.0",
+        "date": "2026-10-13",
+        "title": "Formatting markers",
+        "changes": [
+            "Added: bold and italic markers. Wrap text in [[b]]...[[/b]] or [[i]]...[[/i]] and Amanuensis presses Ctrl+B or Ctrl+I at those spots, so the text comes out bold or italic in Google Docs or Word. The markers are never typed.",
+            "Added: a Formatting Markers card on the Speed tab with one new setting, on by default, saved with your profiles and restored on launch. When it is off, the markers are still removed but no shortcuts are pressed (handy for plain web forms).",
+            "Added: a warning before typing starts if a marker has no partner (a stray closing marker, a repeated opening marker, or one that is never closed).",
+            "Modified: the pre-start time estimate includes the time for each shortcut. Reworks never delete the first formatted word, and no typo, paraphrase, or left mistake can lose or move a formatting change.",
+            "Notes: [[b]], [[/b]], [[i]], and [[/i]] are now reserved, so protected text cannot be exactly b or i. Preview does not press shortcuts. An unclosed marker is closed after the last character. When resuming, click right after the last typed character so the formatting carries on.",
+        ],
+    },
+    {
         "version": "5.3.0",
         "date": "2026-10-12",
         "title": "Finger and hand timing",
@@ -6556,6 +6823,7 @@ frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
+frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
 frame_typos = make_modern_card(tab_mistakes, "Character Typos")
@@ -6831,6 +7099,25 @@ modern_label(
     "Turn this off to type markers as normal text.",
     kind="muted",
 ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Formatting markers (Update #29) ---
+modern_checkbox(
+    frame_format_markers, "Press bold and italic shortcuts for formatting markers", enable_format_markers_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_format_markers,
+    "Wrap text in [[b]]bold[[/b]] or [[i]]italic[[/i]] and Amanuensis presses "
+    "Ctrl+B or Ctrl+I at those spots, so it comes out formatted in Google Docs "
+    "or Word. The markers themselves are never typed. You can use both at once.\n\n"
+    "Turn this off to remove the markers without pressing any shortcut (good for "
+    "plain web forms, where Ctrl+B may do something else).\n\n"
+    "[[b]], [[/b]], [[i]], and [[/i]] are reserved, so protected text cannot be "
+    "exactly b or i. Reworks never delete the first formatted word, and the "
+    "sentence drafts are skipped while a style is on. When resuming, click right "
+    "after the last typed character so the formatting carries on.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
 # --- Character typos ---
 modern_checkbox(frame_typos, "Enable adjacent-key typos", enable_typos_var).grid(
@@ -7159,6 +7446,7 @@ SECTION_CARDS = {
     "Fatigue Drift": frame_fatigue,
     "Finger & Hand Timing": frame_finger_timing,
     "Natural Pauses": frame_pauses,
+    "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
     "Smart Text Fixes": frame_smart_fixes,
