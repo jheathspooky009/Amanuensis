@@ -9,6 +9,18 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.3.0 (2026-10-12) -- Finger and hand timing (Update #28)
+#   - Added: A "Finger & Hand Timing" card on the Speed tab. Two letters typed
+#     with opposite hands in a row go slightly faster, and two different letters
+#     on the same finger (like "ed" or "lo") go slightly slower, like on a real
+#     keyboard. Uses the standard QWERTY touch-typing finger map.
+#   - Added: One new setting (enable_finger_timing), on by default, saved with
+#     profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the small net change. The
+#     16 common letter pairs keep their fast fixed speed.
+#   - Notes: Only letter-to-letter pairs change (spaces, digits, and punctuation
+#     do not). The change happens before fatigue drift. No new packages.
+#
 # v5.2.0 (2026-10-12) -- Resume across sessions (Update #18)
 #   - Added: resume_state.json v2 format with atomic writes (.tmp + os.replace)
 #     and thread safety, storing progress per file keyed by canonical path.
@@ -29,15 +41,6 @@
 #   - Notes: Preview ignores the target. Amanuensis never types faster than the
 #     speed settings, so a target that is too short cannot be reached. Keep the
 #     computer awake during a long run, and use Target Window Lock.
-#
-# v5.0.2 (2026-10-11) -- Release notes from version history (maintenance)
-#   - Added: The GitHub release description is now written automatically from
-#     the newest VERSION_HISTORY entry (scripts/release_notes.py), so the code,
-#     the app's History tab, and the release page always match.
-#   - Modified: A release now stops before publishing if the newest entry is
-#     missing or its version does not match the tag. CI also checks on every
-#     pull request that the notes can be built.
-#   - Notes: No change to how the app works, no new settings, no new packages.
 # ============================================
 
 import pyautogui
@@ -166,6 +169,79 @@ state = TyperState()
 # COMMON LETTER PAIRS (typed slightly faster)
 # --------------------------------------------
 COMMON_PAIRS = {'th', 'he', 'an', 'in', 'er', 're', 'nd', 'ou', 'en', 'to', 'nt', 'ha', 'it', 'is', 'or', 'as'}
+
+# --------------------------------------------
+# FINGER AND HAND TIMING (Update #28)
+# --------------------------------------------
+# Which hand and finger types each letter on a QWERTY keyboard (standard
+# touch typing). Each letter maps to (hand, finger). Index fingers cover two
+# columns of keys, so they own more letters than the other fingers.
+FINGER_FOR_LETTER = {
+    'q': ('left', 'pinky'), 'a': ('left', 'pinky'), 'z': ('left', 'pinky'),
+    'w': ('left', 'ring'), 's': ('left', 'ring'), 'x': ('left', 'ring'),
+    'e': ('left', 'middle'), 'd': ('left', 'middle'), 'c': ('left', 'middle'),
+    'r': ('left', 'index'), 'f': ('left', 'index'), 'v': ('left', 'index'),
+    't': ('left', 'index'), 'g': ('left', 'index'), 'b': ('left', 'index'),
+    'y': ('right', 'index'), 'h': ('right', 'index'), 'n': ('right', 'index'),
+    'u': ('right', 'index'), 'j': ('right', 'index'), 'm': ('right', 'index'),
+    'i': ('right', 'middle'), 'k': ('right', 'middle'),
+    'o': ('right', 'ring'), 'l': ('right', 'ring'),
+    'p': ('right', 'pinky'),
+}
+
+# Multipliers on the delay before a letter. Switching hands lets one hand get
+# ready while the other types, so it is a little faster. Two different keys on
+# the same finger cannot overlap, so they are a little slower.
+HAND_SWITCH_MULTIPLIER = 0.92
+SAME_FINGER_MULTIPLIER = 1.18
+
+
+def get_finger_timing_multiplier(prev_char, char):
+    """Returns the delay multiplier for typing `char` right after `prev_char`.
+    1.0 means no change. Only letter-to-letter pairs change: spaces, digits,
+    punctuation, and a repeated letter (like the double l in "all") stay 1.0."""
+    if not prev_char or not char:
+        return 1.0
+    prev_letter = prev_char[-1].lower()
+    letter = char[0].lower()
+    if prev_letter == letter:
+        return 1.0
+    prev_finger = FINGER_FOR_LETTER.get(prev_letter)
+    this_finger = FINGER_FOR_LETTER.get(letter)
+    if prev_finger is None or this_finger is None:
+        return 1.0
+    if prev_finger[0] != this_finger[0]:
+        return HAND_SWITCH_MULTIPLIER
+    if prev_finger == this_finger:
+        return SAME_FINGER_MULTIPLIER
+    return 1.0
+
+
+def _build_finger_pair_shifts():
+    """Builds a lookup from a two-letter pair to how far its multiplier is from
+    1.0. The 16 common pairs are left out because they already type at their
+    own fast fixed speed. Used by the time estimate so it stays quick."""
+    shifts = {}
+    for first in FINGER_FOR_LETTER:
+        for second in FINGER_FOR_LETTER:
+            pair = first + second
+            if pair in COMMON_PAIRS:
+                continue
+            shift = get_finger_timing_multiplier(first, second) - 1.0
+            if shift != 0.0:
+                shifts[pair] = shift
+    return shifts
+
+
+FINGER_PAIR_SHIFTS = _build_finger_pair_shifts()
+
+
+def estimate_finger_timing_shift(text):
+    """Adds up how much the finger and hand timing changes the typing time of
+    `text`, counted in average per-character delays (negative means faster)."""
+    lowered = text.lower()
+    return sum(FINGER_PAIR_SHIFTS.get(first + second, 0.0)
+               for first, second in zip(lowered, lowered[1:]))
 
 # --------------------------------------------
 # QWERTY PHYSICAL ADJACENCY (for realistic single-letter typos)
@@ -2396,6 +2472,7 @@ def type_text(settings, is_batch=False, is_last=True):
     paraphrase_chance = settings.get("paraphrase_chance", 15.0)
     enable_fatigue = settings.get("enable_fatigue", False)
     fatigue_strength = settings.get("fatigue_strength", 15.0)
+    enable_finger_timing = settings.get("enable_finger_timing", True)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
 
     try:
@@ -2836,6 +2913,9 @@ def type_text(settings, is_batch=False, is_last=True):
             delay = random.uniform(min_delay, max_delay)
             if char.isalpha():
                 delay += random.uniform(0.01, 0.03)
+            if enable_finger_timing:
+                # Update #28: opposite hands a little faster, same finger a little slower
+                delay *= get_finger_timing_multiplier(prev_char, char)
 
         if enable_fatigue:
             delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
@@ -2978,6 +3058,11 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     if settings.get("enable_paraphrase") and settings.get("paraphrase_chance", 0) > 0:
         estimated_paraphrases = newline_count * (settings["paraphrase_chance"] / 100)
         total_seconds += estimated_paraphrases * 4.0
+
+    if settings.get("enable_finger_timing", True):
+        # Finger and hand timing (Update #28): hand switches are a little faster and
+        # same-finger pairs a little slower. The shift is counted in average delays.
+        total_seconds += estimate_finger_timing_shift(text) * avg_delay
 
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
@@ -3142,6 +3227,7 @@ def validate_settings():
         fatigue_strength = 15.0
         fatigue_strength_var.set("15")
 
+    enable_finger_timing = bool(enable_finger_timing_var.get())
     enable_pause_markers = bool(enable_pause_markers_var.get())
 
     enable_smart_fixes = bool(enable_smart_fixes_var.get())
@@ -3243,6 +3329,7 @@ def validate_settings():
         "activity_sensitivity": activity_sensitivity,
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
+        "enable_finger_timing": enable_finger_timing,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -4513,6 +4600,7 @@ def get_current_settings_snapshot():
         "activity_sensitivity": activity_sensitivity_var.get(),
         "enable_fatigue": enable_fatigue_var.get(),
         "fatigue_strength": fatigue_strength_var.get(),
+        "enable_finger_timing": enable_finger_timing_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -4571,6 +4659,7 @@ def apply_settings_snapshot(data, include_files=True):
     activity_sensitivity_var.set(str(data.get("activity_sensitivity", "20")))
     enable_fatigue_var.set(data.get("enable_fatigue", False))
     fatigue_strength_var.set(str(data.get("fatigue_strength", "15")))
+    enable_finger_timing_var.set(bool(data.get("enable_finger_timing", True)))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -5462,6 +5551,7 @@ max_delay_var = tk.StringVar(value="0.15")
 target_wpm_var = tk.StringVar(value="")
 enable_fatigue_var = tk.BooleanVar(value=False)
 fatigue_strength_var = tk.StringVar(value="15")
+enable_finger_timing_var = tk.BooleanVar(value=True)
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -5538,6 +5628,7 @@ SECTION_RESET_VARS = {
     "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
+    "Finger & Hand Timing": [enable_finger_timing_var],
     "Natural Pauses": [
         paragraph_pause_min_var,
         paragraph_pause_max_var,
@@ -6096,6 +6187,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.3.0",
+        "date": "2026-10-12",
+        "title": "Finger and hand timing",
+        "changes": [
+            "Added: a Finger & Hand Timing card on the Speed tab. Two letters typed with opposite hands in a row come a little sooner, and two different letters typed with the same finger (like \"ed\" or \"lo\") come a little later, like on a real keyboard.",
+            "Added: one new setting (enable finger and hand timing), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the small net change. The 16 common letter pairs keep their quick fixed speed.",
+            "Notes: only letter-to-letter pairs change. Spaces, numbers, punctuation, and doubled letters keep their normal timing, and fatigue drift is applied after this change.",
+        ],
+    },
+    {
         "version": "5.2.0",
         "date": "2026-10-12",
         "title": "Resume across sessions",
@@ -6452,6 +6554,7 @@ frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
 frame_settings = make_modern_card(tab_speed, "Typing Speed")
 frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
+frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -6679,6 +6782,23 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Finger and hand timing ---
+modern_checkbox(
+    frame_finger_timing, "Enable finger and hand timing", enable_finger_timing_var
+).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+modern_label(
+    frame_finger_timing,
+    "Types like real hands on a QWERTY keyboard. When two letters in a row use "
+    "opposite hands (like the \"ti\" in \"time\"), the second one comes a little "
+    "sooner. When two different letters use the same finger (like \"ed\" or \"lo\"), "
+    "it comes a little later.\n\n"
+    "Only letters are affected. Spaces, numbers, punctuation, and doubled letters "
+    "keep their normal timing, and the common letter pairs keep their quick speed.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
 # --- Natural pauses (always on, not tied to any enable checkbox) ---
 modern_label(frame_pauses, "Paragraph pause, min (s)").grid(row=0, column=0, sticky="w")
@@ -7037,6 +7157,7 @@ SECTION_CARDS = {
     "Typing Speed": frame_settings,
     "Target Time": frame_target_time,
     "Fatigue Drift": frame_fatigue,
+    "Finger & Hand Timing": frame_finger_timing,
     "Natural Pauses": frame_pauses,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,

@@ -17,6 +17,7 @@ Amanuensis reads text from a file and types it into whatever window currently ha
 ## Features
 
 - **Configurable typing speed** — min/max delay per character, with a slight speed-up on common letter pairs (`th`, `he`, `an`, etc.)
+- **Finger and hand timing** — an optional setting (on by default) that follows a QWERTY touch-typing finger map. Two letters typed with opposite hands come a little sooner, and two different letters on the same finger (like `ed` or `lo`) come a little later. Only letters are affected
 - **Natural pauses** — a short "thinking" pause at every paragraph break, and a longer pause after sentence-ending punctuation, independent of any research break
 - **Sentence reworks** — occasionally pauses, deletes the last few words just typed, and retypes them, simulating real hesitation (final text always stays exactly correct)
 - **Adjacent-key typos** — a configurable per-letter chance of a realistic, physically-nearby keyboard typo that gets caught and corrected
