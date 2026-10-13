@@ -341,6 +341,13 @@ def check_versions(root, tag, findings):
 # Main
 # --------------------------------------------------------------------------
 
+def safe_kind_for_output(kind):
+    """Redact sensitive finding details before printing."""
+    if "secret" in kind.lower():
+        return "contains sensitive data"
+    return kind
+
+
 def main():
     parser = argparse.ArgumentParser(description="Amanuensis repository security check")
     parser.add_argument("--tag", help="a release tag such as v5.0.0, checked against the app version")
@@ -367,7 +374,7 @@ def main():
 
     print(f"FAIL: {len(findings)} problem(s) found. Values are hidden on purpose.")
     for where, kind in findings.items:
-        print(f"  - {where}: {kind}")
+        print(f"  - {where}: {safe_kind_for_output(kind)}")
     return 1
 
 
