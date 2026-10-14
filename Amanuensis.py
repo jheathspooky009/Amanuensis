@@ -9,6 +9,23 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.7.0 (2026-10-13) -- Auto-pick a profile by window (Update #30)
+#   - Added: Auto Profile by Window. Add rules that pair some words from a window
+#     title (like "Google Docs") with a saved profile. When a run starts, the first
+#     rule whose words appear in the target window's title loads its profile, so
+#     each program gets its own typing style.
+#   - Added: An "Auto Profile by Window" card on the Window tab with two new
+#     settings (enable_auto_profile, off by default, and auto_profile_rules, an
+#     empty list by default), restored on launch.
+#   - Modified: The target window is the locked window when Lock typing is on,
+#     otherwise the window that was active when Start was pressed. Clicking the
+#     Start button makes Amanuensis itself active, so use the Start hotkey.
+#   - Notes: Rules hold window words, so they are never saved into profiles and
+#     are ignored when a profile is loaded. A rule can only name a file inside the
+#     profiles folder. An auto-picked profile never changes hotkeys, theme, or
+#     update settings. The log records only the profile name, never the window
+#     title. Preview and the time estimate do not switch profiles. No new packages.
+#
 # v5.6.0 (2026-10-13) -- Flow and hesitation states (Update #31)
 #   - Added: Typing moods. The typist drifts between three states: normal,
 #     flow (a stretch of 80 to 270 characters typed about 15% faster), and
@@ -39,25 +56,6 @@
 #     to be typed (so resume works). Protected text never gets a pause, and a pause
 #     press or window switch during a wait is caught before the next character.
 #     The log records only the spot and length, never the words. No new packages.
-#
-# v5.4.0 (2026-10-13) -- Formatting markers (Update #29)
-#   - Added: Formatting markers for bold and italic. Wrap text in [[b]]...[[/b]]
-#     or [[i]]...[[/i]] and Amanuensis presses Ctrl+B or Ctrl+I at those spots,
-#     so the text comes out bold or italic in Google Docs or Word. The markers
-#     themselves are never typed.
-#   - Added: A "Formatting Markers" card on the Speed tab with one new setting
-#     (enable_format_markers), on by default, saved with profiles and restored
-#     on launch. When it is off the markers are still removed, but no shortcuts
-#     are pressed (handy for plain web forms).
-#   - Added: A warning before typing starts if a marker has no partner (a stray
-#     [[/b]], a repeated [[b]], or one that is never closed).
-#   - Modified: The pre-start time estimate includes the time for each shortcut.
-#     Reworks never delete the first formatted word of a span, and no typo,
-#     paraphrase, or left mistake can ever lose or move a formatting change.
-#   - Notes: [[b]], [[/b]], [[i]], and [[/i]] (any capitals) are now reserved, so
-#     protected text cannot be exactly b or i. Preview does not press shortcuts.
-#     An unclosed marker is closed after the last character. When resuming, click
-#     right after the last typed character so the formatting carries on.
 #
 # ============================================
 
@@ -3800,6 +3798,11 @@ def validate_settings():
 
     locked_window = window_var.get().strip() if lock_window_var.get() else ""
 
+    # Auto Profile by Window (Update #30). The rules are cleaned on the way in,
+    # so anything malformed has already been dropped.
+    enable_auto_profile = bool(enable_auto_profile_var.get())
+    auto_profile_rules = get_auto_profile_rules()
+
     auto_pause_activity = auto_pause_activity_var.get()
     try:
         activity_sensitivity = float(activity_sensitivity_var.get())
@@ -3946,6 +3949,8 @@ def validate_settings():
         "enable_mistakes": enable_mistakes,
         "enable_breaks": enable_breaks,
         "locked_window": locked_window,
+        "enable_auto_profile": enable_auto_profile,
+        "auto_profile_rules": auto_profile_rules,
         "auto_pause_activity": auto_pause_activity,
         "activity_sensitivity": activity_sensitivity,
         "enable_fatigue": enable_fatigue,
@@ -4290,6 +4295,12 @@ def start_typing():
         messagebox.showinfo("Already Running", "The typer is already running.")
         return
 
+    # Auto Profile by Window (Update #30): this may load a saved profile into
+    # the settings, so it must run before the settings are checked below.
+    keep_starting, auto_profile_used = apply_auto_profile_for_start()
+    if not keep_starting:
+        return
+
     settings = validate_settings()
     if settings is None:
         return
@@ -4390,6 +4401,9 @@ def start_typing():
     state.status = "Countdown..."
     state.logging_enabled = log_enabled_var.get()
     state.log_entries = []
+    if auto_profile_used:
+        # Only the profile's name is logged, never the window title.
+        log_event("auto_profile", f"loaded profile {auto_profile_used}")
     state.left_mistakes = []
     state.left_mistakes_resumed = False
     state.locked_window_title = settings["locked_window"]
@@ -5261,6 +5275,8 @@ def get_current_settings_snapshot():
         "sentence_pause_max": sentence_pause_max_var.get(),
         "input_path": input_path_var.get(),
         "file_queue": get_queue_files(),
+        "enable_auto_profile": enable_auto_profile_var.get(),
+        "auto_profile_rules": get_auto_profile_rules(),
         "enable_notify": enable_notify_var.get(),
         "enable_sound": enable_sound_var.get(),
         "auto_pause_activity": auto_pause_activity_var.get(),
@@ -5294,10 +5310,12 @@ def get_current_settings_snapshot():
     }
 
 
-def apply_settings_snapshot(data, include_files=True):
+def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     """Puts saved settings into the window. include_files=False ignores the
-    folder paths in the data (the batch queue), which is what loading a
-    shared profile does. Malformed or non-dictionary data is ignored so a
+    personal parts of the data (the batch queue and the Auto Profile rules),
+    which is what loading a shared profile does. rebind_hotkeys=False leaves
+    the hotkey bindings alone (used when a profile is auto-picked at the
+    moment Start is pressed). Malformed or non-dictionary data is ignored so a
     damaged profile or hand-edited settings file cannot crash the app."""
     if not isinstance(data, dict):
         return
@@ -5361,7 +5379,11 @@ def apply_settings_snapshot(data, include_files=True):
             btn_theme_toggle.configure(text=f"Theme: {saved_theme.capitalize()}")
     if include_files and "file_queue" in data and isinstance(data["file_queue"], (list, tuple)):
         file_queue_var.set(list(data["file_queue"]))
-    apply_hotkeys()
+    if include_files:
+        enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
+        set_auto_profile_rules(data.get("auto_profile_rules", []))
+    if rebind_hotkeys:
+        apply_hotkeys()
 
 
 def save_profile():
@@ -5375,10 +5397,13 @@ def save_profile():
     if not path:
         return
     try:
-        # Profiles are made to be shared, so they never carry folder paths.
+        # Profiles are made to be shared, so they never carry folder paths or
+        # the Auto Profile rules (which hold window title words).
         profile_data = get_current_settings_snapshot()
         profile_data.pop("input_path", None)
         profile_data.pop("file_queue", None)
+        profile_data.pop("enable_auto_profile", None)
+        profile_data.pop("auto_profile_rules", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -5405,6 +5430,263 @@ def load_profile():
         messagebox.showinfo("Profile Loaded", f"Profile loaded from:\n{path}")
     except (OSError, ValueError, TypeError, AttributeError, tk.TclError) as e:
         messagebox.showerror("Load Failed", str(e))
+
+
+# --------------------------------------------
+# AUTO PROFILE BY WINDOW (Update #30)
+# --------------------------------------------
+# A rule says: if the target window's title contains these words, load this
+# saved profile. The rules live as JSON text in one tk variable so they fit the
+# normal settings pattern. They hold window title words, which can be personal,
+# so they are never saved into a profile and are ignored when one is loaded.
+MAX_AUTO_PROFILE_RULES = 20
+MAX_AUTO_PROFILE_KEYWORD_LENGTH = 60
+MAX_PROFILE_FILE_BYTES = 1000000
+
+# An auto-picked profile never changes these. They belong to the app or to the
+# current run, not to a typing style.
+AUTO_PROFILE_KEEP_KEYS = (
+    "hotkey_start",
+    "hotkey_pause",
+    "hotkey_stop",
+    "theme",
+    "enable_update_check",
+    "skipped_update_version",
+    "input_path",
+    "file_queue",
+    "enable_auto_profile",
+    "auto_profile_rules",
+)
+
+
+def is_safe_profile_name(name):
+    """True only for a plain '.json' file name with no folder part, so a rule
+    can only ever point at a file inside the profiles folder."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name != os.path.basename(name) or name in (".", ".."):
+        return False
+    if any(ch in name for ch in ("/", "\\", ":", "\x00")):
+        return False
+    return name.lower().endswith(".json") and len(name) > len(".json")
+
+
+def clean_auto_profile_rules(value):
+    """Turns saved data (a list, or JSON text holding a list) into a clean list
+    of {"keyword": ..., "profile": ...} rules. Anything malformed is skipped,
+    because settings files are untrusted input."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    rules = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        keyword = item.get("keyword")
+        profile_name = item.get("profile")
+        if not isinstance(keyword, str) or not isinstance(profile_name, str):
+            continue
+        keyword = keyword.strip()
+        if not keyword or len(keyword) > MAX_AUTO_PROFILE_KEYWORD_LENGTH:
+            continue
+        if not is_safe_profile_name(profile_name):
+            continue
+        rules.append({"keyword": keyword, "profile": profile_name})
+        if len(rules) >= MAX_AUTO_PROFILE_RULES:
+            break
+    return rules
+
+
+def get_auto_profile_rules():
+    """The current rules as a clean list of dictionaries."""
+    return clean_auto_profile_rules(auto_profile_rules_var.get())
+
+
+def set_auto_profile_rules(rules):
+    """Stores rules (cleaned first). Changing the variable also refreshes the
+    list shown on the Window tab."""
+    auto_profile_rules_var.set(json.dumps(clean_auto_profile_rules(rules)))
+
+
+def list_profile_files():
+    """Names of the saved profile files inside the profiles folder."""
+    try:
+        names = os.listdir(PROFILE_DIR)
+    except OSError:
+        return []
+    good_names = [
+        name for name in names
+        if is_safe_profile_name(name) and os.path.isfile(os.path.join(PROFILE_DIR, name))
+    ]
+    return sorted(good_names, key=str.lower)
+
+
+def refresh_auto_profile_choices():
+    """Refills the profile dropdown from the profiles folder."""
+    names = list_profile_files()
+    auto_profile_combo.configure(values=names or [""])
+    if auto_profile_choice_var.get() not in names:
+        auto_profile_choice_var.set(names[0] if names else "")
+
+
+def refresh_auto_profile_listbox(*args):
+    """Redraws the rule list on the Window tab from the saved rules."""
+    if "auto_profile_listbox" not in globals():
+        return
+    auto_profile_listbox.delete(0, tk.END)
+    for rule in get_auto_profile_rules():
+        auto_profile_listbox.insert(tk.END, f'Title has "{rule["keyword"]}"  ->  {rule["profile"]}')
+
+
+def add_auto_profile_rule():
+    """Adds the typed words and the chosen profile as a new rule."""
+    if state.is_running:
+        return
+    keyword = auto_profile_keyword_var.get().strip()
+    profile_name = auto_profile_choice_var.get().strip()
+    if not keyword:
+        messagebox.showinfo("Add Rule", "Type some words from the window's title first, like Google Docs.")
+        return
+    if len(keyword) > MAX_AUTO_PROFILE_KEYWORD_LENGTH:
+        messagebox.showinfo(
+            "Add Rule", f"Please use {MAX_AUTO_PROFILE_KEYWORD_LENGTH} characters or fewer for the title words."
+        )
+        return
+    if not profile_name:
+        messagebox.showinfo(
+            "Add Rule",
+            "Pick a saved profile first. Save one with 'Save Profile...' on the Data tab, "
+            "keep it in the profiles folder, then click Refresh.",
+        )
+        return
+    rules = get_auto_profile_rules()
+    if len(rules) >= MAX_AUTO_PROFILE_RULES:
+        messagebox.showinfo("Add Rule", f"You can have up to {MAX_AUTO_PROFILE_RULES} rules. Remove one first.")
+        return
+    rules.append({"keyword": keyword, "profile": profile_name})
+    set_auto_profile_rules(rules)
+    auto_profile_keyword_var.set("")
+
+
+def remove_selected_auto_profile_rules():
+    """Removes the highlighted rules from the list."""
+    if state.is_running:
+        return
+    chosen = set(auto_profile_listbox.curselection())
+    if not chosen:
+        return
+    rules = get_auto_profile_rules()
+    set_auto_profile_rules([rule for index, rule in enumerate(rules) if index not in chosen])
+
+
+def get_target_window_title():
+    """The title of the window the person is typing into: the locked window when
+    Lock typing is on, otherwise the window that is active right now. Returns an
+    empty string when it cannot be known (including when the active window is
+    Amanuensis itself, which happens when the Start button was clicked)."""
+    if not HAS_PYGETWINDOW:
+        return ""
+    if lock_window_var.get():
+        return window_var.get().strip()
+    try:
+        active = gw.getActiveWindow()
+        title = active.title if active else ""
+    except Exception:
+        return ""
+    if not isinstance(title, str) or title == window.title():
+        return ""
+    return title.strip()
+
+
+def find_auto_profile_rule(title, rules):
+    """The first rule whose words appear in the title (capitals ignored), or None."""
+    lowered_title = title.lower()
+    for rule in rules:
+        if rule["keyword"].lower() in lowered_title:
+            return rule
+    return None
+
+
+def read_auto_profile_file(profile_name):
+    """Reads a profile from the profiles folder. Returns its data as a
+    dictionary, or None if it is missing, too big, or not a profile."""
+    if not is_safe_profile_name(profile_name):
+        return None
+    path = os.path.join(PROFILE_DIR, profile_name)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > MAX_PROFILE_FILE_BYTES:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_auto_profile(profile_name):
+    """Puts a saved profile into the settings. Hotkeys, theme, update settings,
+    files, and the Auto Profile rules stay as they are. Returns True on success.
+    If anything goes wrong part way, the earlier settings are put back."""
+    data = read_auto_profile_file(profile_name)
+    if data is None:
+        return False
+    backup = get_current_settings_snapshot()
+    merged = dict(backup)
+    for key, value in data.items():
+        if key in backup and key not in AUTO_PROFILE_KEEP_KEYS:
+            merged[key] = value
+    try:
+        apply_settings_snapshot(merged, include_files=False, rebind_hotkeys=False)
+    except (ValueError, TypeError, AttributeError, tk.TclError):
+        apply_settings_snapshot(backup, include_files=False, rebind_hotkeys=False)
+        return False
+    return True
+
+
+def apply_auto_profile_for_start():
+    """Runs when Start is pressed, before the settings are checked. Returns
+    (keep_starting, profile_name). keep_starting is False only when the person
+    cancels because a matching profile could not be loaded. profile_name is
+    the profile that was loaded, or an empty string if none was."""
+    auto_profile_status_var.set("")
+    if not enable_auto_profile_var.get():
+        return True, ""
+    if not HAS_PYGETWINDOW:
+        auto_profile_status_var.set("Auto pick needs pygetwindow, which is not installed.")
+        return True, ""
+    rules = get_auto_profile_rules()
+    if not rules:
+        auto_profile_status_var.set("Auto pick is on, but there are no rules yet.")
+        return True, ""
+    title = get_target_window_title()
+    if not title:
+        auto_profile_status_var.set(
+            "Auto pick could not tell which window you are typing into, so your current settings were used. "
+            "Use the Start hotkey, or lock a window."
+        )
+        return True, ""
+    rule = find_auto_profile_rule(title, rules)
+    if rule is None:
+        auto_profile_status_var.set("No rule matched the target window, so your current settings were used.")
+        return True, ""
+
+    profile_name = rule["profile"]
+    if load_auto_profile(profile_name):
+        auto_profile_status_var.set(f'Last auto pick: loaded "{profile_name}" (matched "{rule["keyword"]}").')
+        return True, profile_name
+    if messagebox.askokcancel(
+        "Auto Profile Problem",
+        f"The profile '{profile_name}' could not be loaded. It may be missing, damaged, or not a profile.\n\n"
+        "Click OK to type with your current settings instead.\n"
+        "Click Cancel to stop so you can fix the rule.",
+    ):
+        auto_profile_status_var.set(f'Could not load "{profile_name}", so your current settings were used.')
+        return True, ""
+    return False, ""
 
 
 def _reset_is_blocked():
@@ -6220,6 +6502,11 @@ file_queue_var = tk.Variable(value=[])
 
 window_var = tk.StringVar(value="")
 lock_window_var = tk.BooleanVar(value=False)
+enable_auto_profile_var = tk.BooleanVar(value=False)
+auto_profile_rules_var = tk.StringVar(value="[]")  # the rules, saved as JSON text
+auto_profile_keyword_var = tk.StringVar(value="")  # new-rule boxes (not saved)
+auto_profile_choice_var = tk.StringVar(value="")
+auto_profile_status_var = tk.StringVar(value="")
 auto_pause_activity_var = tk.BooleanVar(value=False)
 activity_sensitivity_var = tk.StringVar(value="20")
 
@@ -6306,6 +6593,7 @@ resume_status_var = tk.StringVar(value="")
 # single source of truth for default values. When you add a new
 # setting, add its variable to the matching card's list below.
 SECTION_RESET_VARS = {
+    "Auto Profile": [enable_auto_profile_var, auto_profile_rules_var],
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
     "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
@@ -6872,6 +7160,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.7.0",
+        "date": "2026-10-13",
+        "title": "Auto-pick a profile by window",
+        "changes": [
+            "Added: an Auto Profile by Window card on the Window tab. Add rules that pair some words from a window title (like \"Google Docs\") with a saved profile. When a run starts, the first rule whose words appear in the target window's title loads that profile, so each program gets its own typing style.",
+            "Added: two new settings (on or off, and the list of rules), off and empty by default, restored on launch.",
+            "Modified: the target window is the locked window if Lock typing is on, otherwise the window that was active when you pressed the Start hotkey. Clicking the Start button makes Amanuensis itself active, so use the hotkey or lock a window.",
+            "Notes: rules are never saved into profiles and are ignored when a profile is loaded, because window titles can be personal. A rule can only use a file from the profiles folder, and an auto-picked profile never changes your hotkeys, theme, or update settings. The session log records only the profile name, never the window title. Preview and the time estimate do not switch profiles.",
+        ],
+    },
+    {
         "version": "5.6.0",
         "date": "2026-10-13",
         "title": "Flow and hesitation states",
@@ -7267,6 +7566,7 @@ frame_file = make_modern_card(tab_input, "Input File")
 
 # --- Tab: Window (keeps typing going to the right place) ---
 frame_window = make_modern_card(tab_window, "Target Window Lock")
+frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
 frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
 
 # --- Tab: Speed (how fast and how steadily it types) ---
@@ -7413,6 +7713,82 @@ else:
         "pygetwindow not installed \u2014 window lock disabled.\nInstall with: pip install pygetwindow",
         kind="warning",
     ).pack(anchor="w")
+
+# --- Auto profile by window (Update #30) ---
+modern_checkbox(
+    frame_auto_profile,
+    "Pick a typing profile automatically from the window title",
+    enable_auto_profile_var,
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+modern_label(
+    frame_auto_profile,
+    "When a run starts, the first rule whose words appear in the target window's title loads its "
+    "profile. The target is the locked window if lock is on, otherwise the window that was active "
+    "when you pressed the Start hotkey. Keep your profiles in the profiles folder.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+modern_label(frame_auto_profile, "Window title contains:").grid(row=2, column=0, columnspan=2, sticky="w")
+modern_entry(frame_auto_profile, auto_profile_keyword_var, width=30).grid(
+    row=3, column=0, columnspan=2, sticky="w", pady=(4, 8)
+)
+
+modern_label(frame_auto_profile, "Use this profile:").grid(row=4, column=0, columnspan=2, sticky="w")
+auto_profile_combo = modern_combobox(frame_auto_profile, auto_profile_choice_var, width=30)
+auto_profile_combo.grid(row=5, column=0, padx=(0, 8), pady=(4, 8), sticky="we")
+modern_button(frame_auto_profile, "Refresh", refresh_auto_profile_choices, kind="neutral").grid(
+    row=5, column=1, pady=(4, 8)
+)
+modern_button(frame_auto_profile, "Add Rule", add_auto_profile_rule).grid(
+    row=6, column=0, columnspan=2, sticky="w", pady=(0, 8)
+)
+
+modern_label(frame_auto_profile, "Rules (checked from the top, the first match wins):").grid(
+    row=7, column=0, columnspan=2, sticky="w", pady=(0, 2)
+)
+auto_profile_list_frame = modern_frame(frame_auto_profile, bordered=True)
+auto_profile_list_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+auto_profile_list_frame.columnconfigure(0, weight=1)
+
+auto_profile_listbox = tk.Listbox(
+    auto_profile_list_frame,
+    height=4,
+    selectmode=tk.EXTENDED,
+    font=FONT_BODY,
+    bg=PALETTE["input_bg"],
+    fg=PALETTE["text"],
+    selectbackground=PALETTE["accent"],
+    selectforeground="#ffffff",
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    activestyle="none",
+    exportselection=False,
+)
+auto_profile_scroll = modern_scrollbar(auto_profile_list_frame, auto_profile_listbox.yview)
+auto_profile_listbox.configure(yscrollcommand=auto_profile_scroll.set)
+auto_profile_listbox.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+auto_profile_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=10)
+
+
+def _auto_profile_listbox_scroll(event):
+    auto_profile_listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    return "break"
+
+
+auto_profile_listbox.bind("<MouseWheel>", _auto_profile_listbox_scroll)
+
+modern_button(
+    frame_auto_profile, "Remove Selected", remove_selected_auto_profile_rules, kind="neutral"
+).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 4))
+modern_label(frame_auto_profile, textvariable=auto_profile_status_var, kind="muted", wraplength=420).grid(
+    row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+frame_auto_profile.columnconfigure(0, weight=1)
+refresh_auto_profile_choices()
+refresh_auto_profile_listbox()
+auto_profile_rules_var.trace_add("write", refresh_auto_profile_listbox)
 
 # --- Activity auto-pause ---
 modern_checkbox(
@@ -7940,6 +8316,7 @@ for _release_index, _release in enumerate(_past_releases):
 # Each button is added in the first free row at the bottom of its card,
 # after the card has been fully built above.
 SECTION_CARDS = {
+    "Auto Profile": frame_auto_profile,
     "Activity Auto-Pause": frame_activity,
     "Typing Speed": frame_settings,
     "Target Time": frame_target_time,
