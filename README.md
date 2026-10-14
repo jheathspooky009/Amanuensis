@@ -18,6 +18,7 @@ Amanuensis reads text from a file and types it into whatever window currently ha
 
 - **Configurable typing speed** — min/max delay per character, with a slight speed-up on common letter pairs (`th`, `he`, `an`, etc.)
 - **Finger and hand timing** — an optional setting (on by default) that follows a QWERTY touch-typing finger map. Two letters typed with opposite hands come a little sooner, and two different letters on the same finger (like `ed` or `lo`) come a little later. Only letters are affected
+- **Flow and hesitation** — an optional setting (on by default) that gives the typist moods. Amanuensis drifts between normal, flow (about 15% faster), and hesitant (about 25% slower) stretches that last a few dozen to a few hundred characters, and the speed eases in and out so it never jumps. A Mood Strength setting (0 to 200%) scales the swings. Only speed changes, and a long break puts the typist back in the normal state
 - **Natural pauses** — a short "thinking" pause at every paragraph break, and a longer pause after sentence-ending punctuation, independent of any research break
 - **Sentence reworks** — occasionally pauses, deletes the last few words just typed, and retypes them, simulating real hesitation (final text always stays exactly correct)
 - **Adjacent-key typos** — a configurable per-letter chance of a realistic, physically-nearby keyboard typo that gets caught and corrected

@@ -9,6 +9,21 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.6.0 (2026-10-13) -- Flow and hesitation states (Update #31)
+#   - Added: Typing moods. The typist drifts between three states: normal,
+#     flow (a stretch of 80 to 270 characters typed about 15% faster), and
+#     hesitant (a stretch of 40 to 150 characters typed about 25% slower).
+#     Changes ease in over about 12 characters, so speed never jumps.
+#   - Added: A "Flow & Hesitation" card on the Speed tab with two new settings
+#     (enable_typing_moods, on by default, and typing_mood_strength, 100 by
+#     default, 0 to 200), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the small average change.
+#     A session break or research break puts the typist back in the normal state.
+#   - Notes: The mood changes the delay before fatigue drift is applied, so the
+#     two stack. Only speed changes (no extra pauses, typos, or reworks). Resume
+#     starts in the normal state. The log records only the mood and position.
+#     No new packages.
+#
 # v5.5.0 (2026-10-13) -- Difficulty-aware thinking pauses (Update #33)
 #   - Added: Thinking pauses that depend on how hard the text is. Before a hard
 #     word (long, many syllables, numbers, an acronym, or rare letters) there is
@@ -44,17 +59,6 @@
 #     An unclosed marker is closed after the last character. When resuming, click
 #     right after the last typed character so the formatting carries on.
 #
-# v5.3.0 (2026-10-12) -- Finger and hand timing (Update #28)
-#   - Added: A "Finger & Hand Timing" card on the Speed tab. Two letters typed
-#     with opposite hands in a row go slightly faster, and two different letters
-#     on the same finger (like "ed" or "lo") go slightly slower, like on a real
-#     keyboard. Uses the standard QWERTY touch-typing finger map.
-#   - Added: One new setting (enable_finger_timing), on by default, saved with
-#     profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the small net change. The
-#     16 common letter pairs keep their fast fixed speed.
-#   - Notes: Only letter-to-letter pairs change (spaces, digits, and punctuation
-#     do not). The change happens before fatigue drift. No new packages.
 # ============================================
 
 import pyautogui
@@ -2487,6 +2491,110 @@ def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000)
 
 
 # --------------------------------------------
+# FLOW AND HESITATION STATES (Update #31)
+# --------------------------------------------
+# Fatigue drift only slows the typist down over time. Real typing also has
+# moods: a stretch where the words are coming easily (flow) and a stretch of
+# second-guessing (hesitation). The typist moves between three states:
+#   normal -> flow or hesitant -> normal -> ...
+# Each state lasts a random number of characters. The speed changes ease in
+# over a few characters so it never jumps. Only speed changes here.
+MOOD_NORMAL = "normal"
+MOOD_FLOW = "flow"
+MOOD_HESITANT = "hesitant"
+MOOD_LENGTH_CHARS = {
+    MOOD_NORMAL: (100, 300),
+    MOOD_FLOW: (80, 270),
+    MOOD_HESITANT: (40, 150),
+}
+MOOD_FLOW_CHANCE = 0.55         # chance that the next mood after normal is flow
+MOOD_FLOW_SPEEDUP = 0.15        # at 100% strength, flow is 15% quicker
+MOOD_HESITANT_SLOWDOWN = 0.25   # at 100% strength, hesitation is 25% slower
+MOOD_EASE_CHARS = 12            # characters it takes to ease into a new speed
+MOOD_STRENGTH_MAX = 200.0
+
+
+def clamp_mood_strength(strength_percent):
+    """Returns the mood strength as a float between 0 and MOOD_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), MOOD_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_mood_target_multiplier(mood, strength_percent):
+    """Returns the delay multiplier a mood is heading toward (never below 0.5)."""
+    strength = clamp_mood_strength(strength_percent) / 100.0
+    if mood == MOOD_FLOW:
+        return max(0.5, 1.0 - MOOD_FLOW_SPEEDUP * strength)
+    if mood == MOOD_HESITANT:
+        return 1.0 + MOOD_HESITANT_SLOWDOWN * strength
+    return 1.0
+
+
+def estimate_mood_multiplier(strength_percent):
+    """Average delay multiplier over a long run, for the pre-start estimate.
+
+    One cycle is a normal stretch followed by either a flow stretch or a
+    hesitant stretch, each weighted by its average length in characters.
+    """
+    def average_length(mood):
+        low, high = MOOD_LENGTH_CHARS[mood]
+        return (low + high) / 2.0
+
+    flow_chars = MOOD_FLOW_CHANCE * average_length(MOOD_FLOW)
+    hesitant_chars = (1.0 - MOOD_FLOW_CHANCE) * average_length(MOOD_HESITANT)
+    normal_chars = average_length(MOOD_NORMAL)
+    total_chars = normal_chars + flow_chars + hesitant_chars
+    weighted = (
+        normal_chars * get_mood_target_multiplier(MOOD_NORMAL, strength_percent)
+        + flow_chars * get_mood_target_multiplier(MOOD_FLOW, strength_percent)
+        + hesitant_chars * get_mood_target_multiplier(MOOD_HESITANT, strength_percent)
+    )
+    return weighted / total_chars
+
+
+class TypingMood:
+    """Tracks the typist's current mood and gives a delay multiplier per key."""
+
+    def __init__(self, strength_percent):
+        self.strength = clamp_mood_strength(strength_percent)
+        self.mood = MOOD_NORMAL
+        self.multiplier = 1.0
+        self.chars_left = self._draw_length(MOOD_NORMAL)
+
+    @staticmethod
+    def _draw_length(mood):
+        low, high = MOOD_LENGTH_CHARS[mood]
+        return random.randint(low, high)
+
+    def reset(self):
+        """A long rest puts the typist back in the normal state right away."""
+        self.mood = MOOD_NORMAL
+        self.multiplier = 1.0
+        self.chars_left = self._draw_length(MOOD_NORMAL)
+
+    def step(self):
+        """Call once per typed character.
+
+        Returns (multiplier, new_mood). new_mood is the name of the mood that
+        just started, or None when the mood did not change on this character.
+        """
+        new_mood = None
+        self.chars_left -= 1
+        if self.chars_left <= 0:
+            if self.mood == MOOD_NORMAL:
+                self.mood = MOOD_FLOW if random.random() < MOOD_FLOW_CHANCE else MOOD_HESITANT
+            else:
+                self.mood = MOOD_NORMAL
+            self.chars_left = self._draw_length(self.mood)
+            new_mood = self.mood
+        target = get_mood_target_multiplier(self.mood, self.strength)
+        self.multiplier += (target - self.multiplier) / MOOD_EASE_CHARS
+        return self.multiplier, new_mood
+
+
+# --------------------------------------------
 # TYPO SIMULATION HELPERS
 # --------------------------------------------
 def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos):
@@ -2841,6 +2949,8 @@ def type_text(settings, is_batch=False, is_last=True):
     enable_fatigue = settings.get("enable_fatigue", False)
     fatigue_strength = settings.get("fatigue_strength", 15.0)
     enable_finger_timing = settings.get("enable_finger_timing", True)
+    enable_typing_moods = settings.get("enable_typing_moods", True)
+    typing_mood_strength = settings.get("typing_mood_strength", 100.0)
     enable_difficulty_pauses = settings.get("enable_difficulty_pauses", True)
     difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
@@ -2980,6 +3090,10 @@ def type_text(settings, is_batch=False, is_last=True):
     # Multiplier starts fresh on run start and resume-from-checkpoint
     fatigue_chars = 0
 
+    # Flow and hesitation states (Update #31). None when switched off or at 0%.
+    # Like fatigue, a resumed run starts in the normal state.
+    typing_mood = TypingMood(typing_mood_strength) if enable_typing_moods and typing_mood_strength > 0 else None
+
     # Tracks when we last wrote an autosave checkpoint. Initialized to 0
     # so the first eligible sentence-end immediately saves.
     last_autosave_time = 0.0
@@ -3048,6 +3162,8 @@ def type_text(settings, is_batch=False, is_last=True):
                 log_event("session_break_end", "")
                 if enable_fatigue:
                     fatigue_chars = 0  # a long rest fully recovers from fatigue
+                if typing_mood is not None:
+                    typing_mood.reset()  # and the typist starts fresh in the normal state
                 state.status = "Typing..."
             else:
                 log_event("session_break_skipped", "no spare time left for this break")
@@ -3156,6 +3272,8 @@ def type_text(settings, is_batch=False, is_last=True):
                     p_delay = random.uniform(min_delay, max_delay)
                     if p_char.isalpha():
                         p_delay += random.uniform(0.01, 0.03)
+                    if typing_mood is not None:
+                        p_delay *= typing_mood.step()[0]
                     if enable_fatigue:
                         p_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
                         fatigue_chars += 1
@@ -3266,6 +3384,8 @@ def type_text(settings, is_batch=False, is_last=True):
                 if enable_fatigue:
                     # Partly recover from fatigue after a research break
                     fatigue_chars = int(fatigue_chars * 0.25)
+                if typing_mood is not None:
+                    typing_mood.reset()  # a research break also clears the mood
 
                 para_count = 0
                 next_break_target = random.randint(break_min, break_max)
@@ -3347,6 +3467,13 @@ def type_text(settings, is_batch=False, is_last=True):
             if enable_finger_timing:
                 # Update #28: opposite hands a little faster, same finger a little slower
                 delay *= get_finger_timing_multiplier(prev_char, char)
+
+        if typing_mood is not None:
+            # Update #31: flow makes the key quicker, hesitation slower (before fatigue)
+            mood_multiplier, mood_started = typing_mood.step()
+            delay *= mood_multiplier
+            if mood_started in (MOOD_FLOW, MOOD_HESITANT):
+                log_event("typing_mood", f"{mood_started} from character {idx}")
 
         if enable_fatigue:
             delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
@@ -3536,6 +3663,12 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
         avg_fatigue_mult = 1.0 + (fatigue_strength / 200.0)
         total_seconds += (char_count * avg_delay) * (avg_fatigue_mult - 1.0)
 
+    if settings.get("enable_typing_moods", True) and settings.get("typing_mood_strength", 100.0) > 0:
+        # Flow and hesitation states (Update #31): the average speed change over a
+        # long run (a small net number, since flow and hesitation roughly balance).
+        mood_shift = estimate_mood_multiplier(settings["typing_mood_strength"]) - 1.0
+        total_seconds += (char_count * avg_delay) * mood_shift
+
     # Total of all inline {{pause:N}} markers still ahead (exact, not an average).
     total_seconds += marker_pause_seconds
 
@@ -3691,6 +3824,18 @@ def validate_settings():
         fatigue_strength_var.set("15")
 
     enable_finger_timing = bool(enable_finger_timing_var.get())
+    enable_typing_moods = bool(enable_typing_moods_var.get())
+    try:
+        typing_mood_strength = float(typing_mood_strength_var.get())
+        if typing_mood_strength < 0:
+            typing_mood_strength = 0.0
+            typing_mood_strength_var.set("0")
+        elif typing_mood_strength > MOOD_STRENGTH_MAX:
+            typing_mood_strength = MOOD_STRENGTH_MAX
+            typing_mood_strength_var.set(f"{MOOD_STRENGTH_MAX:g}")
+    except ValueError:
+        typing_mood_strength = 100.0
+        typing_mood_strength_var.set("100")
     enable_difficulty_pauses = bool(enable_difficulty_pauses_var.get())
     try:
         difficulty_pause_strength = float(difficulty_pause_strength_var.get())
@@ -3806,6 +3951,8 @@ def validate_settings():
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
         "enable_finger_timing": enable_finger_timing,
+        "enable_typing_moods": enable_typing_moods,
+        "typing_mood_strength": typing_mood_strength,
         "enable_difficulty_pauses": enable_difficulty_pauses,
         "difficulty_pause_strength": difficulty_pause_strength,
         "enable_target_time": enable_target_time,
@@ -5121,6 +5268,8 @@ def get_current_settings_snapshot():
         "enable_fatigue": enable_fatigue_var.get(),
         "fatigue_strength": fatigue_strength_var.get(),
         "enable_finger_timing": enable_finger_timing_var.get(),
+        "enable_typing_moods": enable_typing_moods_var.get(),
+        "typing_mood_strength": typing_mood_strength_var.get(),
         "enable_difficulty_pauses": enable_difficulty_pauses_var.get(),
         "difficulty_pause_strength": difficulty_pause_strength_var.get(),
         "enable_target_time": enable_target_time_var.get(),
@@ -5183,6 +5332,8 @@ def apply_settings_snapshot(data, include_files=True):
     enable_fatigue_var.set(data.get("enable_fatigue", False))
     fatigue_strength_var.set(str(data.get("fatigue_strength", "15")))
     enable_finger_timing_var.set(bool(data.get("enable_finger_timing", True)))
+    enable_typing_moods_var.set(bool(data.get("enable_typing_moods", True)))
+    typing_mood_strength_var.set(str(data.get("typing_mood_strength", "100")))
     enable_difficulty_pauses_var.set(bool(data.get("enable_difficulty_pauses", True)))
     difficulty_pause_strength_var.set(str(data.get("difficulty_pause_strength", "100")))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
@@ -6078,6 +6229,8 @@ target_wpm_var = tk.StringVar(value="")
 enable_fatigue_var = tk.BooleanVar(value=False)
 fatigue_strength_var = tk.StringVar(value="15")
 enable_finger_timing_var = tk.BooleanVar(value=True)
+enable_typing_moods_var = tk.BooleanVar(value=True)
+typing_mood_strength_var = tk.StringVar(value="100")
 enable_difficulty_pauses_var = tk.BooleanVar(value=True)
 difficulty_pause_strength_var = tk.StringVar(value="100")
 
@@ -6158,6 +6311,7 @@ SECTION_RESET_VARS = {
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
     "Finger & Hand Timing": [enable_finger_timing_var],
+    "Flow & Hesitation": [enable_typing_moods_var, typing_mood_strength_var],
     "Natural Pauses": [
         paragraph_pause_min_var,
         paragraph_pause_max_var,
@@ -6718,6 +6872,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.6.0",
+        "date": "2026-10-13",
+        "title": "Flow and hesitation states",
+        "changes": [
+            "Added: typing moods. Amanuensis now drifts between normal, flow (a stretch typed about 15 percent faster), and hesitant (a stretch typed about 25 percent slower). Each stretch lasts a few dozen to a few hundred characters, and the speed eases in and out so it never jumps.",
+            "Added: a Flow & Hesitation card on the Speed tab with two new settings (on or off, and Mood Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the small average change. A session break or research break puts the typist back in the normal state.",
+            "Notes: moods change speed only, with no extra pauses, typos, or reworks, and they stack with fatigue drift. Resuming starts in the normal state. The session log records only the mood and the position.",
+        ],
+    },
+    {
         "version": "5.5.0",
         "date": "2026-10-13",
         "title": "Difficulty-aware thinking pauses",
@@ -7109,6 +7274,7 @@ frame_settings = make_modern_card(tab_speed, "Typing Speed")
 frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
+frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
@@ -7355,6 +7521,30 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+# --- Flow and hesitation states (Update #31) ---
+modern_checkbox(
+    frame_typing_moods, "Enable flow and hesitation states", enable_typing_moods_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_typing_moods, "Mood Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_typing_mood_strength = modern_entry(frame_typing_moods, typing_mood_strength_var, width=8)
+entry_typing_mood_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_typing_moods,
+    "Real typing has moods. Sometimes the words come easily and you speed up "
+    "(flow). Other times you second-guess yourself and slow down (hesitation). "
+    "Amanuensis drifts between normal, flow, and hesitant stretches that last a "
+    "few dozen to a few hundred characters, and the speed eases in and out so it "
+    "never jumps.\n\n"
+    "100% is the normal size (flow is about 15% quicker, hesitation about 25% "
+    "slower). Use less for a steadier typist or more for bigger swings (0 to 200). "
+    "A long break puts the typist back in the normal state, and the time estimate "
+    "includes the small average change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Natural pauses (always on, not tied to any enable checkbox) ---
 modern_label(frame_pauses, "Paragraph pause, min (s)").grid(row=0, column=0, sticky="w")
@@ -7755,6 +7945,7 @@ SECTION_CARDS = {
     "Target Time": frame_target_time,
     "Fatigue Drift": frame_fatigue,
     "Finger & Hand Timing": frame_finger_timing,
+    "Flow & Hesitation": frame_typing_moods,
     "Natural Pauses": frame_pauses,
     "Difficulty Pauses": frame_difficulty_pauses,
     "Formatting Markers": frame_format_markers,
