@@ -9,6 +9,21 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.8.0 (2026-10-14) -- Updates install in place (Update #33)
+#   - Added: Update and Restart. In the packaged .exe, the update prompt now
+#     downloads the new version, checks it against the checksum GitHub published,
+#     replaces the running app, and opens the new version, so there is no second
+#     .exe to swap in by hand.
+#   - Modified: Settings, profiles, and saved progress stay because the new file
+#     takes the old file's place in the same folder. A run in progress is never
+#     interrupted. The old plain Download is still used when the app runs from
+#     source, its folder cannot be written to, or the release has no checksum.
+#   - Notes: The running .exe is renamed to .old, the new one takes its name, and
+#     the old one is put back if any step fails. Leftover .old and .new files are
+#     deleted a few seconds after the next launch. The new copy is started with
+#     PyInstaller's environment reset so it unpacks its own files. No new settings
+#     or packages (the standard subprocess module is used to open the new copy).
+#
 # v5.7.0 (2026-10-13) -- Auto-pick a profile by window (Update #30)
 #   - Added: Auto Profile by Window. Add rules that pair some words from a window
 #     title (like "Google Docs") with a saved profile. When a run starts, the first
@@ -41,22 +56,6 @@
 #     starts in the normal state. The log records only the mood and position.
 #     No new packages.
 #
-# v5.5.0 (2026-10-13) -- Difficulty-aware thinking pauses (Update #33)
-#   - Added: Thinking pauses that depend on how hard the text is. Before a hard
-#     word (long, many syllables, numbers, an acronym, or rare letters) there is
-#     a short stop, and before a very long or packed sentence (30+ words, 3+ hard
-#     words, or 4+ commas, semicolons, and colons) there is a longer one.
-#   - Added: A "Difficulty Pauses" card on the Speed tab with two new settings
-#     (enable_difficulty_pauses, on by default, and difficulty_pause_strength,
-#     100 by default, 0 to 300), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the average time of these
-#     pauses. Not every hard word pauses (about 7 in 10), there are at least 4
-#     words between word pauses, and common long words ("important") never count.
-#   - Notes: The spots are planned once before typing starts, only for text still
-#     to be typed (so resume works). Protected text never gets a pause, and a pause
-#     press or window switch during a wait is caught before the next character.
-#     The log records only the spot and length, never the words. No new packages.
-#
 # ============================================
 
 import pyautogui
@@ -71,6 +70,7 @@ import csv
 import os
 import sys
 import hashlib
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -4698,8 +4698,13 @@ def open_left_mistake_report():
 #     only through run_on_main_thread().
 #   - No dialog is shown while a run is active, because a pop-up would steal
 #     focus from the window being typed into.
-#   - The app never replaces or restarts itself. "Download" saves the new .exe
-#     as a separate file, checks it, and tells the person what to do next.
+#   - The app only replaces itself when the person clicks "Update and Restart",
+#     and only when it is the packaged Windows .exe, its folder can be written
+#     to, and the download matched the checksum GitHub published. It swaps the
+#     files by renaming (the running .exe becomes .old and the new one takes its
+#     place), puts the old one back if any step fails, and never does it while a
+#     typing run is active. In every other case "Download" saves the new .exe as
+#     a separate file, checks it, and tells the person what to do next.
 GITHUB_REPO = "jheathspooky009/Amanuensis"
 UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases"
@@ -4715,6 +4720,9 @@ UPDATE_STARTUP_DELAY_MS = 3000       # wait a moment so the window is fully draw
 UPDATE_MAX_API_BYTES = 1024 * 1024   # the release info should be tiny; refuse anything huge
 UPDATE_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 UPDATE_NOTES_MAX_CHARS = 600
+UPDATE_STAGED_SUFFIX = ".new"        # the new .exe waits next to the running one under this ending
+UPDATE_BACKUP_SUFFIX = ".old"        # the replaced .exe is kept under this ending until the next launch
+UPDATE_CLEANUP_DELAY_MS = 6000       # give the old copy time to fully close before deleting leftovers
 
 # Only touched on the main thread, so a plain flag is enough.
 _update_check_running = False
@@ -4898,13 +4906,24 @@ def show_update_prompt(info):
     """Tells the person a newer version exists and lets them choose what to do."""
     is_packaged = bool(getattr(sys, "frozen", False))
     can_download = is_packaged and bool(info["asset_url"])
+    # Replacing the app in place needs a checksum to compare against, so a
+    # release without one only offers the plain separate-file download.
+    can_install = can_download and bool(info["asset_digest"]) and can_update_in_place()
     notes_text = info["notes"] if info["notes"] else "No release notes were provided."
     message = (
         f"Amanuensis v{info['version']} is available. You are using v{APP_VERSION}.\n\n"
         f"What's new:\n{notes_text}\n\n"
     )
     buttons = []
-    if can_download:
+    if can_install:
+        message += (
+            "Update and Restart downloads the new version, checks it against the checksum GitHub "
+            "published, replaces this app, and opens the new version. Your settings, profiles, and "
+            "saved progress stay as they are. Amanuensis closes for a moment while it restarts."
+        )
+        buttons.append(("Update and Restart", "install", "primary"))
+        buttons.append(("Visit GitHub Page", "visit", "neutral"))
+    elif can_download:
         message += "Download saves the new version as a separate file. Nothing is replaced or restarted for you."
         buttons.append(("Download Update", "download", "primary"))
         buttons.append(("Visit GitHub Page", "visit", "neutral"))
@@ -4918,7 +4937,9 @@ def show_update_prompt(info):
     buttons.append(("Later", "later", "neutral"))
 
     choice = show_modern_dialog("Update Available", message, buttons, kind="info", cancel_value="later")
-    if choice == "download":
+    if choice == "install":
+        start_update_download(info, install_in_place=True)
+    elif choice == "download":
         start_update_download(info)
     elif choice == "visit":
         page_url = info["page_url"]
@@ -4931,6 +4952,94 @@ def show_update_prompt(info):
             f"Skipping v{info['version']}. The startup check will stay quiet until a newer version "
             "comes out. Check for Updates Now still shows it."
         )
+
+
+def get_running_exe_path():
+    """Full path of the packaged .exe that is running right now."""
+    return os.path.abspath(sys.executable)
+
+
+def can_update_in_place():
+    """True only when the app can safely swap its own .exe: the packaged
+    Windows build, started from a real .exe file, in a folder it can write
+    to. Anything else keeps the plain separate-file Download."""
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    exe_path = get_running_exe_path()
+    if not exe_path.lower().endswith(".exe") or not os.path.isfile(exe_path):
+        return False
+    return os.access(os.path.dirname(exe_path), os.W_OK)
+
+
+def cleanup_update_leftovers():
+    """Deletes the old copy and any unfinished download that a past update
+    left next to the .exe. Any problem is ignored, and it tries again at the
+    next launch."""
+    if not getattr(sys, "frozen", False) or _update_download_running:
+        return
+    exe_path = get_running_exe_path()
+    for suffix in (UPDATE_BACKUP_SUFFIX, UPDATE_STAGED_SUFFIX, UPDATE_STAGED_SUFFIX + ".part"):
+        leftover_path = exe_path + suffix
+        if os.path.isfile(leftover_path):
+            try:
+                os.remove(leftover_path)
+            except OSError:
+                pass
+
+
+def install_staged_update(staged_path):
+    """Swaps the downloaded .exe in for the running one. Windows lets a
+    running .exe be renamed but not overwritten, so the running file is
+    renamed to .old first. Returns (ok, message). If any step fails, the old
+    file is put back, so the app is never left without a working .exe."""
+    exe_path = get_running_exe_path()
+    backup_path = exe_path + UPDATE_BACKUP_SUFFIX
+    try:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.replace(exe_path, backup_path)
+    except OSError as rename_error:
+        rename_text = str(rename_error)
+        return False, f"The current app file could not be set aside, so nothing was changed: {rename_text}"
+    try:
+        os.replace(staged_path, exe_path)
+    except OSError as move_error:
+        move_text = str(move_error)
+        try:
+            os.replace(backup_path, exe_path)
+        except OSError:
+            return False, (
+                f"The new file could not be put in place ({move_text}), and the old file could not be "
+                f"restored automatically. It is saved as: {backup_path}"
+            )
+        return False, f"The new file could not be put in place, so your current version was kept: {move_text}"
+    return True, ""
+
+
+def start_new_copy_of_app():
+    """Opens the freshly installed .exe as its own program. Returns True if
+    it started. The hotkeys are released first so the two copies never both
+    answer a hotkey press."""
+    exe_path = get_running_exe_path()
+    environment = dict(os.environ)
+    # A one-file PyInstaller app hands its temporary folder to any program it
+    # starts. The new copy must unpack its own, so these are cleared.
+    environment.pop("_MEIPASS2", None)
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    process_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    keyboard.unhook_all()
+    try:
+        subprocess.Popen(
+            [exe_path],
+            cwd=os.path.dirname(exe_path),
+            env=environment,
+            close_fds=True,
+            creationflags=process_flags,
+        )
+    except OSError:
+        apply_hotkeys()
+        return False
+    return True
 
 
 def choose_update_folder():
@@ -4958,14 +5067,27 @@ def make_unique_path(folder, file_name):
     return path
 
 
-def start_update_download(info):
+def start_update_download(info, install_in_place=False):
     """Opens a small progress window and downloads the new .exe on a
-    background thread."""
+    background thread. With install_in_place, the file is saved next to the
+    running .exe under a temporary name, and the app swaps it in and restarts
+    once it has been checked."""
     global _update_download_running
     if _update_download_running or _update_check_running:
         return
-    folder, is_app_folder = choose_update_folder()
-    target_path = make_unique_path(folder, f"amanuensis-v{info['version']}.exe")
+    if install_in_place:
+        is_app_folder = True
+        target_path = get_running_exe_path() + UPDATE_STAGED_SUFFIX
+        for stale_path in (target_path, target_path + ".part"):
+            if os.path.exists(stale_path):
+                try:
+                    os.remove(stale_path)
+                except OSError:
+                    update_status_var.set("Update stopped: an old unfinished download could not be removed.")
+                    return
+    else:
+        folder, is_app_folder = choose_update_folder()
+        target_path = make_unique_path(folder, f"amanuensis-v{info['version']}.exe")
     cancel_event = threading.Event()
     progress_var = tk.DoubleVar(value=0.0)
     message_var = tk.StringVar(value="Starting download...")
@@ -4987,7 +5109,8 @@ def start_update_download(info):
     update_status_var.set(f"Downloading v{info['version']}...")
     threading.Thread(
         target=_update_download_worker,
-        args=(info, target_path, is_app_folder, cancel_event, progress_var, message_var, progress_win),
+        args=(info, target_path, is_app_folder, cancel_event, progress_var, message_var, progress_win,
+              install_in_place),
         daemon=True,
     ).start()
 
@@ -5061,7 +5184,8 @@ def _download_update_file(info, part_path, cancel_event, progress_var, message_v
     return outcome
 
 
-def _update_download_worker(info, target_path, is_app_folder, cancel_event, progress_var, message_var, progress_win):
+def _update_download_worker(info, target_path, is_app_folder, cancel_event, progress_var, message_var,
+                            progress_win, install_in_place=False):
     """Background thread body for one download."""
     part_path = target_path + ".part"
     try:
@@ -5084,11 +5208,11 @@ def _update_download_worker(info, target_path, is_app_folder, cancel_event, prog
             except OSError:
                 pass
     run_on_main_thread(
-        lambda: finish_update_download(progress_win, info, target_path, is_app_folder, outcome)
+        lambda: finish_update_download(progress_win, info, target_path, is_app_folder, outcome, install_in_place)
     )
 
 
-def finish_update_download(progress_win, info, target_path, is_app_folder, outcome):
+def finish_update_download(progress_win, info, target_path, is_app_folder, outcome, install_in_place=False):
     """Runs on the main thread when a download ends, whatever the result."""
     global _update_download_running
     _update_download_running = False
@@ -5104,6 +5228,10 @@ def finish_update_download(progress_win, info, target_path, is_app_folder, outco
         update_status_var.set("Download failed.")
         if not state.is_running:
             messagebox.showerror("Download Failed", outcome["text"])
+        return
+
+    if install_in_place:
+        finish_in_place_update(info, target_path, outcome)
         return
 
     update_status_var.set(f"Downloaded v{info['version']} to: {target_path}")
@@ -5131,6 +5259,58 @@ def finish_update_download(progress_win, info, target_path, is_app_folder, outco
             os.startfile(os.path.dirname(target_path))
         except OSError:
             pass
+
+
+def finish_in_place_update(info, staged_path, outcome):
+    """Runs on the main thread after the new .exe finished downloading for
+    Update and Restart. Installs it and restarts, or throws the download away
+    and explains why. The app keeps running its current version unless the
+    swap fully succeeds."""
+
+    def throw_away_download():
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
+
+    if not outcome["verified"]:
+        throw_away_download()
+        update_status_var.set("Update stopped: the download could not be checked against GitHub's checksum.")
+        if not state.is_running:
+            messagebox.showerror(
+                "Update Stopped",
+                "The downloaded file could not be checked against a checksum, so it was not installed. "
+                "Your current version was not changed.",
+            )
+        return
+    if state.is_running:
+        # Never swap the app out from under a typing run.
+        throw_away_download()
+        update_status_var.set(
+            f"v{info['version']} was not installed because a run is active. "
+            "Use Check for Updates Now when the run is over."
+        )
+        return
+
+    installed, problem_text = install_staged_update(staged_path)
+    if not installed:
+        throw_away_download()
+        update_status_var.set("Update failed. Your current version was kept.")
+        messagebox.showerror("Update Failed", problem_text)
+        return
+
+    update_status_var.set(f"Installed v{info['version']}. Restarting...")
+    if start_new_copy_of_app():
+        # Close through the normal path (it saves settings). This waits a
+        # moment so the queue loop that called us is not left with a closed window.
+        window.after(300, on_close)
+    else:
+        update_status_var.set(f"Installed v{info['version']}. Close Amanuensis and open it again to use it.")
+        messagebox.showinfo(
+            "Update Installed",
+            f"Amanuensis v{info['version']} was installed, but it could not open itself.\n\n"
+            "Close this window and open Amanuensis again to use the new version.",
+        )
 
 
 def toggle_pause():
@@ -7160,6 +7340,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.8.0",
+        "date": "2026-10-14",
+        "title": "Updates install in place",
+        "changes": [
+            "Added: Update and Restart. In the packaged .exe, the update prompt now downloads the new version, checks it against the checksum GitHub published, replaces the app you are running, and opens the new version. There is no second .exe to swap in by hand anymore.",
+            "Modified: your settings, profiles, and saved progress stay, because the new file takes the old file's place in the same folder. A typing run is never interrupted, and if a run starts while the download is going, the update waits for you to check again.",
+            "Modified: the plain Download button is still used when you run Amanuensis from source code, when its folder cannot be written to (like Program Files), or when a release has no checksum to check against.",
+            "Notes: the running .exe is renamed to .old and the new file takes its name. If any step fails, the old file is put back and you keep your current version. Leftover .old and .new files are deleted a few seconds after the next launch. No new settings or packages.",
+        ],
+    },
+    {
         "version": "5.7.0",
         "date": "2026-10-13",
         "title": "Auto-pick a profile by window",
@@ -8363,6 +8554,7 @@ refresh_resume_status()
 apply_hotkeys()
 window.protocol("WM_DELETE_WINDOW", on_close)
 window.after(UPDATE_STARTUP_DELAY_MS, run_startup_update_check)
+window.after(UPDATE_CLEANUP_DELAY_MS, cleanup_update_leftovers)
 window.after(500, update_gui)
 window.after(50, process_gui_queue)
 window.mainloop()

@@ -43,7 +43,7 @@ Out of scope:
 
 - **Runs locally.** There is no account, no server, and no telemetry. Your text is never uploaded.
 - **One network request.** The optional update check asks GitHub for the newest release number. It uses HTTPS to a short list of GitHub hosts only, refuses redirects anywhere else, and sends no text and no settings. You can turn it off on the Data tab.
-- **Safe downloads.** An update is saved as a separate file, checked against the SHA-256 that GitHub publishes, and never replaces or restarts the running app.
+- **Safe updates.** In the packaged `.exe`, "Update and Restart" downloads the new file next to the app, checks its size and SHA-256 against what GitHub publishes, and only then swaps it in by renaming (the running file becomes `.old`). If any step fails, the old file is put back. It never installs during a typing run, and it is only offered when GitHub published a checksum and the app's folder can be written to. In every other case an update is saved as a separate file and nothing is replaced.
 - **No secrets.** The app has no keys, passwords, or tokens.
 - **Shareable files.** Saved profiles contain settings only, never folder paths. Session logs record the input file's name, not its folder, and cells that a spreadsheet could run as a formula are neutralized.
 
@@ -112,5 +112,6 @@ Contributors must run the same checks before opening a pull request. See [CONTRI
 
 - The `.exe` is not code-signed, so Windows SmartScreen may warn. Verify the checksum or attestation instead.
 - The checksum shown in the update prompt comes from GitHub. The attestation and GPG signature give stronger proof than the checksum alone.
+- Update and Restart trusts the same GitHub checksum and does not check the attestation or GPG signature, so use the manual checks above if you want the stronger proof. It also writes `amanuensis.exe.new` and `amanuensis.exe.old` next to the app for a short time.
 - The `keyboard` library uses global hotkeys and may need administrator rights on some systems.
 - Amanuensis types into whatever window has focus. Keep the Stop hotkey ready, use the Target Window lock, and do not type secrets into a window you cannot see.
