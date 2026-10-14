@@ -9,6 +9,22 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.5.0 (2026-10-13) -- Difficulty-aware thinking pauses (Update #33)
+#   - Added: Thinking pauses that depend on how hard the text is. Before a hard
+#     word (long, many syllables, numbers, an acronym, or rare letters) there is
+#     a short stop, and before a very long or packed sentence (30+ words, 3+ hard
+#     words, or 4+ commas, semicolons, and colons) there is a longer one.
+#   - Added: A "Difficulty Pauses" card on the Speed tab with two new settings
+#     (enable_difficulty_pauses, on by default, and difficulty_pause_strength,
+#     100 by default, 0 to 300), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the average time of these
+#     pauses. Not every hard word pauses (about 7 in 10), there are at least 4
+#     words between word pauses, and common long words ("important") never count.
+#   - Notes: The spots are planned once before typing starts, only for text still
+#     to be typed (so resume works). Protected text never gets a pause, and a pause
+#     press or window switch during a wait is caught before the next character.
+#     The log records only the spot and length, never the words. No new packages.
+#
 # v5.4.0 (2026-10-13) -- Formatting markers (Update #29)
 #   - Added: Formatting markers for bold and italic. Wrap text in [[b]]...[[/b]]
 #     or [[i]]...[[/i]] and Amanuensis presses Ctrl+B or Ctrl+I at those spots,
@@ -39,14 +55,6 @@
 #     16 common letter pairs keep their fast fixed speed.
 #   - Notes: Only letter-to-letter pairs change (spaces, digits, and punctuation
 #     do not). The change happens before fatigue drift. No new packages.
-#
-# v5.2.0 (2026-10-12) -- Resume across sessions (Update #18)
-#   - Added: resume_state.json v2 format with atomic writes (.tmp + os.replace)
-#     and thread safety, storing progress per file keyed by canonical path.
-#   - Added: SHA-256 prefix hash validation to detect if text before the saved
-#     checkpoint was edited, and automatic checkpoint autosave at sentence ends.
-#   - Added: Saved progress status label and "Clear Saved Progress" button in the
-#     Input File card with confirmation dialog and trace auto-refresh.
 # ============================================
 
 import pyautogui
@@ -2239,6 +2247,207 @@ def compute_session_break_seconds(text, settings, protection_mask, pause_map, st
 
 
 # --------------------------------------------
+# DIFFICULTY-AWARE THINKING PAUSES (Update #33)
+# --------------------------------------------
+# Real people slow down on hard words and on long or packed sentences. Before
+# typing starts, the text is scanned once. A word earns "difficulty points"
+# for being long, having many syllables, holding digits, being an ALL-CAPS
+# acronym, or using rare letters. Common everyday words never count. A
+# sentence is "hard" when it is very long, holds several hard words, or is
+# packed with commas. The plan only says WHERE a pause may happen; the typing
+# loop draws the chance and the length when it gets there.
+DIFFICULTY_WORD_MIN_SCORE = 3       # points a word needs to count as hard
+DIFFICULTY_WORD_CHANCE = 0.7        # share of hard words that get a pause
+DIFFICULTY_WORD_GAP_WORDS = 4       # at least this many words between word pauses
+DIFFICULTY_WORD_SECONDS = (0.5, 1.5)
+DIFFICULTY_SENTENCE_CHANCE = 0.8    # share of hard sentences that get a pause
+DIFFICULTY_SENTENCE_SECONDS = (1.5, 3.5)
+DIFFICULTY_LONG_SENTENCE_WORDS = 30
+DIFFICULTY_DENSE_SENTENCE_HARD_WORDS = 3
+DIFFICULTY_COMMA_HEAVY_COUNT = 4
+DIFFICULTY_STRENGTH_MAX = 300.0
+
+DIFFICULTY_WORD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\u2019\-]*")
+DIFFICULTY_VOWEL_GROUP_PATTERN = re.compile(r"[aeiouy]+")
+DIFFICULTY_SENTENCE_CLOSERS = "\"')]\u201d\u2019"
+
+# Long words that are still easy to think of and type. They never count as hard.
+DIFFICULTY_COMMON_WORDS = frozenset("""
+about above across actually after again against almost already although always
+among another anything around because become before behind being believe
+between beyond building business change children community company consider
+continue country different difficult discuss during education effect either
+enough environment especially everything example experience family following
+government great history however important include information interest
+itself knowledge language learning little looking material meeting message
+morning nothing number office opportunity others people percent perhaps person
+personal place political possible present president problem program public
+question reason receive remember research response result school second
+service should something sometimes started state student study support system
+taking thing think those though thought through together tomorrow towards
+understand university usually various water without wonder working world
+would write written yesterday
+""".split())
+
+
+def count_syllables(word):
+    """Rough syllable count: one per group of vowels, ignoring a silent final e."""
+    lowered = re.sub(r"[^a-z]", "", word.lower())
+    if not lowered:
+        return 0
+    count = len(DIFFICULTY_VOWEL_GROUP_PATTERN.findall(lowered))
+    if lowered.endswith("e") and not lowered.endswith(("le", "ee")) and count > 1:
+        count -= 1
+    return max(count, 1)
+
+
+def score_word_difficulty(word):
+    """Gives a word points for how hard it is to think of and type. Common
+    everyday words and very short words score 0."""
+    core = word.strip("-'\u2019")
+    letters = re.sub(r"[^A-Za-z]", "", core)
+    if len(core) < 4:
+        return 0
+    if core.lower() in DIFFICULTY_COMMON_WORDS:
+        return 0
+    points = 0
+    if len(letters) >= 12:
+        points += 2
+    elif len(letters) >= 8:
+        points += 1
+    syllables = count_syllables(letters)
+    if syllables >= 5:
+        points += 3
+    elif syllables >= 4:
+        points += 2
+    elif syllables >= 3:
+        points += 1
+    if any(ch.isdigit() for ch in core):
+        points += 2
+    if len(letters) >= 3 and letters.isupper():
+        points += 2  # an acronym such as NASA or HIPAA
+    if any(ch in "qxzjQXZJ" for ch in letters):
+        points += 1
+    return points
+
+
+def find_sentence_spans(text):
+    """Splits text into (start, end) sentence spans. A span starts at the first
+    character after a sentence end (or a paragraph break) and stops at the next
+    sentence end. A period after an abbreviation like "Dr." does not end one."""
+    spans = []
+    length = len(text)
+    start = 0
+    cursor = 0
+    while cursor < length:
+        char = text[cursor]
+        is_end = False
+        if char == "\n":
+            is_end = True
+        elif char in ".!?":
+            run_end = cursor
+            while run_end + 1 < length and text[run_end + 1] in ".!?":
+                run_end += 1
+            after = run_end + 1
+            while after < length and text[after] in DIFFICULTY_SENTENCE_CLOSERS:
+                after += 1
+            if after >= length or text[after].isspace():
+                token_start = cursor
+                while token_start > start and not text[token_start - 1].isspace():
+                    token_start -= 1
+                if _session_break_is_real_sentence_end(text[cursor:run_end + 1], text[token_start:cursor]):
+                    is_end = True
+                    cursor = after - 1
+        if is_end:
+            if text[start:cursor + 1].strip():
+                spans.append((start, cursor + 1))
+            start = cursor + 1
+        cursor += 1
+    if text[start:].strip():
+        spans.append((start, length))
+    return spans
+
+
+def plan_difficulty_pauses(text, protection_mask, start_index=0):
+    """Finds the spots where a hard word or a hard sentence earns a thinking
+    pause. Returns {index of the first character: (kind, weight)} where kind is
+    "word" or "sentence" and weight (1.0 and up) says how hard it is. Only text
+    from start_index on is planned. Protected text is never touched, and a
+    sentence pause wins over a word pause at the same spot."""
+    plan = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = []
+        for match in DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end):
+            if any(protection_mask[match.start():match.end()]):
+                words.append((match.start(), 0))
+            else:
+                words.append((match.start(), score_word_difficulty(match.group())))
+        if not words:
+            continue
+
+        hard_count = sum(1 for _position, score in words if score >= DIFFICULTY_WORD_MIN_SCORE)
+        segment = text[span_start:span_end]
+        reasons = 0
+        if len(words) >= DIFFICULTY_LONG_SENTENCE_WORDS:
+            reasons += 1
+        if hard_count >= DIFFICULTY_DENSE_SENTENCE_HARD_WORDS:
+            reasons += 1
+        if sum(segment.count(mark) for mark in ",;:") >= DIFFICULTY_COMMA_HEAVY_COUNT:
+            reasons += 1
+        first_position = words[0][0]
+        if reasons and first_position >= start_index and not protection_mask[first_position]:
+            plan[first_position] = ("sentence", 1.0 + 0.25 * (reasons - 1))
+
+        # A word pause needs a few words of room after the last pause, and a
+        # sentence pause counts as the last pause for the sentence's first word.
+        words_since_pause = 0 if first_position in plan else DIFFICULTY_WORD_GAP_WORDS
+        for position, score in words:
+            words_since_pause += 1
+            if (position < start_index or position in plan
+                    or score < DIFFICULTY_WORD_MIN_SCORE
+                    or words_since_pause <= DIFFICULTY_WORD_GAP_WORDS):
+                continue
+            plan[position] = ("word", min(score / 3.0, 2.0))
+            words_since_pause = 0
+    return plan
+
+
+def draw_difficulty_pause_seconds(kind, weight, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with how hard the spot is and
+    with the Pause Strength setting."""
+    if kind == "sentence":
+        chance, (low, high) = DIFFICULTY_SENTENCE_CHANCE, DIFFICULTY_SENTENCE_SECONDS
+    else:
+        chance, (low, high) = DIFFICULTY_WORD_CHANCE, DIFFICULTY_WORD_SECONDS
+    if strength_percent <= 0 or random.random() >= chance:
+        return 0.0
+    return random.uniform(low, high) * weight * (strength_percent / 100.0)
+
+
+def estimate_difficulty_pause_seconds(text, protection_mask, settings):
+    """Average extra time the thinking pauses add to `text`. Uses the same
+    plan, chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_difficulty_pauses", True):
+        return 0.0
+    strength = settings.get("difficulty_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total = 0.0
+    for kind, weight in plan_difficulty_pauses(text, mask).values():
+        if kind == "sentence":
+            average = sum(DIFFICULTY_SENTENCE_SECONDS) / 2.0
+            total += DIFFICULTY_SENTENCE_CHANCE * average * weight * strength
+        else:
+            average = sum(DIFFICULTY_WORD_SECONDS) / 2.0
+            total += DIFFICULTY_WORD_CHANCE * average * weight * strength
+    return total
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -2632,6 +2841,8 @@ def type_text(settings, is_batch=False, is_last=True):
     enable_fatigue = settings.get("enable_fatigue", False)
     fatigue_strength = settings.get("fatigue_strength", 15.0)
     enable_finger_timing = settings.get("enable_finger_timing", True)
+    enable_difficulty_pauses = settings.get("enable_difficulty_pauses", True)
+    difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
 
     try:
@@ -2665,6 +2876,17 @@ def type_text(settings, is_batch=False, is_last=True):
     paraphrase_map = precompute_paragraph_paraphrases(text, protected_ranges)
 
     resume_from = min(settings.get("resume_from", 0), len(text))
+
+    # Thinking pauses for hard words and hard sentences (Update #33). They are
+    # planned only for text that is still to be typed. If planning ever fails,
+    # the file is simply typed without them.
+    difficulty_plan = {}
+    if enable_difficulty_pauses and difficulty_pause_strength > 0:
+        try:
+            difficulty_plan = plan_difficulty_pauses(text, protection_mask, resume_from)
+        except Exception:
+            difficulty_plan = {}
+            log_event("difficulty_pauses_failed", "could not plan thinking pauses; typing without them")
 
     # Mistakes to purposely leave for the person to fix (Update #24). They are
     # planned only for text that is still to be typed. If planning ever fails,
@@ -2842,6 +3064,35 @@ def type_text(settings, is_batch=False, is_last=True):
             if not _wait_for_pause_marker(marker_seconds):
                 return
             state.status = "Typing..."
+
+        # --------------------------------
+        # DIFFICULTY THINKING PAUSE (Update #33)
+        # A short stop before a hard word, or a longer one before a hard
+        # sentence. Like the pause marker above, it runs BEFORE the focus-lock
+        # and pause checks, so a Pause press or a window switch during the
+        # wait is caught before the next character is typed. Only the spot
+        # (never the text) goes in the log.
+        # --------------------------------
+        difficulty_spot = difficulty_plan.get(idx)
+        if difficulty_spot:
+            difficulty_kind, difficulty_weight = difficulty_spot
+            think_seconds = draw_difficulty_pause_seconds(
+                difficulty_kind, difficulty_weight, difficulty_pause_strength
+            )
+            if think_seconds > 0:
+                if difficulty_kind == "sentence":
+                    state.status = "Thinking about how to phrase this..."
+                else:
+                    state.status = "Thinking of the right word..."
+                log_event("difficulty_pause", f"{difficulty_kind} ~{think_seconds:.1f}s before character {idx}")
+                for _ in range(int(think_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
 
         # --------------------------------
         # FOCUS-LOCK CHECK (throttled to ~2x/sec so we're not
@@ -3272,6 +3523,10 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
         # same-finger pairs a little slower. The shift is counted in average delays.
         total_seconds += estimate_finger_timing_shift(text) * avg_delay
 
+    # Thinking pauses on hard words and hard sentences (Update #33), averaged
+    # over the same chances and ranges the typing loop draws from.
+    total_seconds += estimate_difficulty_pause_seconds(text, protection_mask, settings)
+
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
         # increase up to fatigue_strength percent and partly recover after research breaks.
@@ -3436,6 +3691,18 @@ def validate_settings():
         fatigue_strength_var.set("15")
 
     enable_finger_timing = bool(enable_finger_timing_var.get())
+    enable_difficulty_pauses = bool(enable_difficulty_pauses_var.get())
+    try:
+        difficulty_pause_strength = float(difficulty_pause_strength_var.get())
+        if difficulty_pause_strength < 0:
+            difficulty_pause_strength = 0.0
+            difficulty_pause_strength_var.set("0")
+        elif difficulty_pause_strength > DIFFICULTY_STRENGTH_MAX:
+            difficulty_pause_strength = DIFFICULTY_STRENGTH_MAX
+            difficulty_pause_strength_var.set(f"{DIFFICULTY_STRENGTH_MAX:g}")
+    except ValueError:
+        difficulty_pause_strength = 100.0
+        difficulty_pause_strength_var.set("100")
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -3539,6 +3806,8 @@ def validate_settings():
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
         "enable_finger_timing": enable_finger_timing,
+        "enable_difficulty_pauses": enable_difficulty_pauses,
+        "difficulty_pause_strength": difficulty_pause_strength,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -4852,6 +5121,8 @@ def get_current_settings_snapshot():
         "enable_fatigue": enable_fatigue_var.get(),
         "fatigue_strength": fatigue_strength_var.get(),
         "enable_finger_timing": enable_finger_timing_var.get(),
+        "enable_difficulty_pauses": enable_difficulty_pauses_var.get(),
+        "difficulty_pause_strength": difficulty_pause_strength_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -4912,6 +5183,8 @@ def apply_settings_snapshot(data, include_files=True):
     enable_fatigue_var.set(data.get("enable_fatigue", False))
     fatigue_strength_var.set(str(data.get("fatigue_strength", "15")))
     enable_finger_timing_var.set(bool(data.get("enable_finger_timing", True)))
+    enable_difficulty_pauses_var.set(bool(data.get("enable_difficulty_pauses", True)))
+    difficulty_pause_strength_var.set(str(data.get("difficulty_pause_strength", "100")))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -5805,6 +6078,8 @@ target_wpm_var = tk.StringVar(value="")
 enable_fatigue_var = tk.BooleanVar(value=False)
 fatigue_strength_var = tk.StringVar(value="15")
 enable_finger_timing_var = tk.BooleanVar(value=True)
+enable_difficulty_pauses_var = tk.BooleanVar(value=True)
+difficulty_pause_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -5890,6 +6165,7 @@ SECTION_RESET_VARS = {
         sentence_pause_max_var,
         enable_pause_markers_var,
     ],
+    "Difficulty Pauses": [enable_difficulty_pauses_var, difficulty_pause_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
@@ -6442,6 +6718,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.5.0",
+        "date": "2026-10-13",
+        "title": "Difficulty-aware thinking pauses",
+        "changes": [
+            "Added: thinking pauses that depend on how hard the text is. Amanuensis stops for a moment before a hard word (long, many syllables, numbers, an acronym, or rare letters) and for a little longer before a very long or packed sentence.",
+            "Added: a Difficulty Pauses card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. Not every hard word pauses, there are always a few words between word pauses, and common long words like \"important\" never count as hard.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause. The session log records only the spot and length, never the words.",
+        ],
+    },
+    {
         "version": "5.4.0",
         "date": "2026-10-13",
         "title": "Formatting markers",
@@ -6823,6 +7110,7 @@ frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
+frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -7099,6 +7387,28 @@ modern_label(
     "Turn this off to type markers as normal text.",
     kind="muted",
 ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Difficulty pauses (Update #33) ---
+modern_checkbox(
+    frame_difficulty_pauses, "Enable difficulty-aware thinking pauses", enable_difficulty_pauses_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_difficulty_pauses, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_difficulty_pause_strength = modern_entry(frame_difficulty_pauses, difficulty_pause_strength_var, width=8)
+entry_difficulty_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_difficulty_pauses,
+    "Real people slow down on hard material. Amanuensis stops for a moment before "
+    "a hard word (long, many syllables, numbers, or an acronym) and for a little "
+    "longer before a very long or packed sentence. It does not stop for every hard "
+    "word, and never twice in a row.\n\n"
+    "100% is the normal length. Use less for shorter pauses or more for longer ones "
+    "(0 to 300). Protected text never gets a pause, and the time estimate includes "
+    "these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Formatting markers (Update #29) ---
 modern_checkbox(
@@ -7446,6 +7756,7 @@ SECTION_CARDS = {
     "Fatigue Drift": frame_fatigue,
     "Finger & Hand Timing": frame_finger_timing,
     "Natural Pauses": frame_pauses,
+    "Difficulty Pauses": frame_difficulty_pauses,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
