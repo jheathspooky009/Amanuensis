@@ -9,6 +9,23 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.9.0 (2026-10-14) -- Second revision pass (Update #34)
+#   - Added: Second Revision Pass. At the end of a paragraph, the typist can go
+#     back with the Left arrow key to an earlier word that was first typed as a
+#     close synonym, delete it, type the real word, and return to the end with
+#     the Right arrow key. This is the first time the app uses arrow keys.
+#   - Added: A "Second Revision Pass" card on the Mistakes tab with two new
+#     settings (enable_lookback_edit, off by default, and lookback_edit_chance,
+#     25 by default, 0 to 100), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the trips. Preview shows the
+#     swap without pressing any keys.
+#   - Notes: The arrow counts are exact, so only plain words 30 to 250 characters
+#     back are used, and a paragraph is skipped if the text after the word has
+#     protected text, symbols an editor may change, formatting markers, or a left
+#     mistake. No autosave checkpoint is written while a word is waiting to be
+#     fixed. If Stop is pressed then, a message says what to fix by hand. The log
+#     records only the distance, never the words. No new packages.
+#
 # v5.8.0 (2026-10-14) -- Updates install in place (Update #33)
 #   - Added: Update and Restart. In the packaged .exe, the update prompt now
 #     downloads the new version, checks it against the checksum GitHub published,
@@ -40,21 +57,6 @@
 #     profiles folder. An auto-picked profile never changes hotkeys, theme, or
 #     update settings. The log records only the profile name, never the window
 #     title. Preview and the time estimate do not switch profiles. No new packages.
-#
-# v5.6.0 (2026-10-13) -- Flow and hesitation states (Update #31)
-#   - Added: Typing moods. The typist drifts between three states: normal,
-#     flow (a stretch of 80 to 270 characters typed about 15% faster), and
-#     hesitant (a stretch of 40 to 150 characters typed about 25% slower).
-#     Changes ease in over about 12 characters, so speed never jumps.
-#   - Added: A "Flow & Hesitation" card on the Speed tab with two new settings
-#     (enable_typing_moods, on by default, and typing_mood_strength, 100 by
-#     default, 0 to 200), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the small average change.
-#     A session break or research break puts the typist back in the normal state.
-#   - Notes: The mood changes the delay before fatigue drift is applied, so the
-#     two stack. Only speed changes (no extra pauses, typos, or reworks). Resume
-#     starts in the normal state. The log records only the mood and position.
-#     No new packages.
 #
 # ============================================
 
@@ -177,6 +179,7 @@ class TyperState:
         self.blocked_seconds = 0.0  # total time paused by the person, auto-pause, or lost focus (Update #27)
         self.target_end_time = 0.0  # when the run should finish under a target time (0 = no target)
         self.session_breaks_left = 0  # long session breaks still ahead in the current file
+        self.lookback_pending = None  # second revision pass in progress: {draft, original, stage} (Update #34)
 
 
 state = TyperState()
@@ -1664,6 +1667,150 @@ def precompute_paragraph_paraphrases(text, protected_ranges):
 
 
 # --------------------------------------------
+# SECOND REVISION PASS (Update #34)
+# --------------------------------------------
+# Real writers often reread a paragraph and go back to change a word in an
+# earlier sentence. With this feature, one word in a paragraph is first typed
+# as a close synonym. When the paragraph is finished, the typist presses the
+# Left arrow key to go back to that word, deletes it, types the real word, and
+# presses the Right arrow key the same number of times to come back to the end.
+# The final text is always exactly the file's text.
+#
+# Safety rules (the planner skips a paragraph instead of guessing):
+#   * only words that have a built-in synonym, only plain letters, and never
+#     the first word of a paragraph;
+#   * the word must be LOOKBACK_MIN_CHARS to LOOKBACK_MAX_CHARS back, so the
+#     arrow keys stay short and the count stays exact;
+#   * the text between the word and the end of the paragraph may only use the
+#     characters in LOOKBACK_SAFE_CHARS and nothing in LOOKBACK_RISKY_TEXT,
+#     because an editor could shorten or change those and break the count;
+#   * no protected text, formatting shortcut, or purposely left mistake may sit
+#     between the word and the end of the paragraph.
+LOOKBACK_MIN_CHARS = 30
+LOOKBACK_MAX_CHARS = 250
+LOOKBACK_CHANCE_MAX = 100.0
+LOOKBACK_KEY_CHUNK = 8  # arrow presses sent at once, so Stop and Pause still work
+LOOKBACK_ESTIMATE_SECONDS = 9.0  # rough time for one trip back and forth
+LOOKBACK_SAFE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?'\"()-$%"
+)
+LOOKBACK_RISKY_TEXT = ("..", "--", "(c)", "(r)", "(tm)", ":)", ":(", ":-")
+# A word is a run of letters that starts after a space and is not joined to a
+# digit, apostrophe, or hyphen on its right.
+LOOKBACK_WORD_PATTERN = re.compile(r"(?<= )[A-Za-z]+(?![A-Za-z0-9'\-])")
+
+
+def _lookback_span_is_safe(text, protection_mask, start, end):
+    """True when text[start:end] is safe to move the cursor across with the
+    arrow keys: only plain characters, nothing an editor might change, and no
+    protected text."""
+    span = text[start:end]
+    if any(char not in LOOKBACK_SAFE_CHARS for char in span):
+        return False
+    lowered = span.lower()
+    if any(risky in lowered for risky in LOOKBACK_RISKY_TEXT):
+        return False
+    return not any(protection_mask[start:end])
+
+
+def _choose_lookback_edit(text, protection_mask, para_start, trigger_idx, resume_from,
+                          format_map, left_mistake_map, fix_actions, pause_map):
+    """Picks one word to swap in the paragraph text[para_start:trigger_idx].
+    Returns an edit dict (start, end, trigger, original, draft, distance,
+    swapped) or None when the paragraph has no safe word."""
+    para_text = text[para_start:trigger_idx]
+    if not para_text.strip():
+        return None
+
+    # Never in a paragraph that holds a bold or italic shortcut, or that starts
+    # with a style already switched on.
+    if any(para_start <= position <= trigger_idx for position in format_map):
+        return None
+    active_styles = set()
+    for position in sorted(format_map):
+        if position >= para_start:
+            break
+        active_styles ^= set(format_map[position])
+    if active_styles:
+        return None
+
+    candidates = []
+    for match in LOOKBACK_WORD_PATTERN.finditer(para_text):
+        word = match.group(0)
+        synonyms = PARAPHRASE_SYNONYMS.get(word.lower())
+        if not synonyms:
+            continue
+        word_start = para_start + match.start()
+        word_end = para_start + match.end()
+        distance = trigger_idx - word_end
+        if word_start < resume_from:
+            continue
+        if distance < LOOKBACK_MIN_CHARS or distance > LOOKBACK_MAX_CHARS:
+            continue
+        if any(protection_mask[word_start:word_end]):
+            continue
+        if not _lookback_span_is_safe(text, protection_mask, word_end, trigger_idx):
+            continue
+        # A purposely left mistake changes how many characters are on screen.
+        if any(word_start <= position < trigger_idx for position in left_mistake_map):
+            continue
+        # Pause markers and slips inside the word would be skipped, so avoid it.
+        if any(word_start < position < word_end for position in pause_map):
+            continue
+        if any(word_start < position < word_end for position in fix_actions):
+            continue
+        candidates.append((word_start, word_end, word, synonyms))
+
+    if not candidates:
+        return None
+    word_start, word_end, word, synonyms = random.choice(candidates)
+    draft = _match_case(word, random.choice(synonyms))
+    if draft == word or not draft.isalpha():
+        return None
+    return {
+        "start": word_start,
+        "end": word_end,
+        "trigger": trigger_idx,
+        "original": word,
+        "draft": draft,
+        "distance": trigger_idx - word_end,
+        "swapped": False,  # set to True once the draft word was really typed
+    }
+
+
+def plan_lookback_edits(text, protection_mask, settings, resume_from,
+                        format_map, left_mistake_map, fix_actions, pause_map):
+    """Plans the second revision pass before typing starts. Returns two dicts
+    that share the same edit dicts: swaps ({word start: edit}, where the draft
+    word is typed) and fixes ({paragraph end: edit}, where the typist goes back
+    and corrects it). Each paragraph gets an edit with the chosen chance. The
+    last paragraph counts too, even without a line break after it."""
+    swaps = {}
+    fixes = {}
+    if not settings.get("enable_lookback_edit", False) or not text:
+        return swaps, fixes
+    chance = float(settings.get("lookback_edit_chance", 0.0))
+    if chance <= 0:
+        return swaps, fixes
+
+    para_start = 0
+    while para_start < len(text):
+        trigger_idx = text.find("\n", para_start)
+        if trigger_idx == -1:
+            trigger_idx = len(text)
+        if trigger_idx > para_start and trigger_idx > resume_from and random.uniform(0, 100) < chance:
+            edit = _choose_lookback_edit(
+                text, protection_mask, para_start, trigger_idx, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map,
+            )
+            if edit is not None:
+                swaps[edit["start"]] = edit
+                fixes[edit["trigger"]] = edit
+        para_start = trigger_idx + 1
+    return swaps, fixes
+
+
+# --------------------------------------------
 # SESSION LOGGING
 # --------------------------------------------
 def log_event(event, detail=""):
@@ -1872,6 +2019,24 @@ def _preview_ctrl_backspace():
         delete_count = len(content) - cut_at
         if delete_count > 0:
             preview_text_widget.delete(f"end-{delete_count + 1}c", "end-1c")
+        preview_text_widget.see(tk.END)
+        preview_text_widget.configure(state=tk.DISABLED)
+    except tk.TclError:
+        pass
+
+
+def _preview_replace_near_end(distance, remove_count, new_text):
+    """Runs on the main thread via run_on_main_thread. The Preview Run box has
+    no cursor to move, so the second revision pass (Update #34) swaps the
+    word in one step: it replaces `remove_count` characters that sit
+    `distance` characters before the end of the preview text with new_text."""
+    if preview_text_widget is None:
+        return
+    try:
+        preview_text_widget.configure(state=tk.NORMAL)
+        preview_text_widget.delete(f"end-1c-{distance + remove_count}c", f"end-1c-{distance}c")
+        # After the delete, the spot is `distance` characters from the end.
+        preview_text_widget.insert(f"end-1c-{distance}c", new_text)
         preview_text_widget.see(tk.END)
         preview_text_widget.configure(state=tk.DISABLED)
     except tk.TclError:
@@ -2917,6 +3082,145 @@ def _wait_for_pause_marker(seconds):
     return True
 
 
+# --------------------------------------------
+# SECOND REVISION PASS: going back and fixing the word (Update #34)
+# --------------------------------------------
+def _lookback_focus_ok(settings):
+    """True when typing may go on: no window is locked, or the locked window
+    is the active one. Preview runs have no target window to check."""
+    locked_window = settings.get("locked_window", "")
+    if not locked_window or not HAS_PYGETWINDOW or settings.get("preview_mode"):
+        return True
+    active = gw.getActiveWindow()
+    return (active.title if active else "") == locked_window
+
+
+def _lookback_gate(settings, check_focus):
+    """Called between the steps of a look-back fix. Waits while the run is
+    paused (and, when check_focus is True, while the locked window is not the
+    active one), then counts that time as blocked time. Returns False when Stop
+    was pressed, so the caller must stop right away."""
+    if stop_event.is_set():
+        return False
+    if not pause_event.is_set() and (not check_focus or _lookback_focus_ok(settings)):
+        return True
+    previous_status = state.status
+    block_start = time.time()
+    while True:
+        if stop_event.is_set():
+            return False
+        if pause_event.is_set():
+            if not state.status.startswith("Activity detected"):
+                state.status = "Paused"
+        elif check_focus and not _lookback_focus_ok(settings):
+            state.status = "Focus lost \u2014 paused"
+        else:
+            break
+        time.sleep(0.2)
+    _note_blocked_time(time.time() - block_start)
+    state.status = previous_status
+    return True
+
+
+def _lookback_sleep(settings, seconds):
+    """Waits `seconds` in small steps so Stop and Pause still work. Returns
+    False when Stop was pressed."""
+    for _ in range(int(seconds * 10)):
+        if not _lookback_gate(settings, False):
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _press_arrow_key(settings, key, count):
+    """Presses the "left" or "right" arrow key exactly `count` times, a few at a
+    time, checking Stop and Pause between the groups. In preview mode nothing
+    is pressed, because the keys would go to whatever window has focus instead
+    of the preview. Returns False when Stop was pressed."""
+    remaining = count
+    while remaining > 0:
+        if not _lookback_gate(settings, False):
+            return False
+        chunk = min(LOOKBACK_KEY_CHUNK, remaining)
+        if settings.get("preview_mode"):
+            time.sleep(chunk * random.uniform(0.01, 0.03))
+        else:
+            pyautogui.press(key, presses=chunk, interval=random.uniform(0.015, 0.04))
+        remaining -= chunk
+    return True
+
+
+def _run_lookback_fix(settings, edit, min_delay, max_delay):
+    """Goes back to the word that was typed as a synonym, replaces it with the
+    real word, and returns to the end of the paragraph. The Left and Right
+    presses use the same count, so the cursor ends up exactly where it began.
+    `state.lookback_pending` tracks how far along this is, so a Stop in the
+    middle can tell the person what to fix by hand. Returns False when Stop was
+    pressed. The log records only the distance, never the words."""
+    distance = edit["distance"]
+    draft = edit["draft"]
+    original = edit["original"]
+    preview = bool(settings.get("preview_mode"))
+    pending = state.lookback_pending
+
+    log_event("lookback_start", f"going back {distance} characters")
+    state.status = "Reading it over..."
+    if not _lookback_sleep(settings, random.uniform(1.0, 2.5)):
+        return False
+
+    # 1. Go back to the end of the swapped word.
+    state.status = "Going back to an earlier word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if not _press_arrow_key(settings, "left", distance):
+        return False
+    if not _lookback_sleep(settings, random.uniform(0.4, 1.0)):
+        return False
+
+    # 2. Delete the draft word and type the real one.
+    state.status = "Changing a word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if preview:
+        run_on_main_thread(
+            lambda d=distance, n=len(draft), o=original: _preview_replace_near_end(d, n, o)
+        )
+        time.sleep(random.uniform(0.6, 1.2))
+    else:
+        for _ in range(len(draft)):
+            if not _lookback_gate(settings, False):
+                return False
+            _send_backspace(settings)
+            time.sleep(random.uniform(0.08, 0.2))
+        if not _lookback_sleep(settings, random.uniform(0.3, 0.7)):
+            return False
+        if not _lookback_gate(settings, True):
+            return False
+        for char in original:
+            if not _lookback_gate(settings, False):
+                return False
+            _send_char(settings, char)
+            char_delay = random.uniform(min_delay, max_delay)
+            if char.isalpha():
+                char_delay += random.uniform(0.01, 0.03)
+            time.sleep(char_delay)
+    if pending is not None:
+        pending["stage"] = "cursor"  # the text is right now, the cursor is still back there
+    if not _lookback_sleep(settings, random.uniform(0.3, 0.8)):
+        return False
+
+    # 3. Return to the end of the paragraph.
+    state.status = "Going back to the end..."
+    if not _lookback_gate(settings, False):
+        return False
+    if not _press_arrow_key(settings, "right", distance):
+        return False
+    state.lookback_pending = None
+    log_event("lookback_end", "back at the end of the paragraph")
+    state.status = "Typing..."
+    return True
+
+
 def type_text(settings, is_batch=False, is_last=True):
     """Background-thread entry point. Reads the input file, then
     types it out character by character with randomized delays,
@@ -3017,6 +3321,25 @@ def type_text(settings, is_batch=False, is_last=True):
     state.total_chars = len(text)
     state.total_newlines = text.count("\n")
     state.chars_typed = resume_from
+    state.lookback_pending = None
+
+    # Second revision pass (Update #34): words to type as a synonym first and
+    # fix after the paragraph. Planned only for text that is still to be typed.
+    # If planning ever fails, the file is simply typed without them.
+    lookback_swaps = {}
+    lookback_fixes = {}
+    if settings.get("enable_lookback_edit", False):
+        try:
+            lookback_swaps, lookback_fixes = plan_lookback_edits(
+                text, protection_mask, settings, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map
+            )
+        except Exception:
+            lookback_swaps = {}
+            lookback_fixes = {}
+            log_event("lookback_failed", "could not plan second revision edits; typing without them")
+        if lookback_swaps:
+            log_event("lookback_planned", f"{len(lookback_swaps)} paragraph(s)")
     state.newlines_typed = text[:resume_from].count("\n")
     state.paused_duration = 0.0
     state.status = "Countdown..."
@@ -3339,6 +3662,17 @@ def type_text(settings, is_batch=False, is_last=True):
             state.next_mistake_words = max(next_mistake_target - word_count, 0)
 
         # --------------------------------
+        # SECOND REVISION PASS: go back and fix the word (Update #34)
+        # Runs at the end of the paragraph, before the thinking pause and
+        # before the line break is typed. Only if the draft word was really
+        # typed. Arrow keys go back and forth by the same count.
+        # --------------------------------
+        lookback_fix = lookback_fixes.get(idx)
+        if lookback_fix is not None and lookback_fix["swapped"]:
+            if not _run_lookback_fix(settings, lookback_fix, min_delay, max_delay):
+                return
+
+        # --------------------------------
         # PARAGRAPH THINKING PAUSE: always happens at the end of a
         # paragraph, independent of whether a research break is also
         # enabled or due -- pausing to think about what's next is
@@ -3407,6 +3741,39 @@ def type_text(settings, is_batch=False, is_last=True):
                 if not _act_out_smart_fix(settings, fix_kind, slip_text):
                     return
             state.status = "Typing..."
+
+        # --------------------------------
+        # SECOND REVISION PASS: type the draft (synonym) word (Update #34)
+        # The real word is put back when the paragraph ends. Everything that
+        # tracks the word (progress, rework buffer, previous letter) follows
+        # what is really on screen. state.lookback_pending is set BEFORE the
+        # first key, so a Stop in the middle can tell the person what to fix.
+        # --------------------------------
+        lookback_edit = lookback_swaps.get(idx)
+        if lookback_edit is not None and not is_protected and not active_formats:
+            draft_word = lookback_edit["draft"]
+            state.lookback_pending = {
+                "draft": draft_word, "original": lookback_edit["original"], "stage": "reworded",
+            }
+            for draft_char in draft_word:
+                if stop_event.is_set():
+                    return
+                _send_char(settings, draft_char)
+                draft_delay = random.uniform(min_delay, max_delay)
+                if draft_char.isalpha():
+                    draft_delay += random.uniform(0.01, 0.03)
+                if typing_mood is not None:
+                    draft_delay *= typing_mood.step()[0]
+                if enable_fatigue:
+                    draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+                    fatigue_chars += 1
+                time.sleep(draft_delay)
+            lookback_edit["swapped"] = True
+            left_skip_until = lookback_edit["end"]
+            state.chars_typed += lookback_edit["end"] - idx
+            prev_char = draft_word[-1]
+            recent_typed_buffer = (recent_typed_buffer + draft_word)[-120:]
+            continue
 
         # --------------------------------
         # TYPOS: adjacent-key errors, or expanded realistic typo types
@@ -3528,6 +3895,7 @@ def type_text(settings, is_batch=False, is_last=True):
         # paraphrase is partially done, so they are safe to resume from.
         # We skip this in preview mode (never touch resume state there).
         if (not settings.get("preview_mode")
+                and state.lookback_pending is None
                 and char in (".", "!", "?", "\n")
                 and time.time() - last_autosave_time >= 5.0):
             autosave_idx = idx + 1  # characters typed through this index
@@ -3551,6 +3919,13 @@ def type_text(settings, is_batch=False, is_last=True):
                 return
             if not pause_event.is_set():
                 state.status = "Typing..."
+
+    # The last paragraph has no line break after it, so its second revision
+    # pass (if any) happens here, after the last character.
+    final_lookback = lookback_fixes.get(len(text))
+    if final_lookback is not None and final_lookback["swapped"]:
+        if not _run_lookback_fix(settings, final_lookback, min_delay, max_delay):
+            return
 
     # Formatting shortcuts at the very end of the file (this includes the
     # automatic close of any style left open) come after the last character.
@@ -3642,6 +4017,11 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     if settings.get("enable_paraphrase") and settings.get("paraphrase_chance", 0) > 0:
         estimated_paraphrases = newline_count * (settings["paraphrase_chance"] / 100)
         total_seconds += estimated_paraphrases * 4.0
+
+    if settings.get("enable_lookback_edit") and settings.get("lookback_edit_chance", 0) > 0:
+        # Second revision pass (Update #34): rough time for each trip back and forth
+        paragraph_count = newline_count + (1 if text and not text.endswith("\n") else 0)
+        total_seconds += paragraph_count * (settings["lookback_edit_chance"] / 100) * LOOKBACK_ESTIMATE_SECONDS
 
     if settings.get("enable_finger_timing", True):
         # Finger and hand timing (Update #28): hand switches are a little faster and
@@ -3794,6 +4174,18 @@ def validate_settings():
             return None
         if paraphrase_chance < 0 or paraphrase_chance > 100:
             messagebox.showerror("Invalid Input", "Paraphrase chance must be between 0 and 100.")
+            return None
+
+    enable_lookback_edit = bool(enable_lookback_edit_var.get())
+    lookback_edit_chance = 0.0
+    if enable_lookback_edit:
+        try:
+            lookback_edit_chance = float(lookback_edit_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Second revision chance must be a number.")
+            return None
+        if lookback_edit_chance < 0 or lookback_edit_chance > LOOKBACK_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Second revision chance must be between 0 and 100.")
             return None
 
     locked_window = window_var.get().strip() if lock_window_var.get() else ""
@@ -3982,6 +4374,8 @@ def validate_settings():
         "use_extra_typos": use_extra_typos,
         "enable_paraphrase": enable_paraphrase,
         "paraphrase_chance": paraphrase_chance,
+        "enable_lookback_edit": enable_lookback_edit,
+        "lookback_edit_chance": lookback_edit_chance,
         "paragraph_pause_min": paragraph_pause_min,
         "paragraph_pause_max": paragraph_pause_max,
         "sentence_pause_min": sentence_pause_min,
@@ -5325,6 +5719,25 @@ def toggle_pause():
         log_event("manual_pause", "")
 
 
+def show_lookback_stopped_message(pending):
+    """Tells the person what to fix by hand when Stop was pressed in the middle
+    of a second revision pass (Update #34)."""
+    if pending.get("stage") == "cursor":
+        body = (
+            "Typing was stopped while the cursor was going back to the end of the "
+            "paragraph.\n\nThe text itself is correct, but the cursor may be in the middle "
+            "of the paragraph. Click at the very end of the typed text before you resume."
+        )
+    else:
+        body = (
+            "Typing was stopped before a reworded word was fixed.\n\n"
+            f"The text on screen has \"{pending.get('draft', '')}\" where your file says "
+            f"\"{pending.get('original', '')}\". Change it back by hand, then click at the "
+            "very end of the typed text before you resume."
+        )
+    messagebox.showinfo("Stopped in the middle of a word change", body)
+
+
 def stop_typing():
     global preview_text_widget
     was_running = state.is_running
@@ -5364,6 +5777,12 @@ def stop_typing():
     # Tell the person which mistakes were purposely left for them (Update #24).
     if was_running and state.left_mistakes:
         open_left_mistake_report()
+
+    # A second revision pass was cut off by Stop (Update #34).
+    pending_lookback = state.lookback_pending
+    state.lookback_pending = None
+    if was_running and not was_preview and pending_lookback:
+        show_lookback_stopped_message(pending_lookback)
 
     run_on_main_thread(refresh_resume_status)
 
@@ -5449,6 +5868,8 @@ def get_current_settings_snapshot():
         "use_extra_typos": use_extra_typos_var.get(),
         "enable_paraphrase": enable_paraphrase_var.get(),
         "paraphrase_chance": paraphrase_chance_var.get(),
+        "enable_lookback_edit": enable_lookback_edit_var.get(),
+        "lookback_edit_chance": lookback_edit_chance_var.get(),
         "paragraph_pause_min": paragraph_pause_min_var.get(),
         "paragraph_pause_max": paragraph_pause_max_var.get(),
         "sentence_pause_min": sentence_pause_min_var.get(),
@@ -5519,6 +5940,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     use_extra_typos_var.set(data.get("use_extra_typos", False))
     enable_paraphrase_var.set(data.get("enable_paraphrase", True))
     paraphrase_chance_var.set(data.get("paraphrase_chance", "15"))
+    enable_lookback_edit_var.set(bool(data.get("enable_lookback_edit", False)))
+    lookback_edit_chance_var.set(str(data.get("lookback_edit_chance", "25")))
     paragraph_pause_min_var.set(data.get("paragraph_pause_min", "10"))
     paragraph_pause_max_var.set(data.get("paragraph_pause_max", "20"))
     sentence_pause_min_var.set(data.get("sentence_pause_min", "5"))
@@ -6729,6 +7152,9 @@ use_extra_typos_var = tk.BooleanVar(value=False)
 enable_paraphrase_var = tk.BooleanVar(value=True)
 paraphrase_chance_var = tk.StringVar(value="15")
 
+enable_lookback_edit_var = tk.BooleanVar(value=False)
+lookback_edit_chance_var = tk.StringVar(value="25")
+
 enable_smart_fixes_var = tk.BooleanVar(value=False)
 smart_fix_spacing_var = tk.BooleanVar(value=True)
 smart_fix_punctuation_var = tk.BooleanVar(value=True)
@@ -6802,6 +7228,7 @@ SECTION_RESET_VARS = {
         enable_paraphrase_var,
         paraphrase_chance_var,
     ],
+    "Second Revision Pass": [enable_lookback_edit_var, lookback_edit_chance_var],
     "Smart Text Fixes": [
         enable_smart_fixes_var,
         smart_fix_spacing_var,
@@ -7340,6 +7767,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.9.0",
+        "date": "2026-10-14",
+        "title": "Second revision pass",
+        "changes": [
+            "Added: Second Revision Pass. At the end of a paragraph, Amanuensis can go back to an earlier word, change it, and return to where it was. One word is first typed as a close synonym. When the paragraph is done, the typist presses the Left arrow key to go back, deletes the word, types the real one, and presses the Right arrow key the same number of times to return. This is the first time the app uses arrow keys.",
+            "Added: a Second Revision Pass card on the Mistakes tab with a switch (off by default) and a chance per paragraph (25 percent by default, 0 to 100). Both are saved with profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the trips back. Preview shows the change in the preview box without pressing any keys.",
+            "Notes: your text always ends up exactly as in the file. Only plain words 30 to 250 characters from the end of the paragraph are used, and a paragraph is skipped if the text after the word has protected text, symbols an editor might change, bold or italic markers, or a purposely left mistake. No progress checkpoint is saved while a word is waiting to be fixed, and if you press Stop then, a message tells you what to change by hand. The log records only the distance, never the words. It needs an editor where the arrow keys move the cursor. No new packages.",
+        ],
+    },
+    {
         "version": "5.8.0",
         "date": "2026-10-14",
         "title": "Updates install in place",
@@ -7773,6 +8211,7 @@ frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
 frame_typos = make_modern_card(tab_mistakes, "Character Typos")
 frame_mistakes = make_modern_card(tab_mistakes, "Sentence Reworks & Breaks")
+frame_lookback = make_modern_card(tab_mistakes, "Second Revision Pass")
 frame_smart_fixes = make_modern_card(tab_mistakes, "Smart Text Fixes")
 frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
 
@@ -8261,6 +8700,33 @@ modern_label(
     kind="muted",
 ).grid(row=11, column=1, rowspan=2, sticky="w", padx=(16, 0))
 
+# --- Second revision pass (Update #34) ---
+modern_checkbox(
+    frame_lookback, "Enable second revision pass (go back and fix an earlier word)", enable_lookback_edit_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_lookback, "Chance per paragraph (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_lookback_chance = modern_entry(frame_lookback, lookback_edit_chance_var, width=8)
+entry_lookback_chance.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_lookback,
+    "Real writers reread a paragraph and go back to change a word in an earlier "
+    "sentence. With this on, one word in a paragraph is first typed as a close "
+    "synonym. When the paragraph is finished, Amanuensis presses the Left arrow "
+    "key to go back, deletes the word, types the real one, and presses the Right "
+    "arrow key to return to the end. Your text always ends up exactly as written "
+    "in the file.\n\n"
+    "It only picks plain words 30 to 250 characters back, and skips paragraphs "
+    "with protected text, bold or italic markers, purposely left mistakes, or "
+    "symbols an editor might change. It needs an editor where the arrow keys move "
+    "the cursor (like Google Docs or Word), so it is off by default. Preview shows "
+    "the change without pressing any keys. If you press Stop before a word is "
+    "fixed, a message tells you what to change by hand.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Smart text fixes (Update #22) ---
 modern_checkbox(frame_smart_fixes, "Enable smart text fixes", enable_smart_fixes_var).grid(
     row=0, column=0, columnspan=2, sticky="w"
@@ -8519,6 +8985,7 @@ SECTION_CARDS = {
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
+    "Second Revision Pass": frame_lookback,
     "Smart Text Fixes": frame_smart_fixes,
     "Leave Mistakes For Me": frame_leave_mistakes,
     "Hotkeys": frame_hotkeys,
