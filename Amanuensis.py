@@ -9,7 +9,21 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
-# v5.10.0 (2026-10-14) -- Select and retype, plus overshoot (Update #35)
+# v5.11.0 (2026-10-15) -- Faster launch
+#   - Modified: The main window now stays hidden while the interface is built and
+#     appears once, finished and sized. Before, the window could already be on
+#     screen while it was still being built, so it redrew as cards were added.
+#   - Notes: No settings, packages, or typing behavior changed. In a test run on
+#     Linux the launch was about 10 percent faster; Windows was not measured.
+#     pyautogui is still
+#     imported before the window is created on purpose, because importing it turns
+#     on Windows DPI awareness and that must happen before the first Tk window
+#     exists. In a test run, most of the launch time (about 1 second) is
+#     CustomTkinter creating its rounded widgets, which this update cannot remove.
+#     Building each tab only when it is first opened is the next bigger step. It
+#     changes how the app is put together, so it needs a plan first.
+#
+# v5.10.0 (2026-10-14) -- Select and retype, plus overshoot
 #   - Added: Select & Retype. A word can be typed as a close synonym, then
 #     selected with Shift+Left (one press per letter) and typed over with the
 #     real word. Off by default, with a chance per paragraph (20 by default).
@@ -29,7 +43,7 @@
 #     fix by hand, and the word does not count as typed until it is done. The log
 #     never records the words. No new packages.
 #
-# v5.9.0 (2026-10-14) -- Second revision pass (Update #34)
+# v5.9.0 (2026-10-14) -- Second revision pass
 #   - Added: Second Revision Pass. At the end of a paragraph, the typist can go
 #     back with the Left arrow key to an earlier word that was first typed as a
 #     close synonym, delete it, type the real word, and return to the end with
@@ -45,21 +59,6 @@
 #     mistake. No autosave checkpoint is written while a word is waiting to be
 #     fixed. If Stop is pressed then, a message says what to fix by hand. The log
 #     records only the distance, never the words. No new packages.
-#
-# v5.8.0 (2026-10-14) -- Updates install in place (Update #33)
-#   - Added: Update and Restart. In the packaged .exe, the update prompt now
-#     downloads the new version, checks it against the checksum GitHub published,
-#     replaces the running app, and opens the new version, so there is no second
-#     .exe to swap in by hand.
-#   - Modified: Settings, profiles, and saved progress stay because the new file
-#     takes the old file's place in the same folder. A run in progress is never
-#     interrupted. The old plain Download is still used when the app runs from
-#     source, its folder cannot be written to, or the release has no checksum.
-#   - Notes: The running .exe is renamed to .old, the new one takes its name, and
-#     the old one is put back if any step fails. Leftover .old and .new files are
-#     deleted a few seconds after the next launch. The new copy is started with
-#     PyInstaller's environment reset so it unpacks its own files. No new settings
-#     or packages (the standard subprocess module is used to open the new copy).
 #
 # ============================================
 
@@ -7322,6 +7321,11 @@ window.geometry(f"{PREFERRED_WINDOW_WIDTH}x{PREFERRED_WINDOW_HEIGHT}")
 window.minsize(*full_view_min)
 window.configure(bg=PALETTE["bg"])
 window.attributes("-topmost", True)
+# Launch speed (v5.11.0): keep the window hidden while the interface is built.
+# A visible window is redrawn after every card that is added, which is slow.
+# It is shown once, finished and sized, by the deiconify() call at the very
+# bottom of this file. Do not remove that call, or the window never appears.
+window.withdraw()
 
 style = ttk.Style(window)
 style.theme_use("clam")
@@ -8148,6 +8152,15 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.11.0",
+        "date": "2026-10-15",
+        "title": "Faster launch",
+        "changes": [
+            "Modified: the main window now stays hidden while the app builds its screens, and appears once when everything is ready. Before, the window could already be on screen while it was still being built, so it had to redraw as each section was added.",
+            "Notes: nothing about typing, settings, or profiles changed, and there are no new packages. In a test on Linux the launch was about 10 percent faster, and Windows was not measured, so the speed-up you see may be different. Most of the remaining launch time is spent creating the rounded buttons, boxes, and cards, which cannot be removed without a bigger change. Building each tab only when you first open it is the next idea, and it would be planned first.",
+        ],
+    },
     {
         "version": "5.10.0",
         "date": "2026-10-14",
@@ -9461,6 +9474,9 @@ load_last_settings()
 input_path_var.trace_add("write", lambda *args: refresh_resume_status())
 file_queue_var.trace_add("write", lambda *args: refresh_resume_status())
 refresh_resume_status()
+# The interface is finished and sized, so show the window (hidden since the top
+# of the GUI setup, see "Launch speed" above) before the hotkeys are set up.
+window.deiconify()
 apply_hotkeys()
 window.protocol("WM_DELETE_WINDOW", on_close)
 window.after(UPDATE_STARTUP_DELAY_MS, run_startup_update_check)
