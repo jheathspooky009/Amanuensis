@@ -9,6 +9,24 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.12.0 (2026-10-16) -- Bursts followed by pauses
+#   - Added: Typing Bursts. The typist now writes in bursts of a few words and
+#     stops for a moment between them, instead of typing a whole sentence in one
+#     go. A burst is longer (about 8 to 16 words) for plain, familiar wording and
+#     shorter (about 3 to 7 words) in a sentence that needs more thought: one with
+#     a hard word, an argument word like "because" or "however", or many commas.
+#     A burst tries to end at a comma, semicolon, or colon when one is close.
+#   - Added: A "Typing Bursts" card on the Speed tab with two new settings
+#     (enable_typing_bursts, on by default, and burst_pause_strength, 100 by
+#     default, 0 to 300), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the average burst pauses.
+#   - Notes: Spots are planned once before typing, only from the resume point on,
+#     never in or next to protected text, never at a sentence or paragraph start,
+#     and never where a {{pause}} marker or a difficulty pause already sits. A
+#     burst pause is short (about 0.3 to 1.4 seconds) and not every burst ends
+#     with one. The log records only the spot and length, never the words. No new
+#     packages.
+#
 # v5.11.0 (2026-10-15) -- Faster launch
 #   - Modified: The main window now stays hidden while the interface is built and
 #     appears once, finished and sized. Before, the window could already be on
@@ -42,23 +60,6 @@
 #     if Stop is pressed. A Stop in the middle of a select and retype shows what to
 #     fix by hand, and the word does not count as typed until it is done. The log
 #     never records the words. No new packages.
-#
-# v5.9.0 (2026-10-14) -- Second revision pass
-#   - Added: Second Revision Pass. At the end of a paragraph, the typist can go
-#     back with the Left arrow key to an earlier word that was first typed as a
-#     close synonym, delete it, type the real word, and return to the end with
-#     the Right arrow key. This is the first time the app uses arrow keys.
-#   - Added: A "Second Revision Pass" card on the Mistakes tab with two new
-#     settings (enable_lookback_edit, off by default, and lookback_edit_chance,
-#     25 by default, 0 to 100), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the trips. Preview shows the
-#     swap without pressing any keys.
-#   - Notes: The arrow counts are exact, so only plain words 30 to 250 characters
-#     back are used, and a paragraph is skipped if the text after the word has
-#     protected text, symbols an editor may change, formatting markers, or a left
-#     mistake. No autosave checkpoint is written while a word is waiting to be
-#     fixed. If Stop is pressed then, a message says what to fix by hand. The log
-#     records only the distance, never the words. No new packages.
 #
 # ============================================
 
@@ -2739,6 +2740,124 @@ def estimate_difficulty_pause_seconds(text, protection_mask, settings):
 
 
 # --------------------------------------------
+# TYPING BURSTS AND PAUSES (Update #37)
+# --------------------------------------------
+# People rarely type a whole sentence in one go. They write a phrase, stop to
+# think, then write the next phrase. The bursts are longer when the wording is
+# familiar and shorter when the writer is choosing words or making an argument.
+# Before typing starts, each sentence is sorted as "familiar" or "wording".
+# A burst length (in words) is drawn for it, and a burst tries to end at a
+# comma, semicolon, or colon when one is close. The plan only says WHERE a short
+# pause may happen; the typing loop draws the chance and the length there.
+BURST_FAMILIAR = "familiar"
+BURST_WORDING = "wording"
+BURST_WORD_RANGES = {BURST_FAMILIAR: (8, 16), BURST_WORDING: (3, 7)}
+BURST_PAUSE_SECONDS = {BURST_FAMILIAR: (0.3, 0.9), BURST_WORDING: (0.5, 1.4)}
+BURST_PAUSE_CHANCE = 0.85           # share of burst ends that really pause
+BURST_CLAUSE_WINDOW_WORDS = 2       # end a burst early at a comma this close to its limit
+BURST_MIN_WORDS_AFTER = 3           # no burst pause with fewer words than this left in the sentence
+BURST_WORDING_COMMA_COUNT = 3       # this many commas, semicolons, or colons make a sentence "wording"
+BURST_CLAUSE_MARKS = ",;:"
+BURST_STRENGTH_MAX = 300.0
+
+# Words that usually show the writer is making a point or choosing a side.
+BURST_ARGUMENT_WORDS = frozenset("""
+because therefore however although though whereas thus hence moreover
+furthermore consequently unless despite instead rather arguably clearly
+but yet since should must cannot never always
+""".split())
+
+
+def classify_burst_sentence(words, segment):
+    """Returns BURST_WORDING when a sentence needs more thought (a hard word, an
+    argument word such as "because", or many commas), otherwise BURST_FAMILIAR.
+    `words` holds (start, end, score, protected, lowered) for each word."""
+    for _start, _end, score, protected, lowered in words:
+        if protected:
+            continue
+        if score >= DIFFICULTY_WORD_MIN_SCORE or lowered in BURST_ARGUMENT_WORDS:
+            return BURST_WORDING
+    if sum(segment.count(mark) for mark in BURST_CLAUSE_MARKS) >= BURST_WORDING_COMMA_COUNT:
+        return BURST_WORDING
+    return BURST_FAMILIAR
+
+
+def plan_typing_bursts(text, protection_mask, start_index=0, skip_positions=(), rng=None):
+    """Finds the spots where a burst of typing ends and a short pause may
+    happen. Returns {index of the first character of the next word: kind} where
+    kind is BURST_FAMILIAR or BURST_WORDING. Only text from start_index on is
+    planned. Nothing is planned at the first word of a sentence, in or next to
+    protected text, at a spot in skip_positions, or when fewer than
+    BURST_MIN_WORDS_AFTER words remain in the sentence. `rng` lets the time
+    estimate use a fixed random source so its answer does not wobble."""
+    rng = rng if rng is not None else random
+    plan = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = []
+        for match in DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end):
+            protected = any(protection_mask[match.start():match.end()])
+            score = 0 if protected else score_word_difficulty(match.group())
+            words.append((match.start(), match.end(), score, protected, match.group().lower()))
+        if len(words) <= BURST_MIN_WORDS_AFTER:
+            continue
+
+        kind = classify_burst_sentence(words, text[span_start:span_end])
+        low, high = BURST_WORD_RANGES[kind]
+        burst_length = rng.randint(low, high)
+        words_in_burst = 0
+        for number in range(1, len(words)):
+            words_in_burst += 1  # the word before this one belongs to the current burst
+            if len(words) - number < BURST_MIN_WORDS_AFTER:
+                break
+            start = words[number][0]
+            previous_end = words[number - 1][1]
+            gap = text[previous_end:start]
+            ends_a_clause = any(mark in gap for mark in BURST_CLAUSE_MARKS)
+            limit_reached = words_in_burst >= burst_length
+            near_a_clause = ends_a_clause and words_in_burst >= max(low, burst_length - BURST_CLAUSE_WINDOW_WORDS)
+            if not (limit_reached or near_a_clause):
+                continue
+            # The burst ends here. Start counting the next one either way, so a
+            # skipped spot never makes the following bursts pile up.
+            words_in_burst = 0
+            burst_length = rng.randint(low, high)
+            if (words[number][3] or start < start_index or start in skip_positions
+                    or any(protection_mask[previous_end:start])):
+                continue
+            plan[start] = kind
+    return plan
+
+
+def draw_burst_pause_seconds(kind, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Pause Strength setting."""
+    if strength_percent <= 0 or random.random() >= BURST_PAUSE_CHANCE:
+        return 0.0
+    low, high = BURST_PAUSE_SECONDS[kind]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def estimate_burst_pause_seconds(text, protection_mask, settings):
+    """Average extra time the burst pauses add to `text`. Uses the same planner,
+    chance, and ranges the typing loop draws from, with a fixed random source so
+    the estimate stays steady from one click to the next."""
+    if not settings.get("enable_typing_bursts", True):
+        return 0.0
+    strength = settings.get("burst_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    plan = plan_typing_bursts(text, mask, 0, (), random.Random(len(text)))
+    total = 0.0
+    for kind in plan.values():
+        average = sum(BURST_PAUSE_SECONDS[kind]) / 2.0
+        total += BURST_PAUSE_CHANCE * average * strength
+    return total
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -3476,6 +3595,8 @@ def type_text(settings, is_batch=False, is_last=True):
     typing_mood_strength = settings.get("typing_mood_strength", 100.0)
     enable_difficulty_pauses = settings.get("enable_difficulty_pauses", True)
     difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
+    enable_typing_bursts = settings.get("enable_typing_bursts", True)
+    burst_pause_strength = settings.get("burst_pause_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -3522,6 +3643,19 @@ def type_text(settings, is_batch=False, is_last=True):
         except Exception:
             difficulty_plan = {}
             log_event("difficulty_pauses_failed", "could not plan thinking pauses; typing without them")
+
+    # Short pauses between bursts of typing (Update #37). Planned once, only for
+    # text still to be typed, and never at a spot that already has a pause marker
+    # or a difficulty pause. If planning ever fails, the file is typed without them.
+    burst_plan = {}
+    if enable_typing_bursts and burst_pause_strength > 0:
+        try:
+            burst_plan = plan_typing_bursts(
+                text, protection_mask, resume_from, set(pause_map) | set(difficulty_plan)
+            )
+        except Exception:
+            burst_plan = {}
+            log_event("burst_pauses_failed", "could not plan burst pauses; typing without them")
 
     # Mistakes to purposely leave for the person to fix (Update #24). They are
     # planned only for text that is still to be typed. If planning ever fails,
@@ -3764,6 +3898,29 @@ def type_text(settings, is_batch=False, is_last=True):
                     state.status = "Thinking of the right word..."
                 log_event("difficulty_pause", f"{difficulty_kind} ~{think_seconds:.1f}s before character {idx}")
                 for _ in range(int(think_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # BURST PAUSE (Update #37)
+        # A short stop between bursts of typing, like a person who writes a
+        # phrase and then thinks. It runs at the same place as the difficulty
+        # pause (BEFORE the focus-lock and pause checks), stays stoppable and
+        # pausable, and is not added to paused_duration. Only the spot and
+        # length (never the text) go in the log.
+        # --------------------------------
+        burst_kind = burst_plan.get(idx)
+        if burst_kind:
+            burst_seconds = draw_burst_pause_seconds(burst_kind, burst_pause_strength)
+            if burst_seconds > 0:
+                state.status = "Pausing to think..."
+                log_event("burst_pause", f"{burst_kind} ~{burst_seconds:.1f}s before character {idx}")
+                for _ in range(int(burst_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
                     time.sleep(0.1)
@@ -4346,6 +4503,9 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     # over the same chances and ranges the typing loop draws from.
     total_seconds += estimate_difficulty_pause_seconds(text, protection_mask, settings)
 
+    # Short pauses between bursts of typing (Update #37), averaged the same way.
+    total_seconds += estimate_burst_pause_seconds(text, protection_mask, settings)
+
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
         # increase up to fatigue_strength percent and partly recover after research breaks.
@@ -4581,6 +4741,18 @@ def validate_settings():
     except ValueError:
         difficulty_pause_strength = 100.0
         difficulty_pause_strength_var.set("100")
+    enable_typing_bursts = bool(enable_typing_bursts_var.get())
+    try:
+        burst_pause_strength = float(burst_pause_strength_var.get())
+        if burst_pause_strength < 0:
+            burst_pause_strength = 0.0
+            burst_pause_strength_var.set("0")
+        elif burst_pause_strength > BURST_STRENGTH_MAX:
+            burst_pause_strength = BURST_STRENGTH_MAX
+            burst_pause_strength_var.set(f"{BURST_STRENGTH_MAX:g}")
+    except ValueError:
+        burst_pause_strength = 100.0
+        burst_pause_strength_var.set("100")
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -4690,6 +4862,8 @@ def validate_settings():
         "typing_mood_strength": typing_mood_strength,
         "enable_difficulty_pauses": enable_difficulty_pauses,
         "difficulty_pause_strength": difficulty_pause_strength,
+        "enable_typing_bursts": enable_typing_bursts,
+        "burst_pause_strength": burst_pause_strength,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -6255,6 +6429,8 @@ def get_current_settings_snapshot():
         "typing_mood_strength": typing_mood_strength_var.get(),
         "enable_difficulty_pauses": enable_difficulty_pauses_var.get(),
         "difficulty_pause_strength": difficulty_pause_strength_var.get(),
+        "enable_typing_bursts": enable_typing_bursts_var.get(),
+        "burst_pause_strength": burst_pause_strength_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -6327,6 +6503,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     typing_mood_strength_var.set(str(data.get("typing_mood_strength", "100")))
     enable_difficulty_pauses_var.set(bool(data.get("enable_difficulty_pauses", True)))
     difficulty_pause_strength_var.set(str(data.get("difficulty_pause_strength", "100")))
+    enable_typing_bursts_var.set(bool(data.get("enable_typing_bursts", True)))
+    burst_pause_strength_var.set(str(data.get("burst_pause_strength", "100")))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -7498,6 +7676,8 @@ enable_typing_moods_var = tk.BooleanVar(value=True)
 typing_mood_strength_var = tk.StringVar(value="100")
 enable_difficulty_pauses_var = tk.BooleanVar(value=True)
 difficulty_pause_strength_var = tk.StringVar(value="100")
+enable_typing_bursts_var = tk.BooleanVar(value=True)
+burst_pause_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -7594,6 +7774,7 @@ SECTION_RESET_VARS = {
         enable_pause_markers_var,
     ],
     "Difficulty Pauses": [enable_difficulty_pauses_var, difficulty_pause_strength_var],
+    "Typing Bursts": [enable_typing_bursts_var, burst_pause_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
@@ -8153,6 +8334,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.12.0",
+        "date": "2026-10-16",
+        "title": "Bursts followed by pauses",
+        "changes": [
+            "Added: typing bursts. Amanuensis now types a phrase, stops for a moment, then types the next phrase, instead of running through a whole sentence without a break. Bursts are longer (about 8 to 16 words) when the wording is plain and familiar, and shorter (about 3 to 7 words) in a sentence that needs more thought, such as one with a hard word, an argument word like \"because\" or \"however\", or many commas. A burst often ends at a comma when one is close.",
+            "Added: a Typing Bursts card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. They are short (about 0.3 to 1.4 seconds) and not every burst ends with one.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause, and there is no burst pause at the start of a sentence or paragraph, or where a pause marker or a difficulty pause already is. The session log records only the spot and length, never the words.",
+        ],
+    },
+    {
         "version": "5.11.0",
         "date": "2026-10-15",
         "title": "Faster launch",
@@ -8613,6 +8805,7 @@ frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
 frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
+frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -9010,6 +9203,30 @@ modern_label(
     "100% is the normal length. Use less for shorter pauses or more for longer ones "
     "(0 to 300). Protected text never gets a pause, and the time estimate includes "
     "these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Typing bursts (Update #37) ---
+modern_checkbox(
+    frame_typing_bursts, "Type in bursts with short pauses between them", enable_typing_bursts_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_typing_bursts, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_burst_pause_strength = modern_entry(frame_typing_bursts, burst_pause_strength_var, width=8)
+entry_burst_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_typing_bursts,
+    "People type a phrase, stop for a moment to think, then carry on. Amanuensis "
+    "does the same: bursts of about 8 to 16 words when the wording is plain and "
+    "familiar, and shorter bursts of about 3 to 7 words in a sentence with a hard "
+    "word, an argument word like \"because\" or \"however\", or many commas. A "
+    "burst often ends at a comma when one is close. Not every burst ends with a "
+    "pause.\n\n"
+    "100% is the normal length (usually under a second and a half). Use "
+    "less for shorter pauses or more for longer ones (0 to 300). Protected text "
+    "never gets a pause, and the time estimate includes these pauses.",
     kind="muted",
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -9437,6 +9654,7 @@ SECTION_CARDS = {
     "Flow & Hesitation": frame_typing_moods,
     "Natural Pauses": frame_pauses,
     "Difficulty Pauses": frame_difficulty_pauses,
+    "Typing Bursts": frame_typing_bursts,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
