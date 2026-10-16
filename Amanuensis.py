@@ -9,6 +9,26 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.10.0 (2026-10-14) -- Select and retype, plus overshoot (Update #35)
+#   - Added: Select & Retype. A word can be typed as a close synonym, then
+#     selected with Shift+Left (one press per letter) and typed over with the
+#     real word. Off by default, with a chance per paragraph (20 by default).
+#   - Added: Overshoot. After a typo is backspaced, the typist sometimes presses
+#     Backspace one time too many, notices, and types the letter again. On by
+#     default (30 percent of typo fixes). It only needs the Backspace key.
+#   - Added: A "Select, Retype & Overshoot" card on the Mistakes tab with four new
+#     settings (enable_select_retype, select_retype_chance, enable_overshoot,
+#     overshoot_chance), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes both. Preview shows the swap
+#     without pressing any keys.
+#   - Notes: The selection count is exact (the letters of the word just typed), and
+#     only plain words with no protected text, formatting marker, or left mistake
+#     are used. Overshoot never reaches past the one letter before the cursor,
+#     never touches a bold or italic letter, and always puts the letter back, even
+#     if Stop is pressed. A Stop in the middle of a select and retype shows what to
+#     fix by hand, and the word does not count as typed until it is done. The log
+#     never records the words. No new packages.
+#
 # v5.9.0 (2026-10-14) -- Second revision pass (Update #34)
 #   - Added: Second Revision Pass. At the end of a paragraph, the typist can go
 #     back with the Left arrow key to an earlier word that was first typed as a
@@ -40,23 +60,6 @@
 #     deleted a few seconds after the next launch. The new copy is started with
 #     PyInstaller's environment reset so it unpacks its own files. No new settings
 #     or packages (the standard subprocess module is used to open the new copy).
-#
-# v5.7.0 (2026-10-13) -- Auto-pick a profile by window (Update #30)
-#   - Added: Auto Profile by Window. Add rules that pair some words from a window
-#     title (like "Google Docs") with a saved profile. When a run starts, the first
-#     rule whose words appear in the target window's title loads its profile, so
-#     each program gets its own typing style.
-#   - Added: An "Auto Profile by Window" card on the Window tab with two new
-#     settings (enable_auto_profile, off by default, and auto_profile_rules, an
-#     empty list by default), restored on launch.
-#   - Modified: The target window is the locked window when Lock typing is on,
-#     otherwise the window that was active when Start was pressed. Clicking the
-#     Start button makes Amanuensis itself active, so use the Start hotkey.
-#   - Notes: Rules hold window words, so they are never saved into profiles and
-#     are ignored when a profile is loaded. A rule can only name a file inside the
-#     profiles folder. An auto-picked profile never changes hotkeys, theme, or
-#     update settings. The log records only the profile name, never the window
-#     title. Preview and the time estimate do not switch profiles. No new packages.
 #
 # ============================================
 
@@ -180,6 +183,7 @@ class TyperState:
         self.target_end_time = 0.0  # when the run should finish under a target time (0 = no target)
         self.session_breaks_left = 0  # long session breaks still ahead in the current file
         self.lookback_pending = None  # second revision pass in progress: {draft, original, stage} (Update #34)
+        self.select_retype_pending = None  # select and retype in progress: {draft, original} (Update #35)
 
 
 state = TyperState()
@@ -1811,6 +1815,127 @@ def plan_lookback_edits(text, protection_mask, settings, resume_from,
 
 
 # --------------------------------------------
+# SELECT AND RETYPE, PLUS OVERSHOOT (Update #35)
+# --------------------------------------------
+# Two more ways a real typist fixes things:
+#
+# 1. Select and retype. Right after finishing a word, the typist decides it is
+#    the wrong word, holds Shift and taps Left once for each letter to select
+#    it, and types the real word over the highlighted one. The draft word is a
+#    close synonym (the same built-in list the paragraph paraphrase uses), so
+#    the final text is always exactly the file's text. The press count is the
+#    exact number of letters just typed, and the cursor is still right after
+#    them, so the selection can never reach anything else.
+#
+# 2. Overshoot. After a typo has been backspaced away, the typist sometimes
+#    presses Backspace one time too many, notices, and types that letter again.
+#    It only needs the Backspace key, so it works in any text box.
+#
+# Safety rules (the planner skips a word instead of guessing):
+#   * only words with a built-in synonym, only plain letters, and never the
+#     first word of a paragraph (the same word pattern as the second revision);
+#   * no protected text, bold or italic marker, purposely left mistake, pause
+#     marker, or smart-fix slip may touch the word;
+#   * never a word that the second revision pass already uses.
+# Overshoot never reaches past the one letter right before the cursor, is skipped
+# next to bold or italic shortcuts, and always puts the letter back, even if Stop
+# is pressed in the middle.
+SELECT_RETYPE_CHANCE_MAX = 100.0
+OVERSHOOT_CHANCE_MAX = 100.0
+SELECT_RETYPE_ESTIMATE_SECONDS = 5.0  # rough time for one select and retype
+OVERSHOOT_ESTIMATE_SECONDS = 1.2  # rough extra time for one overshoot
+
+
+def _choose_select_retype(text, protection_mask, para_start, para_end, resume_from,
+                          format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps):
+    """Picks one word to select and retype in the paragraph text[para_start:para_end].
+    Returns an edit dict (start, end, original, draft) or None when the paragraph
+    has no safe word."""
+    para_text = text[para_start:para_end]
+    if not para_text.strip():
+        return None
+
+    format_positions = sorted(format_map)
+    candidates = []
+    for match in LOOKBACK_WORD_PATTERN.finditer(para_text):
+        word = match.group(0)
+        synonyms = PARAPHRASE_SYNONYMS.get(word.lower())
+        if not synonyms:
+            continue
+        word_start = para_start + match.start()
+        word_end = para_start + match.end()
+        if word_start < resume_from:
+            continue
+        if any(protection_mask[word_start:word_end]):
+            continue
+        # No bold or italic shortcut at or inside the word, and no style switched
+        # on when the word starts (a retyped word could lose the style).
+        if any(word_start - 1 <= position <= word_end + 1 for position in format_positions):
+            continue
+        active_styles = set()
+        for position in format_positions:
+            if position >= word_start:
+                break
+            active_styles ^= set(format_map[position])
+        if active_styles:
+            continue
+        # A purposely left mistake changes what is on screen.
+        if any(position < word_end and entry["end"] > word_start
+               for position, entry in left_mistake_map.items()):
+            continue
+        # Pause markers and slips inside the word would be skipped, so avoid it.
+        if any(word_start < position < word_end for position in pause_map):
+            continue
+        if any(word_start < position < word_end for position in fix_actions):
+            continue
+        # Never the same word the second revision pass changes.
+        if any(edit["start"] < word_end and word_start < edit["end"] for edit in lookback_swaps.values()):
+            continue
+        candidates.append((word_start, word_end, word, synonyms))
+
+    if not candidates:
+        return None
+    word_start, word_end, word, synonyms = random.choice(candidates)
+    draft = _match_case(word, random.choice(synonyms))
+    if draft == word or not draft.isalpha():
+        return None
+    return {
+        "start": word_start,
+        "end": word_end,
+        "original": word,
+        "draft": draft,
+    }
+
+
+def plan_select_retypes(text, protection_mask, settings, resume_from,
+                        format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps):
+    """Plans select and retype before typing starts. Returns a dict
+    {word start: edit}. Each paragraph gets one edit with the chosen chance. The
+    last paragraph counts too, even without a line break after it."""
+    plan = {}
+    if not settings.get("enable_select_retype", False) or not text:
+        return plan
+    chance = float(settings.get("select_retype_chance", 0.0))
+    if chance <= 0:
+        return plan
+
+    para_start = 0
+    while para_start < len(text):
+        para_end = text.find("\n", para_start)
+        if para_end == -1:
+            para_end = len(text)
+        if para_end > para_start and para_end > resume_from and random.uniform(0, 100) < chance:
+            edit = _choose_select_retype(
+                text, protection_mask, para_start, para_end, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+            )
+            if edit is not None:
+                plan[edit["start"]] = edit
+        para_start = para_end + 1
+    return plan
+
+
+# --------------------------------------------
 # SESSION LOGGING
 # --------------------------------------------
 def log_event(event, detail=""):
@@ -3221,6 +3346,103 @@ def _run_lookback_fix(settings, edit, min_delay, max_delay):
     return True
 
 
+# --------------------------------------------
+# SELECT AND RETYPE, PLUS OVERSHOOT: the key presses (Update #35)
+# --------------------------------------------
+def _press_shift_left(settings, count):
+    """Selects the `count` characters to the left of the cursor by holding Shift
+    and pressing Left exactly `count` times, a few at a time, checking Stop and
+    Pause between the groups. Shift is let go after every group (even if
+    something goes wrong), so it is never left held while the run is paused. In
+    preview mode nothing is pressed, because the keys would go to whatever
+    window has focus instead of the preview. Returns False when Stop was
+    pressed."""
+    remaining = count
+    while remaining > 0:
+        if not _lookback_gate(settings, False):
+            return False
+        chunk = min(LOOKBACK_KEY_CHUNK, remaining)
+        if settings.get("preview_mode"):
+            time.sleep(chunk * random.uniform(0.02, 0.05))
+        else:
+            pyautogui.keyDown("shift")
+            try:
+                pyautogui.press("left", presses=chunk, interval=random.uniform(0.03, 0.07))
+            finally:
+                pyautogui.keyUp("shift")
+        remaining -= chunk
+    return True
+
+
+def _run_select_retype(settings, edit, min_delay, max_delay):
+    """The second half of a select and retype. The draft word is already typed
+    and the cursor is right after it. This waits a moment (as if rereading the
+    word), selects the draft with Shift+Left, and types the real word over it.
+    `state.select_retype_pending` is set by the caller before the first key and
+    cleared here when the word is done, so a Stop in the middle can tell the
+    person what to fix by hand. Returns False when Stop was pressed. The log
+    records only the letter count, never the words."""
+    draft = edit["draft"]
+    original = edit["original"]
+    preview = bool(settings.get("preview_mode"))
+
+    log_event("select_retype_start", f"selecting {len(draft)} letters")
+    state.status = "Rereading the last word..."
+    if not _lookback_sleep(settings, random.uniform(0.7, 1.8)):
+        return False
+
+    # 1. Select the draft word (the cursor is still right after it).
+    state.status = "Selecting the word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if not _press_shift_left(settings, len(draft)):
+        return False
+    if not _lookback_sleep(settings, random.uniform(0.3, 0.8)):
+        return False
+
+    # 2. Type the real word over the highlighted one.
+    state.status = "Typing over the word..."
+    if not _lookback_gate(settings, True):
+        return False
+    if preview:
+        run_on_main_thread(lambda n=len(draft), o=original: _preview_replace_near_end(0, n, o))
+        time.sleep(random.uniform(0.4, 0.9))
+    else:
+        for char in original:
+            if not _lookback_gate(settings, False):
+                return False
+            _send_char(settings, char)
+            char_delay = random.uniform(min_delay, max_delay)
+            if char.isalpha():
+                char_delay += random.uniform(0.01, 0.03)
+            time.sleep(char_delay)
+
+    state.select_retype_pending = None
+    log_event("select_retype_end", "")
+    state.status = "Typing..."
+    return True
+
+
+def _run_overshoot(settings, previous_letter):
+    """Presses Backspace one time too many (right after a typo was backspaced
+    away), notices, and types the deleted letter again, so the screen ends up
+    exactly as it was. Once the extra Backspace has been pressed, the letter is
+    always typed again, even if Stop is pressed, so no letter is ever left
+    missing. Returns False if Stop was requested (the caller should return
+    right away). The log records no letters."""
+    state.status = "Went back one letter too far..."
+    time.sleep(random.uniform(0.04, 0.12))  # same quick burst as the last Backspace
+    if stop_event.is_set():
+        return False
+    _send_backspace(settings)
+    time.sleep(random.uniform(0.25, 0.6))  # the "oops" moment
+    _send_char(settings, previous_letter)
+    time.sleep(random.uniform(0.1, 0.25))
+    log_event("overshoot", "pressed Backspace one time too many and typed the letter again")
+    state.status = "Typing..."
+    return not stop_event.is_set()
+
+
 def type_text(settings, is_batch=False, is_last=True):
     """Background-thread entry point. Reads the input file, then
     types it out character by character with randomized delays,
@@ -3256,6 +3478,8 @@ def type_text(settings, is_batch=False, is_last=True):
     enable_difficulty_pauses = settings.get("enable_difficulty_pauses", True)
     difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
+    enable_overshoot = settings.get("enable_overshoot", True)
+    overshoot_chance = settings.get("overshoot_chance", 30.0)
 
     try:
         with open(input_path, "r", encoding="utf-8") as file:
@@ -3322,6 +3546,7 @@ def type_text(settings, is_batch=False, is_last=True):
     state.total_newlines = text.count("\n")
     state.chars_typed = resume_from
     state.lookback_pending = None
+    state.select_retype_pending = None
 
     # Second revision pass (Update #34): words to type as a synonym first and
     # fix after the paragraph. Planned only for text that is still to be typed.
@@ -3340,6 +3565,23 @@ def type_text(settings, is_batch=False, is_last=True):
             log_event("lookback_failed", "could not plan second revision edits; typing without them")
         if lookback_swaps:
             log_event("lookback_planned", f"{len(lookback_swaps)} paragraph(s)")
+
+    # Select and retype (Update #35): words to type as a synonym, then select
+    # with Shift+Left and type over. Planned only for text that is still to be
+    # typed, and never on a word the second revision pass uses. If planning ever
+    # fails, the file is simply typed without them.
+    select_retype_plan = {}
+    if settings.get("enable_select_retype", False):
+        try:
+            select_retype_plan = plan_select_retypes(
+                text, protection_mask, settings, resume_from,
+                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps
+            )
+        except Exception:
+            select_retype_plan = {}
+            log_event("select_retype_failed", "could not plan select and retype; typing without them")
+        if select_retype_plan:
+            log_event("select_retype_planned", f"{len(select_retype_plan)} word(s)")
     state.newlines_typed = text[:resume_from].count("\n")
     state.paused_duration = 0.0
     state.status = "Countdown..."
@@ -3776,16 +4018,52 @@ def type_text(settings, is_batch=False, is_last=True):
             continue
 
         # --------------------------------
+        # SELECT AND RETYPE (Update #35)
+        # The draft (synonym) word is typed, then Shift+Left selects exactly its
+        # letters and the real word is typed over it. state.select_retype_pending
+        # is set BEFORE the first key, so a Stop in the middle can tell the person
+        # what to fix by hand. chars_typed only moves once the word is done, so a
+        # resume starts again at this word.
+        # --------------------------------
+        select_edit = select_retype_plan.get(idx)
+        if (select_edit is not None and not is_protected and not active_formats
+                and idx not in left_mistake_map):
+            select_draft = select_edit["draft"]
+            state.select_retype_pending = {"draft": select_draft, "original": select_edit["original"]}
+            for draft_char in select_draft:
+                if stop_event.is_set():
+                    return
+                _send_char(settings, draft_char)
+                draft_delay = random.uniform(min_delay, max_delay)
+                if draft_char.isalpha():
+                    draft_delay += random.uniform(0.01, 0.03)
+                if typing_mood is not None:
+                    draft_delay *= typing_mood.step()[0]
+                if enable_fatigue:
+                    draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
+                    fatigue_chars += 1
+                time.sleep(draft_delay)
+            if not _run_select_retype(settings, select_edit, min_delay, max_delay):
+                return
+            left_skip_until = select_edit["end"]
+            state.chars_typed += select_edit["end"] - idx
+            prev_char = select_edit["original"][-1]
+            recent_typed_buffer = (recent_typed_buffer + select_edit["original"])[-120:]
+            continue
+
+        # --------------------------------
         # TYPOS: adjacent-key errors, or expanded realistic typo types
         # (swapped letters, doubled letters, missed spaces) when enabled.
         # --------------------------------
         char_already_typed = False
+        typo_corrected = False
         if enable_typos and not is_protected and idx not in left_mistake_map:
             can_typo = char.isalpha() or (use_extra_typos and char == " ")
             if can_typo and random.uniform(0, 100) < typo_chance:
                 if not use_extra_typos:
                     if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
                         _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, False)
+                        typo_corrected = True
                 else:
                     candidates = []
                     if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
@@ -3815,9 +4093,31 @@ def type_text(settings, is_batch=False, is_last=True):
                             char_already_typed = _simulate_doubled_letter_typo(settings, text, idx, protection_mask)
                         elif chosen_typo == "missed_space":
                             _simulate_missed_space_typo(settings, text, idx, protection_mask)
+                        typo_corrected = True
 
         if stop_event.is_set():
             return
+
+        # --------------------------------
+        # OVERSHOOT (Update #35)
+        # Right after a typo was backspaced away, the typist sometimes presses
+        # Backspace one time too many, then types that letter again. Only the one
+        # letter right before the cursor is touched, and only a plain letter this
+        # run typed itself (the rework buffer holds exactly what is on screen).
+        # Skipped next to bold or italic shortcuts and while a second revision
+        # word is waiting.
+        # --------------------------------
+        if (typo_corrected and enable_overshoot and overshoot_chance > 0
+                and not char_already_typed
+                and idx - 1 >= resume_from
+                and not rework_hold
+                and not active_formats
+                and idx not in format_map and (idx - 1) not in format_map
+                and state.lookback_pending is None
+                and recent_typed_buffer and recent_typed_buffer[-1].isalpha()
+                and random.uniform(0, 100) < overshoot_chance):
+            if not _run_overshoot(settings, recent_typed_buffer[-1]):
+                return
 
         # --------------------------------
         # LETTER-PAIR SPEED-UP + BASE DELAY
@@ -4023,6 +4323,21 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
         paragraph_count = newline_count + (1 if text and not text.endswith("\n") else 0)
         total_seconds += paragraph_count * (settings["lookback_edit_chance"] / 100) * LOOKBACK_ESTIMATE_SECONDS
 
+    if settings.get("enable_select_retype") and settings.get("select_retype_chance", 0) > 0:
+        # Select and retype (Update #35): rough time for each one
+        paragraph_count = newline_count + (1 if text and not text.endswith("\n") else 0)
+        total_seconds += paragraph_count * (settings["select_retype_chance"] / 100) * SELECT_RETYPE_ESTIMATE_SECONDS
+
+    if (settings.get("enable_overshoot", True) and settings.get("overshoot_chance", 0) > 0
+            and settings["enable_typos"] and settings["typo_chance"] > 0):
+        # Overshoot (Update #35): only happens after a typo is fixed
+        if protection_mask is not None:
+            overshoot_alpha = sum(1 for i, c in enumerate(text) if c.isalpha() and not protection_mask[i])
+        else:
+            overshoot_alpha = sum(1 for c in text if c.isalpha())
+        overshoot_typos = overshoot_alpha * (settings["typo_chance"] / 100)
+        total_seconds += overshoot_typos * (settings["overshoot_chance"] / 100) * OVERSHOOT_ESTIMATE_SECONDS
+
     if settings.get("enable_finger_timing", True):
         # Finger and hand timing (Update #28): hand switches are a little faster and
         # same-finger pairs a little slower. The shift is counted in average delays.
@@ -4186,6 +4501,30 @@ def validate_settings():
             return None
         if lookback_edit_chance < 0 or lookback_edit_chance > LOOKBACK_CHANCE_MAX:
             messagebox.showerror("Invalid Input", "Second revision chance must be between 0 and 100.")
+            return None
+
+    enable_select_retype = bool(enable_select_retype_var.get())
+    select_retype_chance = 0.0
+    if enable_select_retype:
+        try:
+            select_retype_chance = float(select_retype_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Select and retype chance must be a number.")
+            return None
+        if select_retype_chance < 0 or select_retype_chance > SELECT_RETYPE_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Select and retype chance must be between 0 and 100.")
+            return None
+
+    enable_overshoot = bool(enable_overshoot_var.get())
+    overshoot_chance = 0.0
+    if enable_overshoot:
+        try:
+            overshoot_chance = float(overshoot_chance_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Overshoot chance must be a number.")
+            return None
+        if overshoot_chance < 0 or overshoot_chance > OVERSHOOT_CHANCE_MAX:
+            messagebox.showerror("Invalid Input", "Overshoot chance must be between 0 and 100.")
             return None
 
     locked_window = window_var.get().strip() if lock_window_var.get() else ""
@@ -4376,6 +4715,10 @@ def validate_settings():
         "paraphrase_chance": paraphrase_chance,
         "enable_lookback_edit": enable_lookback_edit,
         "lookback_edit_chance": lookback_edit_chance,
+        "enable_select_retype": enable_select_retype,
+        "select_retype_chance": select_retype_chance,
+        "enable_overshoot": enable_overshoot,
+        "overshoot_chance": overshoot_chance,
         "paragraph_pause_min": paragraph_pause_min,
         "paragraph_pause_max": paragraph_pause_max,
         "sentence_pause_min": sentence_pause_min,
@@ -5738,6 +6081,20 @@ def show_lookback_stopped_message(pending):
     messagebox.showinfo("Stopped in the middle of a word change", body)
 
 
+def show_select_retype_stopped_message(pending):
+    """Tells the person what to fix by hand when Stop was pressed in the middle
+    of a select and retype (Update #35). The word never counted as typed, so
+    after it is deleted, resuming types it again."""
+    body = (
+        "Typing was stopped while a word was being selected and retyped.\n\n"
+        f"The last word on screen may be \"{pending.get('draft', '')}\" (it may still be "
+        f"highlighted), or only the start of \"{pending.get('original', '')}\". Delete "
+        "that last word by hand, then click right after the last correct character "
+        "before you resume."
+    )
+    messagebox.showinfo("Stopped in the middle of a word change", body)
+
+
 def stop_typing():
     global preview_text_widget
     was_running = state.is_running
@@ -5783,6 +6140,12 @@ def stop_typing():
     state.lookback_pending = None
     if was_running and not was_preview and pending_lookback:
         show_lookback_stopped_message(pending_lookback)
+
+    # A select and retype was cut off by Stop (Update #35).
+    pending_select = state.select_retype_pending
+    state.select_retype_pending = None
+    if was_running and not was_preview and pending_select:
+        show_select_retype_stopped_message(pending_select)
 
     run_on_main_thread(refresh_resume_status)
 
@@ -5870,6 +6233,10 @@ def get_current_settings_snapshot():
         "paraphrase_chance": paraphrase_chance_var.get(),
         "enable_lookback_edit": enable_lookback_edit_var.get(),
         "lookback_edit_chance": lookback_edit_chance_var.get(),
+        "enable_select_retype": enable_select_retype_var.get(),
+        "select_retype_chance": select_retype_chance_var.get(),
+        "enable_overshoot": enable_overshoot_var.get(),
+        "overshoot_chance": overshoot_chance_var.get(),
         "paragraph_pause_min": paragraph_pause_min_var.get(),
         "paragraph_pause_max": paragraph_pause_max_var.get(),
         "sentence_pause_min": sentence_pause_min_var.get(),
@@ -5942,6 +6309,10 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     paraphrase_chance_var.set(data.get("paraphrase_chance", "15"))
     enable_lookback_edit_var.set(bool(data.get("enable_lookback_edit", False)))
     lookback_edit_chance_var.set(str(data.get("lookback_edit_chance", "25")))
+    enable_select_retype_var.set(bool(data.get("enable_select_retype", False)))
+    select_retype_chance_var.set(str(data.get("select_retype_chance", "20")))
+    enable_overshoot_var.set(bool(data.get("enable_overshoot", True)))
+    overshoot_chance_var.set(str(data.get("overshoot_chance", "30")))
     paragraph_pause_min_var.set(data.get("paragraph_pause_min", "10"))
     paragraph_pause_max_var.set(data.get("paragraph_pause_max", "20"))
     sentence_pause_min_var.set(data.get("sentence_pause_min", "5"))
@@ -7155,6 +7526,11 @@ paraphrase_chance_var = tk.StringVar(value="15")
 enable_lookback_edit_var = tk.BooleanVar(value=False)
 lookback_edit_chance_var = tk.StringVar(value="25")
 
+enable_select_retype_var = tk.BooleanVar(value=False)
+select_retype_chance_var = tk.StringVar(value="20")
+enable_overshoot_var = tk.BooleanVar(value=True)
+overshoot_chance_var = tk.StringVar(value="30")
+
 enable_smart_fixes_var = tk.BooleanVar(value=False)
 smart_fix_spacing_var = tk.BooleanVar(value=True)
 smart_fix_punctuation_var = tk.BooleanVar(value=True)
@@ -7229,6 +7605,12 @@ SECTION_RESET_VARS = {
         paraphrase_chance_var,
     ],
     "Second Revision Pass": [enable_lookback_edit_var, lookback_edit_chance_var],
+    "Select, Retype & Overshoot": [
+        enable_select_retype_var,
+        select_retype_chance_var,
+        enable_overshoot_var,
+        overshoot_chance_var,
+    ],
     "Smart Text Fixes": [
         enable_smart_fixes_var,
         smart_fix_spacing_var,
@@ -7767,6 +8149,18 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.10.0",
+        "date": "2026-10-14",
+        "title": "Select and retype, plus overshoot",
+        "changes": [
+            "Added: Select & Retype. Right after finishing a word, Amanuensis can decide it was the wrong word. One word is first typed as a close synonym. Then the typist holds Shift and taps the Left arrow key once per letter to highlight the word, and types the real word over it.",
+            "Added: Overshoot. After a typo is backspaced away, the typist sometimes presses Backspace one time too many, pauses as if noticing, and types that letter again.",
+            "Added: a Select, Retype & Overshoot card on the Mistakes tab with four new settings: select and retype (off by default, 20 percent per paragraph) and overshoot (on by default, 30 percent of typo fixes). All are saved with profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes both. Preview shows the change in the preview box without pressing any keys.",
+            "Notes: your text always ends up exactly as in the file. The selection uses exactly the letters of the word just typed. Only plain words are used, never next to protected text, bold or italic markers, or purposely left mistakes. Overshoot only touches the one letter before the cursor, is skipped next to bold or italic text, and always puts the letter back, even if you press Stop. If you press Stop in the middle of a select and retype, a message tells you what to fix by hand. The log never records the words. Select and retype needs an editor where Shift+Left highlights text. No new packages.",
+        ],
+    },
+    {
         "version": "5.9.0",
         "date": "2026-10-14",
         "title": "Second revision pass",
@@ -8212,6 +8606,7 @@ frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 frame_typos = make_modern_card(tab_mistakes, "Character Typos")
 frame_mistakes = make_modern_card(tab_mistakes, "Sentence Reworks & Breaks")
 frame_lookback = make_modern_card(tab_mistakes, "Second Revision Pass")
+frame_select_retype = make_modern_card(tab_mistakes, "Select, Retype & Overshoot")
 frame_smart_fixes = make_modern_card(tab_mistakes, "Smart Text Fixes")
 frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
 
@@ -8727,6 +9122,53 @@ modern_label(
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Select, retype & overshoot (Update #35) ---
+modern_checkbox(
+    frame_select_retype, "Enable select and retype (highlight a word and type over it)", enable_select_retype_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_select_retype, "Chance per paragraph (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_select_retype_chance = modern_entry(frame_select_retype, select_retype_chance_var, width=8)
+entry_select_retype_chance.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_select_retype,
+    "Right after finishing a word, Amanuensis can decide it was the wrong word. "
+    "One word in a paragraph is first typed as a close synonym. Then it holds "
+    "Shift and taps the Left arrow key once per letter to highlight the word, "
+    "and types the real word over it. Your text always ends up exactly as "
+    "written in the file.\n\n"
+    "It needs an editor where Shift+Left highlights text (like Google Docs or "
+    "Word), so it is off by default. Please do not click while a word is "
+    "highlighted. It only picks plain words, and skips words touched by "
+    "protected text, bold or italic markers, or purposely left mistakes. "
+    "Preview shows the change without pressing any keys. If you press Stop in "
+    "the middle, a message tells you what to fix by hand.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_separator(frame_select_retype).grid(row=3, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_checkbox(
+    frame_select_retype, "Enable overshoot (delete one letter too many, then retype it)", enable_overshoot_var
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_select_retype, "Chance per typo fix (%):").grid(row=5, column=0, sticky="w", padx=(0, 8))
+entry_overshoot_chance = modern_entry(frame_select_retype, overshoot_chance_var, width=8)
+entry_overshoot_chance.grid(row=5, column=1, sticky="w")
+
+modern_label(
+    frame_select_retype,
+    "After a typo is backspaced away, a real typist sometimes presses Backspace "
+    "once too often. With this on, Amanuensis sometimes deletes the letter before "
+    "the cursor, pauses as if noticing, and types that letter again. It only uses "
+    "the Backspace key, so it works in any text box. It only happens when "
+    "character typos are on, and never next to bold or italic text.",
+    kind="muted",
+    wraplength=420,
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Smart text fixes (Update #22) ---
 modern_checkbox(frame_smart_fixes, "Enable smart text fixes", enable_smart_fixes_var).grid(
     row=0, column=0, columnspan=2, sticky="w"
@@ -8986,6 +9428,7 @@ SECTION_CARDS = {
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
     "Second Revision Pass": frame_lookback,
+    "Select, Retype & Overshoot": frame_select_retype,
     "Smart Text Fixes": frame_smart_fixes,
     "Leave Mistakes For Me": frame_leave_mistakes,
     "Hotkeys": frame_hotkeys,
