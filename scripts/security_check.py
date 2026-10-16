@@ -342,10 +342,23 @@ def check_versions(root, tag, findings):
 # --------------------------------------------------------------------------
 
 def safe_kind_for_output(kind):
-    """Redact sensitive finding details before printing."""
-    if "secret" in kind.lower():
+    """Redact finding details before printing."""
+    lowered = kind.lower()
+    if "secret" in lowered or "private term" in lowered:
         return "contains sensitive data"
-    return kind
+    if "email address" in lowered:
+        return "contains an email address"
+    if "ip address" in lowered:
+        return "contains an IP address"
+    if "user home folder path" in lowered or "windows user folder path" in lowered:
+        return "contains a user folder path"
+    if "workflow" in lowered:
+        return "workflow security configuration issue"
+    if "forbidden" in lowered:
+        return "contains a forbidden file"
+    if "version" in lowered or "tag" in lowered:
+        return "version consistency issue"
+    return "security policy violation"
 
 
 def main():
