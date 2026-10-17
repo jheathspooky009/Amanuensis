@@ -9,6 +9,27 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.14.0 (2026-10-16) -- Uneven rhythm
+#   - Added: Uneven Rhythm. The typist no longer keeps one steady beat. Everyday
+#     words and familiar phrases (like "of the", "as well as", or "a lot of")
+#     now type about 15% quicker. Names in the middle of a sentence, hard or
+#     technical words, numbers, acronyms, punctuation marks (commas, colons,
+#     brackets, quote marks, question and exclamation marks), and carefully
+#     hedged claims (words like "perhaps" and "might", or phrases like "tends
+#     to" and "in some cases") type about 20 to 30% slower.
+#   - Added: An "Uneven Rhythm" card on the Speed tab with two new settings
+#     (enable_uneven_rhythm, on by default, and rhythm_strength, 100 by default,
+#     0 to 200), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the average change. It is
+#     small, because the quicker and slower parts mostly balance out.
+#   - Notes: Only the speed of a key changes. No pause is added and the typed
+#     text never changes. The text is scanned once before typing (only from the
+#     resume point on) with no randomness, so the estimate uses the very same
+#     plan. Protected text always types at the normal speed. The change is
+#     applied before fatigue drift, together with flow and hesitation, finger
+#     timing, and the common letter pairs. The session log only records how many
+#     characters of each kind were planned, never the words. No new packages.
+#
 # v5.13.0 (2026-10-16) -- Pauses at decision points
 #   - Added: Decision Pauses. The typist now stops for a moment at the spots
 #     where a writer has to decide something: before a new paragraph, before a
@@ -47,20 +68,6 @@
 #     burst pause is short (about 0.3 to 1.4 seconds) and not every burst ends
 #     with one. The log records only the spot and length, never the words. No new
 #     packages.
-#
-# v5.11.0 (2026-10-15) -- Faster launch
-#   - Modified: The main window now stays hidden while the interface is built and
-#     appears once, finished and sized. Before, the window could already be on
-#     screen while it was still being built, so it redrew as cards were added.
-#   - Notes: No settings, packages, or typing behavior changed. In a test run on
-#     Linux the launch was about 10 percent faster; Windows was not measured.
-#     pyautogui is still
-#     imported before the window is created on purpose, because importing it turns
-#     on Windows DPI awareness and that must happen before the first Tk window
-#     exists. In a test run, most of the launch time (about 1 second) is
-#     CustomTkinter creating its rounded widgets, which this update cannot remove.
-#     Building each tab only when it is first opened is the next bigger step. It
-#     changes how the app is put together, so it needs a plan first.
 #
 # ============================================
 
@@ -3011,6 +3018,210 @@ def estimate_decision_pause_seconds(text, protection_mask, settings):
 
 
 # --------------------------------------------
+# UNEVEN RHYTHM (Update #40)
+# --------------------------------------------
+# A real typist does not keep one steady beat. Familiar phrases and everyday
+# words come out quickly. Names, technical terms, punctuation, and carefully
+# hedged claims ("this may suggest", "in some cases") slow the hands down.
+# Before typing starts, the text is scanned once and every character that
+# should type faster or slower is given a kind. Only the speed of a key
+# changes: nothing is added and no pause is made here (pauses belong to the
+# Difficulty, Burst, and Decision Pauses). The scan uses no randomness, so
+# the time estimate uses the very same plan.
+RHYTHM_FAST = "fast"
+RHYTHM_NAME = "name"
+RHYTHM_TECHNICAL = "technical"
+RHYTHM_HEDGE = "hedge"
+RHYTHM_PUNCTUATION = "punctuation"
+# Delay multipliers at 100% strength. Below 1.0 is quicker, above 1.0 slower.
+RHYTHM_BASE_MULTIPLIERS = {
+    RHYTHM_FAST: 0.85,         # a familiar word or phrase: 15% quicker
+    RHYTHM_NAME: 1.20,         # a name in the middle of a sentence: 20% slower
+    RHYTHM_TECHNICAL: 1.25,    # a hard word, an acronym, or a number: 25% slower
+    RHYTHM_HEDGE: 1.20,        # a hedging word or phrase: 20% slower
+    RHYTHM_PUNCTUATION: 1.30,  # a comma, colon, bracket, or quote mark: 30% slower
+}
+RHYTHM_MIN_MULTIPLIER = 0.5
+RHYTHM_STRENGTH_MAX = 200.0
+RHYTHM_PHRASE_MAX_WORDS = 4
+RHYTHM_PUNCTUATION_CHARS = frozenset(',;:()"?!\u201c\u201d\u2014\u2013')
+# A word right after one of these starts a quotation, so a capital letter
+# there is not a sign of a name.
+RHYTHM_OPENING_MARKS = "\"([\u201c\u2018"
+
+# Short everyday words that fly off the keys. Long everyday words come from
+# DIFFICULTY_COMMON_WORDS, which are added to this set below.
+RHYTHM_FAST_WORDS = frozenset("""
+the and of to in is it that was for on with as at by this be are from or an
+have not but they you we he she had has will would can all there their what
+when which were been your said each them then than into its out our more also
+just like some such only over very so if do did does has his her him how who
+why now one two any no yes up down about a i
+""".split()) | DIFFICULTY_COMMON_WORDS
+
+RHYTHM_FAST_PHRASES = frozenset([
+    "as well as", "a lot of", "one of the", "in order to", "a number of",
+    "going to", "such as", "kind of", "sort of", "a bit", "a few", "a little",
+    "of course", "so far", "at first", "in front of", "out of", "because of",
+    "according to", "as soon as", "as long as", "be able to", "able to",
+    "you know", "thank you", "for example", "for instance", "in addition",
+    "in fact", "at the end", "at the same time", "by the way", "right now",
+])
+
+# Words and phrases a writer uses to qualify a claim. Typing them carefully
+# is a sign of care, so they slow the rhythm down.
+RHYTHM_HEDGE_WORDS = frozenset("""
+may might could perhaps possibly probably likely unlikely generally typically
+usually often sometimes somewhat arguably apparently seemingly roughly
+approximately essentially largely mostly partly partially relatively fairly
+rarely occasionally potentially presumably supposedly conceivably
+""".split())
+
+RHYTHM_HEDGE_PHRASES = frozenset([
+    "tends to", "tend to", "tended to", "in some cases", "in many cases",
+    "in most cases", "to some extent", "to a degree", "to a certain extent",
+    "it seems", "it appears", "seems to", "appears to", "not necessarily",
+    "more or less", "in general", "for the most part", "as far as",
+    "can be argued", "it is possible", "it is likely", "it is unlikely",
+    "at least in part", "in part", "on the whole", "so to speak",
+])
+
+
+def clamp_rhythm_strength(strength_percent):
+    """Returns the rhythm strength as a float between 0 and RHYTHM_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), RHYTHM_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_rhythm_multiplier(kind, strength_percent):
+    """Returns the delay multiplier for one kind of rhythm change at the given
+    strength (never below RHYTHM_MIN_MULTIPLIER). 1.0 means no change."""
+    base = RHYTHM_BASE_MULTIPLIERS.get(kind, 1.0)
+    strength = clamp_rhythm_strength(strength_percent) / 100.0
+    return max(RHYTHM_MIN_MULTIPLIER, 1.0 + (base - 1.0) * strength)
+
+
+def classify_rhythm_word(word, starts_sentence):
+    """Sorts one word into a rhythm kind, or None when it keeps the normal
+    speed. A hedging word wins over everything, then numbers, hard words and
+    acronyms, then everyday words, and last a name in the middle of a sentence
+    (a capital letter at the start of a sentence says nothing about a name)."""
+    core = word.strip("-'\u2019")
+    if not core:
+        return None
+    lowered = core.lower()
+    if lowered in RHYTHM_HEDGE_WORDS:
+        return RHYTHM_HEDGE
+    if any(ch.isdigit() for ch in core):
+        return RHYTHM_TECHNICAL
+    if score_word_difficulty(core) >= DIFFICULTY_WORD_MIN_SCORE:
+        return RHYTHM_TECHNICAL
+    if len(core) >= 2 and core.isupper() and core.isalpha():
+        return RHYTHM_TECHNICAL  # an acronym such as NASA
+    if core[0] == "I" and len(core) > 1 and core[1] in "'\u2019":
+        return RHYTHM_FAST  # I'm, I'll, I've
+    if lowered in RHYTHM_FAST_WORDS:
+        return RHYTHM_FAST
+    if not starts_sentence and len(core) >= 2 and core[0].isupper():
+        return RHYTHM_NAME
+    return None
+
+
+def find_rhythm_phrase_spans(text, words, phrases):
+    """Finds runs of neighbouring words (only spaces between them) that make a
+    phrase from `phrases`. Returns (start, end) character spans in `text`. The
+    longest phrase at each spot is taken."""
+    spans = []
+    number = 0
+    while number < len(words):
+        matched_size = 0
+        for size in range(min(RHYTHM_PHRASE_MAX_WORDS, len(words) - number), 1, -1):
+            group = words[number:number + size]
+            joined_by_spaces = all(
+                not text[group[k].end():group[k + 1].start()].strip()
+                and "\n" not in text[group[k].end():group[k + 1].start()]
+                for k in range(size - 1)
+            )
+            if not joined_by_spaces:
+                continue
+            phrase = " ".join(match.group().lower() for match in group)
+            if phrase in phrases:
+                spans.append((group[0].start(), group[-1].end()))
+                matched_size = size
+                break
+        number += matched_size if matched_size else 1
+    return spans
+
+
+def _mark_rhythm_span(kinds, start, end, kind, protection_mask, start_index, overwrite):
+    """Gives each character in [start, end) the rhythm kind. Protected text and
+    text before start_index are left alone. With overwrite False, a character
+    that already has a kind keeps it."""
+    for index in range(max(start, start_index), end):
+        if protection_mask[index]:
+            continue
+        if overwrite or index not in kinds:
+            kinds[index] = kind
+
+
+def plan_uneven_rhythm(text, protection_mask, start_index=0):
+    """Scans the text once and returns {character index: rhythm kind} for every
+    character that should type faster or slower than normal. Only text from
+    start_index on is planned, and protected text is never touched. No
+    randomness is used, so the same text always gives the same plan."""
+    kinds = {}
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        words = list(DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end))
+        # Step 1: single words (everyday, hard, number, acronym, name, hedge)
+        for number, match in enumerate(words):
+            starts_sentence = number == 0 or text[match.start() - 1] in RHYTHM_OPENING_MARKS
+            kind = classify_rhythm_word(match.group(), starts_sentence)
+            if kind is not None:
+                _mark_rhythm_span(kinds, match.start(), match.end(), kind,
+                                  protection_mask, start_index, True)
+        # Step 2: familiar phrases only fill in what is still unmarked
+        for phrase_start, phrase_end in find_rhythm_phrase_spans(text, words, RHYTHM_FAST_PHRASES):
+            _mark_rhythm_span(kinds, phrase_start, phrase_end, RHYTHM_FAST,
+                              protection_mask, start_index, False)
+        # Step 3: hedging phrases win over everything else
+        for phrase_start, phrase_end in find_rhythm_phrase_spans(text, words, RHYTHM_HEDGE_PHRASES):
+            _mark_rhythm_span(kinds, phrase_start, phrase_end, RHYTHM_HEDGE,
+                              protection_mask, start_index, True)
+    # Step 4: punctuation keys
+    for index in range(max(0, start_index), len(text)):
+        if text[index] in RHYTHM_PUNCTUATION_CHARS and not protection_mask[index]:
+            kinds[index] = RHYTHM_PUNCTUATION
+    return kinds
+
+
+def summarize_rhythm_plan(plan):
+    """Counts how many characters each rhythm kind covers, for the session log.
+    Only counts are returned, never any of the text."""
+    counts = {}
+    for kind in plan.values():
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def estimate_rhythm_shift(text, protection_mask, settings):
+    """Adds up how much the uneven rhythm changes the typing time of `text`,
+    counted in average per-character delays (negative means faster). Uses the
+    same plan the typing loop uses."""
+    if not settings.get("enable_uneven_rhythm", True):
+        return 0.0
+    strength = clamp_rhythm_strength(settings.get("rhythm_strength", 100.0))
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    plan = plan_uneven_rhythm(text, mask)
+    return sum(get_rhythm_multiplier(kind, strength) - 1.0 for kind in plan.values())
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -3752,6 +3963,8 @@ def type_text(settings, is_batch=False, is_last=True):
     burst_pause_strength = settings.get("burst_pause_strength", 100.0)
     enable_decision_pauses = settings.get("enable_decision_pauses", True)
     decision_pause_strength = settings.get("decision_pause_strength", 100.0)
+    enable_uneven_rhythm = settings.get("enable_uneven_rhythm", True)
+    rhythm_strength = settings.get("rhythm_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -3827,6 +4040,26 @@ def type_text(settings, is_batch=False, is_last=True):
         except Exception:
             burst_plan = {}
             log_event("burst_pauses_failed", "could not plan burst pauses; typing without them")
+
+    # Uneven rhythm (Update #40): familiar words and phrases a little quicker;
+    # names, technical terms, punctuation, and hedged claims a little slower.
+    # Planned once, only for text still to be typed, and never in protected
+    # text. If planning ever fails, the file is typed at an even speed.
+    rhythm_plan = {}
+    rhythm_multipliers = {}
+    if enable_uneven_rhythm and rhythm_strength > 0:
+        try:
+            rhythm_plan = plan_uneven_rhythm(text, protection_mask, resume_from)
+            rhythm_multipliers = {
+                kind: get_rhythm_multiplier(kind, rhythm_strength) for kind in RHYTHM_BASE_MULTIPLIERS
+            }
+            if rhythm_plan:
+                counts = summarize_rhythm_plan(rhythm_plan)
+                log_event("uneven_rhythm", "planned " + ", ".join(
+                    f"{kind} {count}" for kind, count in sorted(counts.items())) + " characters")
+        except Exception:
+            rhythm_plan = {}
+            log_event("uneven_rhythm_failed", "could not plan uneven rhythm; typing at an even speed")
 
     # Mistakes to purposely leave for the person to fix (Update #24). They are
     # planned only for text that is still to be typed. If planning ever fails,
@@ -4498,6 +4731,12 @@ def type_text(settings, is_batch=False, is_last=True):
             if mood_started in (MOOD_FLOW, MOOD_HESITANT):
                 log_event("typing_mood", f"{mood_started} from character {idx}")
 
+        rhythm_kind = rhythm_plan.get(idx)
+        if rhythm_kind is not None:
+            # Update #40: familiar text a little quicker; names, technical terms,
+            # punctuation, and hedged claims a little slower (before fatigue)
+            delay *= rhythm_multipliers[rhythm_kind]
+
         if enable_fatigue:
             delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
             fatigue_chars += 1
@@ -4700,6 +4939,10 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
         # Finger and hand timing (Update #28): hand switches are a little faster and
         # same-finger pairs a little slower. The shift is counted in average delays.
         total_seconds += estimate_finger_timing_shift(text) * avg_delay
+
+    # Uneven rhythm (Update #40): familiar text quicker, names, technical terms,
+    # punctuation, and hedged claims slower. Counted in average delays.
+    total_seconds += estimate_rhythm_shift(text, protection_mask, settings) * avg_delay
 
     # Thinking pauses on hard words and hard sentences (Update #33), averaged
     # over the same chances and ranges the typing loop draws from.
@@ -4970,6 +5213,18 @@ def validate_settings():
     except ValueError:
         decision_pause_strength = 100.0
         decision_pause_strength_var.set("100")
+    enable_uneven_rhythm = bool(enable_uneven_rhythm_var.get())
+    try:
+        rhythm_strength = float(rhythm_strength_var.get())
+        if rhythm_strength < 0:
+            rhythm_strength = 0.0
+            rhythm_strength_var.set("0")
+        elif rhythm_strength > RHYTHM_STRENGTH_MAX:
+            rhythm_strength = RHYTHM_STRENGTH_MAX
+            rhythm_strength_var.set(f"{RHYTHM_STRENGTH_MAX:g}")
+    except ValueError:
+        rhythm_strength = 100.0
+        rhythm_strength_var.set("100")
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -5083,6 +5338,8 @@ def validate_settings():
         "burst_pause_strength": burst_pause_strength,
         "enable_decision_pauses": enable_decision_pauses,
         "decision_pause_strength": decision_pause_strength,
+        "enable_uneven_rhythm": enable_uneven_rhythm,
+        "rhythm_strength": rhythm_strength,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -6652,6 +6909,8 @@ def get_current_settings_snapshot():
         "burst_pause_strength": burst_pause_strength_var.get(),
         "enable_decision_pauses": enable_decision_pauses_var.get(),
         "decision_pause_strength": decision_pause_strength_var.get(),
+        "enable_uneven_rhythm": enable_uneven_rhythm_var.get(),
+        "rhythm_strength": rhythm_strength_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -6728,6 +6987,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     burst_pause_strength_var.set(str(data.get("burst_pause_strength", "100")))
     enable_decision_pauses_var.set(bool(data.get("enable_decision_pauses", True)))
     decision_pause_strength_var.set(str(data.get("decision_pause_strength", "100")))
+    enable_uneven_rhythm_var.set(bool(data.get("enable_uneven_rhythm", True)))
+    rhythm_strength_var.set(str(data.get("rhythm_strength", "100")))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -7903,6 +8164,8 @@ enable_typing_bursts_var = tk.BooleanVar(value=True)
 burst_pause_strength_var = tk.StringVar(value="100")
 enable_decision_pauses_var = tk.BooleanVar(value=True)
 decision_pause_strength_var = tk.StringVar(value="100")
+enable_uneven_rhythm_var = tk.BooleanVar(value=True)
+rhythm_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -7991,6 +8254,7 @@ SECTION_RESET_VARS = {
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
     "Finger & Hand Timing": [enable_finger_timing_var],
     "Flow & Hesitation": [enable_typing_moods_var, typing_mood_strength_var],
+    "Uneven Rhythm": [enable_uneven_rhythm_var, rhythm_strength_var],
     "Natural Pauses": [
         paragraph_pause_min_var,
         paragraph_pause_max_var,
@@ -8560,6 +8824,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.14.0",
+        "date": "2026-10-16",
+        "title": "Uneven rhythm",
+        "changes": [
+            "Added: uneven rhythm. Amanuensis no longer types to one steady beat. Everyday words and familiar phrases (like of the, as well as, or a lot of) now come out about 15 percent quicker. Names in the middle of a sentence, hard or technical words, numbers, acronyms, punctuation marks (commas, colons, brackets, quote marks, question and exclamation marks), and carefully hedged claims (words like perhaps and might, or phrases like tends to and in some cases) come out about 20 to 30 percent slower.",
+            "Added: an Uneven Rhythm card on the Speed tab with two new settings (on or off, and Rhythm Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average change. It is small, because the quicker and slower parts mostly balance out.",
+            "Notes: only the speed of a key changes. No pause is added and the typed text never changes. The text is scanned once before typing starts, only for text that is still to be typed, so resuming works. Protected text always types at the normal speed. The change stacks with flow and hesitation, finger timing, and fatigue drift. The session log only records how many characters of each kind were planned, never the words.",
+        ],
+    },
+    {
         "version": "5.13.0",
         "date": "2026-10-16",
         "title": "Pauses at decision points",
@@ -9040,6 +9315,7 @@ frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
 frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
+frame_uneven_rhythm = make_modern_card(tab_speed, "Uneven Rhythm")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
@@ -9387,6 +9663,31 @@ modern_label(
     "slower). Use less for a steadier typist or more for bigger swings (0 to 200). "
     "A long break puts the typist back in the normal state, and the time estimate "
     "includes the small average change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Uneven rhythm (Update #40) ---
+modern_checkbox(
+    frame_uneven_rhythm, "Type with an uneven rhythm", enable_uneven_rhythm_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_uneven_rhythm, "Rhythm Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_rhythm_strength = modern_entry(frame_uneven_rhythm, rhythm_strength_var, width=8)
+entry_rhythm_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_uneven_rhythm,
+    "A real typist does not keep one steady beat. Everyday words and familiar "
+    "phrases (like of the, as well as, or a lot of) come out a little quicker, "
+    "about 15% faster. Names in the middle of a sentence, hard or technical "
+    "words, numbers, punctuation marks, and carefully hedged claims (like "
+    "perhaps, tends to, or in some cases) come out slower, about 20 to 30% "
+    "slower.\n\n"
+    "100% is the normal size. Use less for a steadier rhythm or more for bigger "
+    "differences (0 to 200). Only the speed of the keys changes. No pauses are "
+    "added here (the pause cards do that). Protected text always types at the "
+    "normal speed, and the time estimate includes the change.",
     kind="muted",
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -9913,6 +10214,7 @@ SECTION_CARDS = {
     "Fatigue Drift": frame_fatigue,
     "Finger & Hand Timing": frame_finger_timing,
     "Flow & Hesitation": frame_typing_moods,
+    "Uneven Rhythm": frame_uneven_rhythm,
     "Natural Pauses": frame_pauses,
     "Difficulty Pauses": frame_difficulty_pauses,
     "Typing Bursts": frame_typing_bursts,
