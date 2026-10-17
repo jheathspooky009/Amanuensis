@@ -9,6 +9,27 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.13.0 (2026-10-16) -- Pauses at decision points
+#   - Added: Decision Pauses. The typist now stops for a moment at the spots
+#     where a writer has to decide something: before a new paragraph, before a
+#     sentence that states a claim (one that starts with a phrase like "I
+#     believe", "this shows", or "the evidence"), and before a transition such
+#     as "however", "for example", or "in conclusion" (also right after a
+#     semicolon). Hard words already have their own pause, so they are not
+#     repeated here.
+#   - Added: A "Decision Pauses" card on the Speed tab with two new settings
+#     (enable_decision_pauses, on by default, and decision_pause_strength, 100 by
+#     default, 0 to 300), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the average decision
+#     pauses. Burst pauses now skip a spot that already has a decision pause.
+#   - Notes: Spots are planned once before typing, only from the resume point on,
+#     never in or next to protected text, never at the very start of the file,
+#     and never where a {{pause}} marker or a difficulty pause already sits. A
+#     claim or transition pause is skipped when the sentence before it already
+#     had one. Pauses are about 0.8 to 3 seconds, and not every spot pauses. The
+#     Natural Pauses after a paragraph break still happen first. The log records
+#     only the spot and kind, never the words. No new packages.
+#
 # v5.12.0 (2026-10-16) -- Bursts followed by pauses
 #   - Added: Typing Bursts. The typist now writes in bursts of a few words and
 #     stops for a moment between them, instead of typing a whole sentence in one
@@ -40,26 +61,6 @@
 #     CustomTkinter creating its rounded widgets, which this update cannot remove.
 #     Building each tab only when it is first opened is the next bigger step. It
 #     changes how the app is put together, so it needs a plan first.
-#
-# v5.10.0 (2026-10-14) -- Select and retype, plus overshoot
-#   - Added: Select & Retype. A word can be typed as a close synonym, then
-#     selected with Shift+Left (one press per letter) and typed over with the
-#     real word. Off by default, with a chance per paragraph (20 by default).
-#   - Added: Overshoot. After a typo is backspaced, the typist sometimes presses
-#     Backspace one time too many, notices, and types the letter again. On by
-#     default (30 percent of typo fixes). It only needs the Backspace key.
-#   - Added: A "Select, Retype & Overshoot" card on the Mistakes tab with four new
-#     settings (enable_select_retype, select_retype_chance, enable_overshoot,
-#     overshoot_chance), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes both. Preview shows the swap
-#     without pressing any keys.
-#   - Notes: The selection count is exact (the letters of the word just typed), and
-#     only plain words with no protected text, formatting marker, or left mistake
-#     are used. Overshoot never reaches past the one letter before the cursor,
-#     never touches a bold or italic letter, and always puts the letter back, even
-#     if Stop is pressed. A Stop in the middle of a select and retype shows what to
-#     fix by hand, and the word does not count as typed until it is done. The log
-#     never records the words. No new packages.
 #
 # ============================================
 
@@ -2858,6 +2859,158 @@ def estimate_burst_pause_seconds(text, protection_mask, settings):
 
 
 # --------------------------------------------
+# PAUSES AT DECISION POINTS (Update #38)
+# --------------------------------------------
+# People stop longest where they have to decide something: what to say in a new
+# paragraph, how to put a claim, or which way to turn with a transition such as
+# "however". Hard words already get their own pause (Difficulty Pauses), so this
+# adds the other three. Before typing starts, the text is scanned once. The plan
+# only says WHERE a decision pause may happen; the typing loop draws the chance
+# and the length there.
+DECISION_PARAGRAPH = "paragraph"
+DECISION_CLAIM = "claim"
+DECISION_TRANSITION = "transition"
+DECISION_SECONDS = {
+    DECISION_PARAGRAPH: (1.0, 3.0),
+    DECISION_CLAIM: (1.0, 2.5),
+    DECISION_TRANSITION: (0.8, 2.0),
+}
+DECISION_CHANCE = {
+    DECISION_PARAGRAPH: 0.65,    # share of paragraph starts that really pause
+    DECISION_CLAIM: 0.6,
+    DECISION_TRANSITION: 0.7,
+}
+DECISION_COMBINED_WEIGHT = 1.25  # a paragraph that also opens with a claim or transition
+DECISION_PHRASE_MAX_WORDS = 4    # longest opening phrase that is checked
+DECISION_STRENGTH_MAX = 300.0
+# Characters that may sit between a line break and the first word of a paragraph
+# (spaces, an opening quote or bracket, a bullet mark).
+DECISION_LOOKBACK_CHARS = " \t\"'([\u201c\u2018-*#>"
+
+DECISION_TRANSITION_WORDS = frozenset("""
+however therefore moreover furthermore consequently nevertheless nonetheless
+meanwhile finally additionally similarly conversely otherwise overall
+ultimately thus hence instead accordingly
+""".split())
+
+DECISION_TRANSITION_PHRASES = frozenset([
+    "in addition", "for example", "for instance", "on the other hand",
+    "in contrast", "by contrast", "as a result", "in conclusion", "in summary",
+    "to summarize", "in other words", "in fact", "at the same time",
+    "on the contrary", "above all", "in particular", "to begin with",
+    "in the end", "even so", "that said",
+])
+
+DECISION_CLAIM_PHRASES = frozenset([
+    "i believe", "i argue", "i think", "i would argue", "i claim",
+    "in my opinion", "in my view", "this shows", "this proves", "this means",
+    "this suggests", "this demonstrates", "it is clear", "the evidence",
+    "the data", "the results", "studies show", "research shows",
+    "research suggests", "evidence shows", "clearly", "obviously", "undoubtedly",
+])
+
+
+def find_decision_phrase_kind(opening_words):
+    """Looks at the first few lowercase words of a sentence. Returns
+    DECISION_TRANSITION or DECISION_CLAIM when they open with a known transition
+    or claim phrase, otherwise None. The longest phrase is checked first."""
+    for count in range(min(len(opening_words), DECISION_PHRASE_MAX_WORDS), 0, -1):
+        phrase = " ".join(opening_words[:count])
+        if phrase in DECISION_TRANSITION_PHRASES:
+            return DECISION_TRANSITION
+        if count == 1 and phrase in DECISION_TRANSITION_WORDS:
+            return DECISION_TRANSITION
+        if phrase in DECISION_CLAIM_PHRASES:
+            return DECISION_CLAIM
+    return None
+
+
+def starts_new_paragraph(text, position):
+    """True when the word at `position` is the first word on its line and there
+    is real text before it (so the very first paragraph of the file is not one)."""
+    cursor = position
+    while cursor > 0 and text[cursor - 1] in DECISION_LOOKBACK_CHARS:
+        cursor -= 1
+    return cursor > 0 and text[cursor - 1] == "\n" and bool(text[:cursor].strip())
+
+
+def plan_decision_pauses(text, protection_mask, start_index=0, skip_positions=()):
+    """Finds the spots where a decision earns a pause: the first word of a new
+    paragraph, of a sentence that states a claim, or of a sentence that opens
+    with a transition (and a transition word right after a semicolon). Returns
+    {index of the first character: (kind, weight)}. Only text from start_index
+    on is planned. Nothing is planned in or next to protected text, at a spot in
+    skip_positions, or at the very start of the text. A claim or transition
+    spot is dropped when the sentence before it already got one."""
+    plan = {}
+    last_planned_sentence = -2
+    for sentence_number, (span_start, span_end) in enumerate(find_sentence_spans(text)):
+        if span_end <= start_index:
+            continue
+        words = list(DIFFICULTY_WORD_PATTERN.finditer(text, span_start, span_end))
+        if not words:
+            continue
+
+        first = words[0]
+        position = first.start()
+        opening = [match.group().lower() for match in words[:DECISION_PHRASE_MAX_WORDS]]
+        kind = find_decision_phrase_kind(opening)
+        weight = 1.0
+        if starts_new_paragraph(text, position):
+            if kind is not None:
+                weight = DECISION_COMBINED_WEIGHT
+            kind = DECISION_PARAGRAPH
+        elif kind is not None and sentence_number - last_planned_sentence <= 1:
+            kind = None
+        if (kind is not None and position >= start_index and position not in skip_positions
+                and text[:position].strip()
+                and not any(protection_mask[max(0, position - 2):first.end()])):
+            plan[position] = (kind, weight)
+            last_planned_sentence = sentence_number
+
+        # A transition word right after a semicolon, such as "; however,"
+        for number in range(1, len(words)):
+            word = words[number]
+            if word.group().lower() not in DECISION_TRANSITION_WORDS:
+                continue
+            if ";" not in text[words[number - 1].end():word.start()]:
+                continue
+            spot = word.start()
+            if (spot < start_index or spot in skip_positions or spot in plan
+                    or any(protection_mask[words[number - 1].end():word.end()])):
+                continue
+            plan[spot] = (DECISION_TRANSITION, 1.0)
+            last_planned_sentence = sentence_number
+    return plan
+
+
+def draw_decision_pause_seconds(kind, weight, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with how strong the decision is
+    and with the Pause Strength setting."""
+    if strength_percent <= 0 or random.random() >= DECISION_CHANCE[kind]:
+        return 0.0
+    low, high = DECISION_SECONDS[kind]
+    return random.uniform(low, high) * weight * (strength_percent / 100.0)
+
+
+def estimate_decision_pause_seconds(text, protection_mask, settings):
+    """Average extra time the decision pauses add to `text`. Uses the same plan,
+    chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_decision_pauses", True):
+        return 0.0
+    strength = settings.get("decision_pause_strength", 100.0) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total = 0.0
+    for kind, weight in plan_decision_pauses(text, mask).values():
+        average = sum(DECISION_SECONDS[kind]) / 2.0
+        total += DECISION_CHANCE[kind] * average * weight * strength
+    return total
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -3597,6 +3750,8 @@ def type_text(settings, is_batch=False, is_last=True):
     difficulty_pause_strength = settings.get("difficulty_pause_strength", 100.0)
     enable_typing_bursts = settings.get("enable_typing_bursts", True)
     burst_pause_strength = settings.get("burst_pause_strength", 100.0)
+    enable_decision_pauses = settings.get("enable_decision_pauses", True)
+    decision_pause_strength = settings.get("decision_pause_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -3644,14 +3799,30 @@ def type_text(settings, is_batch=False, is_last=True):
             difficulty_plan = {}
             log_event("difficulty_pauses_failed", "could not plan thinking pauses; typing without them")
 
+    # Pauses at decision points (Update #38): before a new paragraph, a claim, or
+    # a transition. Planned once, only for text still to be typed, and never at a
+    # spot that already has a pause marker or a difficulty pause. If planning
+    # ever fails, the file is typed without them.
+    decision_plan = {}
+    if enable_decision_pauses and decision_pause_strength > 0:
+        try:
+            decision_plan = plan_decision_pauses(
+                text, protection_mask, resume_from, set(pause_map) | set(difficulty_plan)
+            )
+        except Exception:
+            decision_plan = {}
+            log_event("decision_pauses_failed", "could not plan decision pauses; typing without them")
+
     # Short pauses between bursts of typing (Update #37). Planned once, only for
-    # text still to be typed, and never at a spot that already has a pause marker
-    # or a difficulty pause. If planning ever fails, the file is typed without them.
+    # text still to be typed, and never at a spot that already has a pause marker,
+    # a difficulty pause, or a decision pause. If planning ever fails, the file is
+    # typed without them.
     burst_plan = {}
     if enable_typing_bursts and burst_pause_strength > 0:
         try:
             burst_plan = plan_typing_bursts(
-                text, protection_mask, resume_from, set(pause_map) | set(difficulty_plan)
+                text, protection_mask, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan)
             )
         except Exception:
             burst_plan = {}
@@ -3898,6 +4069,37 @@ def type_text(settings, is_batch=False, is_last=True):
                     state.status = "Thinking of the right word..."
                 log_event("difficulty_pause", f"{difficulty_kind} ~{think_seconds:.1f}s before character {idx}")
                 for _ in range(int(think_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # DECISION PAUSE (Update #38)
+        # A stop before a new paragraph, a claim, or a transition, where a
+        # writer decides what to say next. It runs at the same place as the
+        # difficulty pause (BEFORE the focus-lock and pause checks), stays
+        # stoppable and pausable, and is not added to paused_duration. Only the
+        # spot and kind (never the text) go in the log.
+        # --------------------------------
+        decision_spot = decision_plan.get(idx)
+        if decision_spot:
+            decision_kind, decision_weight = decision_spot
+            decision_seconds = draw_decision_pause_seconds(
+                decision_kind, decision_weight, decision_pause_strength
+            )
+            if decision_seconds > 0:
+                if decision_kind == DECISION_PARAGRAPH:
+                    state.status = "Deciding what to write next..."
+                elif decision_kind == DECISION_CLAIM:
+                    state.status = "Thinking about how to make this point..."
+                else:
+                    state.status = "Deciding where the argument goes next..."
+                log_event("decision_pause", f"{decision_kind} ~{decision_seconds:.1f}s before character {idx}")
+                for _ in range(int(decision_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
                     time.sleep(0.1)
@@ -4506,6 +4708,9 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     # Short pauses between bursts of typing (Update #37), averaged the same way.
     total_seconds += estimate_burst_pause_seconds(text, protection_mask, settings)
 
+    # Pauses at decision points (Update #38), averaged the same way.
+    total_seconds += estimate_decision_pause_seconds(text, protection_mask, settings)
+
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
         # increase up to fatigue_strength percent and partly recover after research breaks.
@@ -4753,6 +4958,18 @@ def validate_settings():
     except ValueError:
         burst_pause_strength = 100.0
         burst_pause_strength_var.set("100")
+    enable_decision_pauses = bool(enable_decision_pauses_var.get())
+    try:
+        decision_pause_strength = float(decision_pause_strength_var.get())
+        if decision_pause_strength < 0:
+            decision_pause_strength = 0.0
+            decision_pause_strength_var.set("0")
+        elif decision_pause_strength > DECISION_STRENGTH_MAX:
+            decision_pause_strength = DECISION_STRENGTH_MAX
+            decision_pause_strength_var.set(f"{DECISION_STRENGTH_MAX:g}")
+    except ValueError:
+        decision_pause_strength = 100.0
+        decision_pause_strength_var.set("100")
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -4864,6 +5081,8 @@ def validate_settings():
         "difficulty_pause_strength": difficulty_pause_strength,
         "enable_typing_bursts": enable_typing_bursts,
         "burst_pause_strength": burst_pause_strength,
+        "enable_decision_pauses": enable_decision_pauses,
+        "decision_pause_strength": decision_pause_strength,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -6431,6 +6650,8 @@ def get_current_settings_snapshot():
         "difficulty_pause_strength": difficulty_pause_strength_var.get(),
         "enable_typing_bursts": enable_typing_bursts_var.get(),
         "burst_pause_strength": burst_pause_strength_var.get(),
+        "enable_decision_pauses": enable_decision_pauses_var.get(),
+        "decision_pause_strength": decision_pause_strength_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -6505,6 +6726,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     difficulty_pause_strength_var.set(str(data.get("difficulty_pause_strength", "100")))
     enable_typing_bursts_var.set(bool(data.get("enable_typing_bursts", True)))
     burst_pause_strength_var.set(str(data.get("burst_pause_strength", "100")))
+    enable_decision_pauses_var.set(bool(data.get("enable_decision_pauses", True)))
+    decision_pause_strength_var.set(str(data.get("decision_pause_strength", "100")))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -7678,6 +7901,8 @@ enable_difficulty_pauses_var = tk.BooleanVar(value=True)
 difficulty_pause_strength_var = tk.StringVar(value="100")
 enable_typing_bursts_var = tk.BooleanVar(value=True)
 burst_pause_strength_var = tk.StringVar(value="100")
+enable_decision_pauses_var = tk.BooleanVar(value=True)
+decision_pause_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -7775,6 +8000,7 @@ SECTION_RESET_VARS = {
     ],
     "Difficulty Pauses": [enable_difficulty_pauses_var, difficulty_pause_strength_var],
     "Typing Bursts": [enable_typing_bursts_var, burst_pause_strength_var],
+    "Decision Pauses": [enable_decision_pauses_var, decision_pause_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
@@ -8334,6 +8560,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.13.0",
+        "date": "2026-10-16",
+        "title": "Pauses at decision points",
+        "changes": [
+            "Added: decision pauses. Amanuensis now stops for a moment at the spots where a writer has to decide something: before a new paragraph, before a sentence that states a claim (one that starts with a phrase like I believe, this shows, or the evidence), and before a transition such as however, for example, or in conclusion. A transition word right after a semicolon counts too. Hard words already had their own pause, so they are not repeated here.",
+            "Added: a Decision Pauses card on the Speed tab with two new settings (on or off, and Pause Strength from 0 to 300 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average time of these pauses. They are about 0.8 to 3 seconds and not every spot pauses. Burst pauses now skip a spot that already has a decision pause.",
+            "Notes: the pause spots are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text never gets a pause, and there is none at the very start of the file or where a pause marker or a difficulty pause already is. A claim or transition pause is skipped when the sentence before it already had one. The Natural Pauses after a paragraph break still happen first. The session log records only the spot and kind, never the words.",
+        ],
+    },
+    {
         "version": "5.12.0",
         "date": "2026-10-16",
         "title": "Bursts followed by pauses",
@@ -8806,6 +9043,7 @@ frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
+frame_decision_pauses = make_modern_card(tab_speed, "Decision Pauses")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -9227,6 +9465,29 @@ modern_label(
     "100% is the normal length (usually under a second and a half). Use "
     "less for shorter pauses or more for longer ones (0 to 300). Protected text "
     "never gets a pause, and the time estimate includes these pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Decision pauses (Update #38) ---
+modern_checkbox(
+    frame_decision_pauses, "Pause at decision points", enable_decision_pauses_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_decision_pauses, "Pause Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_decision_pause_strength = modern_entry(frame_decision_pauses, decision_pause_strength_var, width=8)
+entry_decision_pause_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_decision_pauses,
+    "Writers stop longest where they have to decide something. Amanuensis pauses "
+    "before a new paragraph, before a sentence that states a claim (like I "
+    "believe, this shows, or the evidence), and before a transition (like "
+    "however, for example, or in conclusion). Hard words have their own pause "
+    "in Difficulty Pauses. Not every spot pauses.\n\n"
+    "100% is the normal length (usually 1 to 3 seconds). Use less for shorter "
+    "pauses or more for longer ones (0 to 300). Protected text never gets a "
+    "pause, and the time estimate includes these pauses.",
     kind="muted",
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -9655,6 +9916,7 @@ SECTION_CARDS = {
     "Natural Pauses": frame_pauses,
     "Difficulty Pauses": frame_difficulty_pauses,
     "Typing Bursts": frame_typing_bursts,
+    "Decision Pauses": frame_decision_pauses,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
