@@ -9,6 +9,31 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.16.0 (2026-10-18) -- Punctuation and formatting habits
+#   - Added: Writing Habits. A writer has habits, and they stay the same all the
+#     way through. Amanuensis now gives each file its own set. The typist may
+#     always stop for a moment before an opening parenthesis or a dash used as an
+#     aside, before an opening quotation mark, or before a heading and the first
+#     line under it. Each of those three is "none", "light", or "strong" for the
+#     file, and at least two are always real habits. Commas are typed "quick",
+#     "even", or "slow" (half, normal, or one and a half times the usual comma
+#     pause).
+#   - Added: A "Writing Habits" card on the Speed tab with two new settings
+#     (enable_writing_habits, on by default, and writing_habit_strength, 100 by
+#     default, 0 to 200), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the average habit pauses and
+#     the change in comma time. The comma pause in the typing loop now takes the
+#     comma pace into account. Semicolons and colons are unchanged.
+#   - Notes: The habits are worked out from a hash of the final text, with no
+#     fresh random draw, so the estimate, the run, and a resume all agree. Spots
+#     are planned once before typing, only from the resume point on, never in or
+#     next to protected text, never at the very start of the file, and never
+#     where a {{pause}} marker, a difficulty pause, a decision pause, or a burst
+#     pause already sits. A heading is a short line with blank lines around it
+#     that does not end like a sentence, or a line that starts with #. Bullet
+#     lines are never headings. The typed text never changes. The log records the
+#     habit levels, the spot, and the kind, never the words. No new packages.
+#
 # v5.15.0 (2026-10-17) -- Revision clusters
 #   - Added: Revision Clusters. Real revising bunches together: a writer changes a
 #     phrase, then fixes several things in a row, then drafts calmly for a while.
@@ -53,27 +78,6 @@
 #     applied before fatigue drift, together with flow and hesitation, finger
 #     timing, and the common letter pairs. The session log only records how many
 #     characters of each kind were planned, never the words. No new packages.
-#
-# v5.13.0 (2026-10-16) -- Pauses at decision points
-#   - Added: Decision Pauses. The typist now stops for a moment at the spots
-#     where a writer has to decide something: before a new paragraph, before a
-#     sentence that states a claim (one that starts with a phrase like "I
-#     believe", "this shows", or "the evidence"), and before a transition such
-#     as "however", "for example", or "in conclusion" (also right after a
-#     semicolon). Hard words already have their own pause, so they are not
-#     repeated here.
-#   - Added: A "Decision Pauses" card on the Speed tab with two new settings
-#     (enable_decision_pauses, on by default, and decision_pause_strength, 100 by
-#     default, 0 to 300), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the average decision
-#     pauses. Burst pauses now skip a spot that already has a decision pause.
-#   - Notes: Spots are planned once before typing, only from the resume point on,
-#     never in or next to protected text, never at the very start of the file,
-#     and never where a {{pause}} marker or a difficulty pause already sits. A
-#     claim or transition pause is skipped when the sentence before it already
-#     had one. Pauses are about 0.8 to 3 seconds, and not every spot pauses. The
-#     Natural Pauses after a paragraph break still happen first. The log records
-#     only the spot and kind, never the words. No new packages.
 #
 # ============================================
 
@@ -3220,6 +3224,227 @@ def estimate_decision_pause_seconds(text, protection_mask, settings):
 
 
 # --------------------------------------------
+# WRITING HABITS (Update #41)
+# --------------------------------------------
+# A writer has habits. One always stops before opening a parenthesis, another
+# thinks hard before a quotation or a heading, another rushes through commas.
+# What makes them habits is that they stay the same all the way through the
+# text. Before typing starts, a habit profile is worked out from the text
+# itself (not from a fresh random draw), so the time estimate, the run, and a
+# resume all agree on it. For each kind of spot the typist is "none", "light",
+# or "strong", and the commas are typed "quick", "even", or "slow". Only the
+# length of a pause changes. The typed text never changes.
+HABIT_HEADING = "heading"
+HABIT_QUOTE = "quote"
+HABIT_ASIDE = "aside"
+HABIT_KINDS = (HABIT_HEADING, HABIT_QUOTE, HABIT_ASIDE)
+HABIT_SECONDS = {
+    HABIT_HEADING: (0.8, 2.0),
+    HABIT_QUOTE: (0.4, 1.2),
+    HABIT_ASIDE: (0.4, 1.2),
+}
+HABIT_STATUS = {
+    HABIT_HEADING: "Thinking about the heading...",
+    HABIT_QUOTE: "Thinking about a quotation...",
+    HABIT_ASIDE: "Deciding whether to add an aside...",
+}
+HABIT_CHANCE = {
+    "light": {HABIT_HEADING: 0.5, HABIT_QUOTE: 0.4, HABIT_ASIDE: 0.4},
+    "strong": {HABIT_HEADING: 0.9, HABIT_QUOTE: 0.8, HABIT_ASIDE: 0.8},
+}
+HABIT_LEVEL_CUTS = (0.3, 0.7)    # a roll under 0.3 is "none", under 0.7 "light", else "strong"
+HABIT_MIN_ACTIVE = 2             # at least this many of the three spot kinds are real habits
+HABIT_COMMA_PACE_CUTS = (0.3, 0.7)
+HABIT_COMMA_SCALE = {"quick": 0.5, "even": 1.0, "slow": 1.5}
+HABIT_COMMA_MIN_SCALE = 0.1
+HABIT_STRENGTH_MAX = 200.0
+HABIT_HEADING_MAX_CHARS = 80
+HABIT_HEADING_MAX_WORDS = 12
+HABIT_HEADING_END_MARKS = ".!?,;:"
+HABIT_BULLET_STARTS = ("- ", "* ", "+ ", "\u2022 ")
+HABIT_OPENING_BEFORE_QUOTE = "([{\u2014\u2013-"
+
+
+def get_writing_habit_profile(text):
+    """Works out this writer's habits from the text. The same text always gives
+    the same profile, so the estimate, the run, and a resume agree. Returns
+    {"heading": level, "quote": level, "aside": level, "comma": pace}."""
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    profile = {}
+    for kind in HABIT_KINDS:
+        roll = rng.random()
+        if roll < HABIT_LEVEL_CUTS[0]:
+            profile[kind] = "none"
+        elif roll < HABIT_LEVEL_CUTS[1]:
+            profile[kind] = "light"
+        else:
+            profile[kind] = "strong"
+    quiet = [kind for kind in HABIT_KINDS if profile[kind] == "none"]
+    while len(HABIT_KINDS) - len(quiet) < HABIT_MIN_ACTIVE:
+        profile[quiet.pop(rng.randrange(len(quiet)))] = "light"
+    roll = rng.random()
+    if roll < HABIT_COMMA_PACE_CUTS[0]:
+        profile["comma"] = "quick"
+    elif roll < HABIT_COMMA_PACE_CUTS[1]:
+        profile["comma"] = "even"
+    else:
+        profile["comma"] = "slow"
+    return profile
+
+
+def get_writing_habit_chances(profile):
+    """The chance that a planned spot really pauses, for each kind of spot.
+    A kind that is not a habit for this writer has a chance of 0."""
+    chances = {}
+    for kind in HABIT_KINDS:
+        chances[kind] = HABIT_CHANCE.get(profile.get(kind), {}).get(kind, 0.0)
+    return chances
+
+
+def get_comma_pace_scale(profile, strength_percent):
+    """How much longer or shorter than normal this writer lingers on a comma.
+    1.0 is the normal pause. The Habit Strength setting scales the difference."""
+    base = HABIT_COMMA_SCALE.get(profile.get("comma"), 1.0)
+    strength = max(0.0, min(float(strength_percent), HABIT_STRENGTH_MAX)) / 100.0
+    return max(HABIT_COMMA_MIN_SCALE, 1.0 + (base - 1.0) * strength)
+
+
+def describe_writing_habit_profile(profile):
+    """A short line for the session log. It names habits only, never any text."""
+    parts = [f"{kind} {profile.get(kind, 'none')}" for kind in HABIT_KINDS]
+    parts.append(f"commas {profile.get('comma', 'even')}")
+    return ", ".join(parts)
+
+
+def find_habit_heading_spots(text):
+    """Finds heading lines and the first line of text after each one. A heading
+    is a short line that is not a bullet and does not end like a sentence, with
+    blank lines around it, or a line that starts with #. Returns the index of the
+    first real character of each heading line and of each body line after it."""
+    lines = text.split("\n")
+    starts = []
+    position = 0
+    for line in lines:
+        starts.append(position)
+        position += len(line) + 1
+    spots = []
+    for number, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(HABIT_BULLET_STARTS):
+            continue
+        if not stripped.startswith("#"):
+            if (len(stripped) > HABIT_HEADING_MAX_CHARS
+                    or len(stripped.split()) > HABIT_HEADING_MAX_WORDS
+                    or stripped[-1] in HABIT_HEADING_END_MARKS):
+                continue
+            if number > 0 and lines[number - 1].strip():
+                continue
+            if number + 1 >= len(lines) or lines[number + 1].strip():
+                continue
+        body_number = number + 1
+        while body_number < len(lines) and not lines[body_number].strip():
+            body_number += 1
+        if body_number >= len(lines):
+            continue
+        body_line = lines[body_number]
+        spots.append(starts[number] + len(line) - len(line.lstrip()))
+        spots.append(starts[body_number] + len(body_line) - len(body_line.lstrip()))
+    return spots
+
+
+def plan_writing_habits(text, protection_mask, chances, start_index=0, skip_positions=()):
+    """Finds the spots where a habit may pause: a heading and the first line after
+    it, an opening quotation mark, and an opening parenthesis or a dash used as an
+    aside. Returns {index of the character it pauses before: kind}. Only kinds
+    with a chance above 0 are planned, and only text from start_index on. Nothing
+    is planned in or next to protected text, at a spot in skip_positions, or at
+    the very start of the text."""
+    plan = {}
+    length = len(text)
+    first_content = length - len(text.lstrip())
+
+    def add(spot, kind):
+        if chances.get(kind, 0.0) <= 0:
+            return
+        if spot <= first_content or spot < start_index or spot >= length:
+            return
+        if spot in plan or spot in skip_positions:
+            return
+        if any(protection_mask[max(0, spot - 2):spot + 1]):
+            return
+        plan[spot] = kind
+
+    for spot in find_habit_heading_spots(text):
+        add(spot, HABIT_HEADING)
+
+    for index, char in enumerate(text):
+        previous = text[index - 1] if index > 0 else "\n"
+        following = text[index + 1] if index + 1 < length else ""
+        if char == "\u201c":
+            if following and not following.isspace():
+                add(index, HABIT_QUOTE)
+        elif char == '"':
+            if (previous.isspace() or previous in HABIT_OPENING_BEFORE_QUOTE) \
+                    and following and not following.isspace():
+                add(index, HABIT_QUOTE)
+        elif char == "(":
+            if following and not following.isspace():
+                add(index, HABIT_ASIDE)
+        elif char == "\u2014":
+            add(index, HABIT_ASIDE)
+        elif char == "\u2013":
+            if previous == " " and following == " ":
+                add(index, HABIT_ASIDE)
+        elif char == "-":
+            if following == "-" and previous != "-":
+                add(index, HABIT_ASIDE)
+            elif previous == " " and following == " ":
+                line_start = text.rfind("\n", 0, index) + 1
+                if text[line_start:index].strip():    # not an indented bullet
+                    add(index, HABIT_ASIDE)
+    return plan
+
+
+def draw_writing_habit_seconds(kind, chance, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Habit Strength."""
+    if strength_percent <= 0 or chance <= 0 or random.random() >= chance:
+        return 0.0
+    low, high = HABIT_SECONDS[kind]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def summarize_writing_habit_plan(plan):
+    """Counts the planned spots per kind, for the session log."""
+    counts = {}
+    for kind in plan.values():
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def estimate_writing_habit_seconds(text, protection_mask, settings):
+    """Average extra time (or less time, for quick commas) the writing habits add
+    to `text`. Uses the same profile, plan, chances, and ranges as the typing
+    loop."""
+    if not settings.get("enable_writing_habits", True):
+        return 0.0
+    strength = settings.get("writing_habit_strength", 100.0)
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    profile = get_writing_habit_profile(text)
+    chances = get_writing_habit_chances(profile)
+    total = 0.0
+    for kind in plan_writing_habits(text, mask, chances).values():
+        total += chances[kind] * (sum(HABIT_SECONDS[kind]) / 2.0) * (strength / 100.0)
+    # A comma already pauses 0.5 to 1.5 seconds (1.0 on average). Quick or slow
+    # commas change that average.
+    total += text.count(",") * (get_comma_pace_scale(profile, strength) - 1.0)
+    return total
+
+
+# --------------------------------------------
 # UNEVEN RHYTHM (Update #40)
 # --------------------------------------------
 # A real typist does not keep one steady beat. Familiar phrases and everyday
@@ -4167,6 +4392,8 @@ def type_text(settings, is_batch=False, is_last=True):
     decision_pause_strength = settings.get("decision_pause_strength", 100.0)
     enable_uneven_rhythm = settings.get("enable_uneven_rhythm", True)
     rhythm_strength = settings.get("rhythm_strength", 100.0)
+    enable_writing_habits = settings.get("enable_writing_habits", True)
+    writing_habit_strength = settings.get("writing_habit_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -4245,6 +4472,36 @@ def type_text(settings, is_batch=False, is_last=True):
         except Exception:
             burst_plan = {}
             log_event("burst_pauses_failed", "could not plan burst pauses; typing without them")
+
+    # Writing habits (Update #41): a pause before a heading, an opening quote, or
+    # an aside, and a quicker or slower pace on commas. The habit profile comes
+    # from the text itself, so it stays the same through the whole run and a
+    # resume. Planned once, only for text still to be typed, never in protected
+    # text, and never at a spot that already has another pause. If planning ever
+    # fails, the file is typed without them.
+    habit_plan = {}
+    habit_chances = {}
+    comma_pace_scale = 1.0
+    if enable_writing_habits and writing_habit_strength > 0:
+        try:
+            habit_profile = get_writing_habit_profile(text)
+            habit_chances = get_writing_habit_chances(habit_profile)
+            comma_pace_scale = get_comma_pace_scale(habit_profile, writing_habit_strength)
+            habit_plan = plan_writing_habits(
+                text, protection_mask, habit_chances, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan) | set(burst_plan)
+            )
+            habit_counts = summarize_writing_habit_plan(habit_plan)
+            planned_text = ", ".join(
+                f"{kind} {count}" for kind, count in sorted(habit_counts.items())
+            ) or "no spots"
+            log_event("writing_habits", describe_writing_habit_profile(habit_profile)
+                      + "; planned " + planned_text)
+        except Exception:
+            habit_plan = {}
+            habit_chances = {}
+            comma_pace_scale = 1.0
+            log_event("writing_habits_failed", "could not plan writing habits; typing without them")
 
     # Uneven rhythm (Update #40): familiar words and phrases a little quicker;
     # names, technical terms, punctuation, and hedged claims a little slower.
@@ -4598,6 +4855,32 @@ def type_text(settings, is_batch=False, is_last=True):
                 state.status = "Pausing to think..."
                 log_event("burst_pause", f"{burst_kind} ~{burst_seconds:.1f}s before character {idx}")
                 for _ in range(int(burst_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
+        # WRITING HABIT PAUSE (Update #41)
+        # A short stop before a heading, an opening quotation mark, or an aside
+        # (a parenthesis or dash), for the kinds of spot that are a habit for
+        # this writer. It runs at the same place as the pauses above (BEFORE the
+        # focus-lock and pause checks), stays stoppable and pausable, and is not
+        # added to paused_duration. Only the spot and kind (never the text) go
+        # in the log.
+        # --------------------------------
+        habit_kind = habit_plan.get(idx)
+        if habit_kind:
+            habit_seconds = draw_writing_habit_seconds(
+                habit_kind, habit_chances.get(habit_kind, 0.0), writing_habit_strength
+            )
+            if habit_seconds > 0:
+                state.status = HABIT_STATUS[habit_kind]
+                log_event("writing_habit_pause", f"{habit_kind} ~{habit_seconds:.1f}s before character {idx}")
+                for _ in range(int(habit_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
                     time.sleep(0.1)
@@ -5045,7 +5328,11 @@ def type_text(settings, is_batch=False, is_last=True):
         prev_char = char
         time.sleep(delay)
 
-        if char in [",", ";", ":"]:
+        if char == ",":
+            # A writing habit (Update #41) may make this writer quicker or
+            # slower on commas. The scale is 1.0 when habits are off.
+            time.sleep(random.uniform(0.5, 1.5) * comma_pace_scale)
+        elif char in [";", ":"]:
             time.sleep(random.uniform(0.5, 1.5))
         elif char in [".", "!", "?"]:
             sentence_pause = random.uniform(sentence_pause_min, sentence_pause_max)
@@ -5195,6 +5482,10 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
 
     # Pauses at decision points (Update #38), averaged the same way.
     total_seconds += estimate_decision_pause_seconds(text, protection_mask, settings)
+
+    # Writing habits (Update #41): pauses before headings, quotes, and asides,
+    # plus quicker or slower commas, averaged the same way.
+    total_seconds += estimate_writing_habit_seconds(text, protection_mask, settings)
 
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
@@ -5467,6 +5758,18 @@ def validate_settings():
     except ValueError:
         rhythm_strength = 100.0
         rhythm_strength_var.set("100")
+    enable_writing_habits = bool(enable_writing_habits_var.get())
+    try:
+        writing_habit_strength = float(writing_habit_strength_var.get())
+        if not (writing_habit_strength >= 0):  # also catches NaN
+            writing_habit_strength = 0.0
+            writing_habit_strength_var.set("0")
+        elif writing_habit_strength > HABIT_STRENGTH_MAX:
+            writing_habit_strength = HABIT_STRENGTH_MAX
+            writing_habit_strength_var.set(f"{HABIT_STRENGTH_MAX:g}")
+    except ValueError:
+        writing_habit_strength = 100.0
+        writing_habit_strength_var.set("100")
     enable_revision_clusters = bool(enable_revision_clusters_var.get())
     try:
         cluster_strength = float(cluster_strength_var.get())
@@ -5599,6 +5902,8 @@ def validate_settings():
         "decision_pause_strength": decision_pause_strength,
         "enable_uneven_rhythm": enable_uneven_rhythm,
         "rhythm_strength": rhythm_strength,
+        "enable_writing_habits": enable_writing_habits,
+        "writing_habit_strength": writing_habit_strength,
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
         "revision_style": revision_style,
@@ -7173,6 +7478,8 @@ def get_current_settings_snapshot():
         "decision_pause_strength": decision_pause_strength_var.get(),
         "enable_uneven_rhythm": enable_uneven_rhythm_var.get(),
         "rhythm_strength": rhythm_strength_var.get(),
+        "enable_writing_habits": enable_writing_habits_var.get(),
+        "writing_habit_strength": writing_habit_strength_var.get(),
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
         "revision_style": revision_style_var.get(),
@@ -7254,6 +7561,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     decision_pause_strength_var.set(str(data.get("decision_pause_strength", "100")))
     enable_uneven_rhythm_var.set(bool(data.get("enable_uneven_rhythm", True)))
     rhythm_strength_var.set(str(data.get("rhythm_strength", "100")))
+    enable_writing_habits_var.set(bool(data.get("enable_writing_habits", True)))
+    writing_habit_strength_var.set(str(data.get("writing_habit_strength", "100")))
     enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
     cluster_strength_var.set(str(data.get("cluster_strength", "100")))
     revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
@@ -8434,6 +8743,8 @@ enable_decision_pauses_var = tk.BooleanVar(value=True)
 decision_pause_strength_var = tk.StringVar(value="100")
 enable_uneven_rhythm_var = tk.BooleanVar(value=True)
 rhythm_strength_var = tk.StringVar(value="100")
+enable_writing_habits_var = tk.BooleanVar(value=True)
+writing_habit_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -8536,6 +8847,7 @@ SECTION_RESET_VARS = {
     "Difficulty Pauses": [enable_difficulty_pauses_var, difficulty_pause_strength_var],
     "Typing Bursts": [enable_typing_bursts_var, burst_pause_strength_var],
     "Decision Pauses": [enable_decision_pauses_var, decision_pause_strength_var],
+    "Writing Habits": [enable_writing_habits_var, writing_habit_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
@@ -9096,6 +9408,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.16.0",
+        "date": "2026-10-18",
+        "title": "Punctuation and formatting habits",
+        "changes": [
+            "Added: writing habits. A writer has habits, and they stay the same all the way through. Amanuensis now gives each file its own set. The typist may always stop for a moment before an opening parenthesis or a dash used as an aside, before an opening quotation mark, or before a heading and the first line under it. Each of those three is none, light, or strong for the file, and at least two are always real habits. Commas are typed quick, even, or slow (half, normal, or one and a half times the usual comma pause).",
+            "Added: a Writing Habits card on the Speed tab with two new settings (on or off, and Habit Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the average habit pauses and the change in comma time. Semicolons and colons are unchanged.",
+            "Notes: the habits are worked out from the text itself, with no fresh random draw, so the same file always gets the same habits and resuming keeps them. The spots are planned once before typing starts, only for text that is still to be typed. Protected text never gets a pause, and there is none at the very start of the file or where a pause marker, a difficulty pause, a decision pause, or a burst pause already is. A heading is a short line with blank lines around it that does not end like a sentence, or a line that starts with #. Bullet lines are never headings. The typed text never changes. The session log records the habit levels, the spot, and the kind, never the words.",
+        ],
+    },
+    {
         "version": "5.15.0",
         "date": "2026-10-17",
         "title": "Revision clusters",
@@ -9603,6 +9926,7 @@ frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
 frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
 frame_decision_pauses = make_modern_card(tab_speed, "Decision Pauses")
+frame_writing_habits = make_modern_card(tab_speed, "Writing Habits")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -10077,6 +10401,30 @@ modern_label(
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Writing habits (Update #41) ---
+modern_checkbox(
+    frame_writing_habits, "Type with consistent writing habits", enable_writing_habits_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_writing_habits, "Habit Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_writing_habit_strength = modern_entry(frame_writing_habits, writing_habit_strength_var, width=8)
+entry_writing_habit_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_writing_habits,
+    "Every writer has habits. Amanuensis gives each file its own set. The typist "
+    "may always stop before an opening parenthesis or a dash used as an aside, "
+    "before an opening quotation mark, or before a heading and the first line "
+    "under it, and may rush or linger over commas. The habits are picked from the "
+    "text, so the same file always gets the same habits, and they stay the same "
+    "through the whole run, even after a resume. Not every spot pauses.\n\n"
+    "100% is the normal length (usually under a second and a half). Use less for "
+    "shorter pauses or more for longer ones (0 to 200). Protected text never gets "
+    "a pause, and the time estimate includes these habits.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Formatting markers (Update #29) ---
 modern_checkbox(
     frame_format_markers, "Press bold and italic shortcuts for formatting markers", enable_format_markers_var
@@ -10541,6 +10889,7 @@ SECTION_CARDS = {
     "Difficulty Pauses": frame_difficulty_pauses,
     "Typing Bursts": frame_typing_bursts,
     "Decision Pauses": frame_decision_pauses,
+    "Writing Habits": frame_writing_habits,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
