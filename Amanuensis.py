@@ -9,6 +9,30 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.15.0 (2026-10-17) -- Revision clusters
+#   - Added: Revision Clusters. Real revising bunches together: a writer changes a
+#     phrase, then fixes several things in a row, then drafts calmly for a while.
+#     Amanuensis now groups its typos, sentence reworks, drafted paraphrases,
+#     second revision words, and select and retype words into short stretches of
+#     the text instead of scattering them evenly. A stretch is about 70 to 220
+#     characters long and starts at the beginning of a sentence. Outside those
+#     stretches the typing is calmer.
+#   - Added: A "Revision Clusters" card on the Mistakes tab with three new settings
+#     (enable_revision_clusters, on by default; cluster_strength, 100 by default,
+#     0 to 200; and revision_style, "Mixed" by default, or "Edit as I go" or
+#     "Draft, then revise"), saved with profiles and restored on launch.
+#   - Modified: Second revision pass and select and retype now pick a word inside
+#     a cluster when the paragraph has one.
+#   - Notes: The typo chance, the sentence rework count, and the paraphrase chance
+#     are raised inside a cluster and lowered outside it. The two weights are
+#     worked out so the average stays the same, so the file gets about the same
+#     number of mistakes overall and the time estimate is unchanged. Clusters are
+#     planned once before typing, only from the resume point on, and only in
+#     paragraphs of 160 characters or more. "Edit as I go" spreads clusters
+#     through each paragraph. "Draft, then revise" keeps the start of a paragraph
+#     calm and puts one cluster at its end. The log records only how many
+#     clusters were planned, never the words. No new packages.
+#
 # v5.14.0 (2026-10-16) -- Uneven rhythm
 #   - Added: Uneven Rhythm. The typist no longer keeps one steady beat. Everyday
 #     words and familiar phrases (like "of the", "as well as", or "a lot of")
@@ -51,24 +75,6 @@
 #     Natural Pauses after a paragraph break still happen first. The log records
 #     only the spot and kind, never the words. No new packages.
 #
-# v5.12.0 (2026-10-16) -- Bursts followed by pauses
-#   - Added: Typing Bursts. The typist now writes in bursts of a few words and
-#     stops for a moment between them, instead of typing a whole sentence in one
-#     go. A burst is longer (about 8 to 16 words) for plain, familiar wording and
-#     shorter (about 3 to 7 words) in a sentence that needs more thought: one with
-#     a hard word, an argument word like "because" or "however", or many commas.
-#     A burst tries to end at a comma, semicolon, or colon when one is close.
-#   - Added: A "Typing Bursts" card on the Speed tab with two new settings
-#     (enable_typing_bursts, on by default, and burst_pause_strength, 100 by
-#     default, 0 to 300), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the average burst pauses.
-#   - Notes: Spots are planned once before typing, only from the resume point on,
-#     never in or next to protected text, never at a sentence or paragraph start,
-#     and never where a {{pause}} marker or a difficulty pause already sits. A
-#     burst pause is short (about 0.3 to 1.4 seconds) and not every burst ends
-#     with one. The log records only the spot and length, never the words. No new
-#     packages.
-#
 # ============================================
 
 import pyautogui
@@ -83,6 +89,7 @@ import csv
 import os
 import sys
 import hashlib
+import math
 import subprocess
 import urllib.error
 import urllib.parse
@@ -1726,7 +1733,7 @@ def _lookback_span_is_safe(text, protection_mask, start, end):
 
 
 def _choose_lookback_edit(text, protection_mask, para_start, trigger_idx, resume_from,
-                          format_map, left_mistake_map, fix_actions, pause_map):
+                          format_map, left_mistake_map, fix_actions, pause_map, cluster_flags=None):
     """Picks one word to swap in the paragraph text[para_start:trigger_idx].
     Returns an edit dict (start, end, trigger, original, draft, distance,
     swapped) or None when the paragraph has no safe word."""
@@ -1775,7 +1782,8 @@ def _choose_lookback_edit(text, protection_mask, para_start, trigger_idx, resume
 
     if not candidates:
         return None
-    word_start, word_end, word, synonyms = random.choice(candidates)
+    # Update #39: when the paragraph has a revision cluster, pick a word in it.
+    word_start, word_end, word, synonyms = random.choice(prefer_cluster_candidates(candidates, cluster_flags))
     draft = _match_case(word, random.choice(synonyms))
     if draft == word or not draft.isalpha():
         return None
@@ -1791,7 +1799,7 @@ def _choose_lookback_edit(text, protection_mask, para_start, trigger_idx, resume
 
 
 def plan_lookback_edits(text, protection_mask, settings, resume_from,
-                        format_map, left_mistake_map, fix_actions, pause_map):
+                        format_map, left_mistake_map, fix_actions, pause_map, cluster_flags=None):
     """Plans the second revision pass before typing starts. Returns two dicts
     that share the same edit dicts: swaps ({word start: edit}, where the draft
     word is typed) and fixes ({paragraph end: edit}, where the typist goes back
@@ -1813,7 +1821,7 @@ def plan_lookback_edits(text, protection_mask, settings, resume_from,
         if trigger_idx > para_start and trigger_idx > resume_from and random.uniform(0, 100) < chance:
             edit = _choose_lookback_edit(
                 text, protection_mask, para_start, trigger_idx, resume_from,
-                format_map, left_mistake_map, fix_actions, pause_map,
+                format_map, left_mistake_map, fix_actions, pause_map, cluster_flags,
             )
             if edit is not None:
                 swaps[edit["start"]] = edit
@@ -1855,7 +1863,8 @@ OVERSHOOT_ESTIMATE_SECONDS = 1.2  # rough extra time for one overshoot
 
 
 def _choose_select_retype(text, protection_mask, para_start, para_end, resume_from,
-                          format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps):
+                          format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                          cluster_flags=None):
     """Picks one word to select and retype in the paragraph text[para_start:para_end].
     Returns an edit dict (start, end, original, draft) or None when the paragraph
     has no safe word."""
@@ -1903,7 +1912,8 @@ def _choose_select_retype(text, protection_mask, para_start, para_end, resume_fr
 
     if not candidates:
         return None
-    word_start, word_end, word, synonyms = random.choice(candidates)
+    # Update #39: when the paragraph has a revision cluster, pick a word in it.
+    word_start, word_end, word, synonyms = random.choice(prefer_cluster_candidates(candidates, cluster_flags))
     draft = _match_case(word, random.choice(synonyms))
     if draft == word or not draft.isalpha():
         return None
@@ -1916,7 +1926,8 @@ def _choose_select_retype(text, protection_mask, para_start, para_end, resume_fr
 
 
 def plan_select_retypes(text, protection_mask, settings, resume_from,
-                        format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps):
+                        format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                        cluster_flags=None):
     """Plans select and retype before typing starts. Returns a dict
     {word start: edit}. Each paragraph gets one edit with the chosen chance. The
     last paragraph counts too, even without a line break after it."""
@@ -1936,11 +1947,202 @@ def plan_select_retypes(text, protection_mask, settings, resume_from,
             edit = _choose_select_retype(
                 text, protection_mask, para_start, para_end, resume_from,
                 format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps,
+                cluster_flags,
             )
             if edit is not None:
                 plan[edit["start"]] = edit
         para_start = para_end + 1
     return plan
+
+
+# --------------------------------------------
+# REVISION CLUSTERS (Update #39)
+# --------------------------------------------
+# Real revising bunches together. A writer changes one phrase, then fixes a
+# few more things in a row, then drafts calmly for a while. Without this,
+# every mistake lands at a random spot, evenly spread through the file.
+#
+# Clusters are short stretches of the text (about 70 to 220 characters, always
+# starting at the beginning of a sentence). Inside a cluster the typo chance,
+# the sentence rework count, and the paragraph paraphrase chance are raised by
+# the cluster weight. Outside a cluster they are lowered by the calm weight.
+# get_cluster_weights() works the two weights out so that the average over the
+# whole file stays at 1.0. That is why the total number of mistakes, and so the
+# time estimate, stay the same. The second revision pass and select and retype
+# also pick their word inside a cluster when the paragraph has one.
+#
+# Three revision styles decide where the clusters go in a paragraph:
+#   * "Edit as I go": clusters are spread through the paragraph with calm
+#     stretches between them.
+#   * "Draft, then revise": the start of the paragraph is calm and one cluster
+#     sits at the end (the writer rereads the paragraph and revises it).
+#   * "Mixed": each paragraph randomly uses one of the two styles.
+#
+# Only paragraphs of CLUSTER_MIN_PARAGRAPH_CHARS or more get clusters. Nothing
+# here changes the typed text. Protected text is still never touched, because
+# every mistake feature checks for protected text itself.
+CLUSTER_STRENGTH_MAX = 200.0
+CLUSTER_BASE_BOOST = 1.5  # at 100% strength, a cluster weight of 1 + 1.5 = 2.5
+CLUSTER_STYLE_MIXED = "Mixed"
+CLUSTER_STYLE_AS_YOU_GO = "Edit as I go"
+CLUSTER_STYLE_DRAFT_FIRST = "Draft, then revise"
+CLUSTER_STYLES = (CLUSTER_STYLE_MIXED, CLUSTER_STYLE_AS_YOU_GO, CLUSTER_STYLE_DRAFT_FIRST)
+CLUSTER_MIN_PARAGRAPH_CHARS = 160
+CLUSTER_MIN_CHARS = 70
+CLUSTER_MAX_CHARS = 220
+CLUSTER_GAP_MIN = 250  # calm characters between two clusters (edit as I go)
+CLUSTER_GAP_MAX = 650
+CLUSTER_DRAFT_FRACTION = 0.65  # draft then revise: the cluster starts after this much of the paragraph
+CLUSTER_DRAFT_MAX_CHARS = 300  # ... and is never longer than this (unless the last sentence is)
+CLUSTER_MIN_CALM_WEIGHT = 0.2  # calm stretches keep at least this share of the normal mistake rate
+CLUSTER_DRAFT_CHANCE = 85.0  # percent of paragraphs that get an end-of-paragraph cluster
+CLUSTER_SENTENCE_START = re.compile(r"[.!?][\"')\]]*\s+(?=\S)")
+
+
+def clamp_cluster_strength(strength_percent):
+    """Returns the cluster strength as a float between 0 and CLUSTER_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), CLUSTER_STRENGTH_MAX))
+    except (TypeError, ValueError):
+        return 100.0
+
+
+def normalize_cluster_style(value):
+    """Returns a known revision style, or Mixed for anything else (settings
+    and profile files are untrusted input)."""
+    return value if value in CLUSTER_STYLES else CLUSTER_STYLE_MIXED
+
+
+def _cluster_sentence_starts(text, para_start, para_end):
+    """Returns the index where each sentence of text[para_start:para_end] starts."""
+    starts = [para_start]
+    for match in CLUSTER_SENTENCE_START.finditer(text, para_start, para_end):
+        starts.append(match.end())
+    return [start for start in starts if start < para_end]
+
+
+def _cluster_snap_end(text, start, target_end, para_end):
+    """Moves a cluster end to the nearest sentence or phrase end before
+    target_end (so a cluster does not stop in the middle of a phrase). When
+    there is none, it moves forward to the next space instead."""
+    end = min(target_end, para_end)
+    if end >= para_end:
+        return para_end
+    floor = start + CLUSTER_MIN_CHARS // 2
+    for position in range(end, floor, -1):
+        if text[position - 1] in ".!?,;:":
+            return position
+    while end < para_end and text[end] != " ":
+        end += 1
+    return end
+
+
+def _plan_clusters_as_you_go(text, para_start, para_end, rng):
+    """Edit as I go: clusters spread through one paragraph, each starting at a
+    sentence start, with calm stretches in between."""
+    zones = []
+    cursor = para_start + rng.randint(0, CLUSTER_GAP_MIN)
+    for start in _cluster_sentence_starts(text, para_start, para_end):
+        if start < cursor:
+            continue
+        if para_end - start < CLUSTER_MIN_CHARS // 2:
+            break
+        target_end = start + rng.randint(CLUSTER_MIN_CHARS, CLUSTER_MAX_CHARS)
+        end = _cluster_snap_end(text, start, target_end, para_end)
+        if end - start < CLUSTER_MIN_CHARS // 2:
+            continue
+        zones.append((start, end))
+        cursor = end + rng.randint(CLUSTER_GAP_MIN, CLUSTER_GAP_MAX)
+    return zones
+
+
+def _plan_clusters_draft_then_revise(text, para_start, para_end, rng):
+    """Draft, then revise: the start of the paragraph is calm, and one cluster
+    covers its last sentence or two, where the writer rereads and revises."""
+    if rng.uniform(0, 100) >= CLUSTER_DRAFT_CHANCE:
+        return []
+    starts = _cluster_sentence_starts(text, para_start, para_end)
+    threshold = max(
+        para_start + int((para_end - para_start) * CLUSTER_DRAFT_FRACTION),
+        para_end - CLUSTER_DRAFT_MAX_CHARS,
+    )
+    later = [start for start in starts if start >= threshold]
+    if later:
+        start = later[0]
+    elif len(starts) > 1:
+        start = starts[-1]
+    else:
+        return []
+    if para_end - start < CLUSTER_MIN_CHARS // 2:
+        return []
+    return [(start, para_end)]
+
+
+def plan_revision_clusters(text, start_index=0, style=CLUSTER_STYLE_MIXED, rng=None):
+    """Plans the revision clusters before typing starts, only for text that is
+    still to be typed (from start_index on). Returns a sorted list of
+    (start, end) character ranges. Paragraphs that are too short get none."""
+    rng = rng or random
+    style = normalize_cluster_style(style)
+    zones = []
+    para_start = 0
+    while para_start < len(text):
+        para_end = text.find("\n", para_start)
+        if para_end == -1:
+            para_end = len(text)
+        if para_end > start_index and para_end - para_start >= CLUSTER_MIN_PARAGRAPH_CHARS:
+            para_style = style
+            if para_style == CLUSTER_STYLE_MIXED:
+                para_style = rng.choice((CLUSTER_STYLE_AS_YOU_GO, CLUSTER_STYLE_DRAFT_FIRST))
+            if para_style == CLUSTER_STYLE_AS_YOU_GO:
+                found = _plan_clusters_as_you_go(text, para_start, para_end, rng)
+            else:
+                found = _plan_clusters_draft_then_revise(text, para_start, para_end, rng)
+            for zone_start, zone_end in found:
+                zone_start = max(zone_start, start_index)
+                if zone_end - zone_start >= CLUSTER_MIN_CHARS // 2:
+                    zones.append((zone_start, zone_end))
+        para_start = para_end + 1
+    return zones
+
+
+def build_cluster_flags(text_length, zones):
+    """Returns a bytearray with one entry per character: 1 inside a cluster,
+    0 outside. The typing loop reads it once per character."""
+    flags = bytearray(text_length)
+    for zone_start, zone_end in zones:
+        zone_end = min(zone_end, text_length)
+        if zone_start < zone_end:
+            flags[zone_start:zone_end] = b"\x01" * (zone_end - zone_start)
+    return flags
+
+
+def get_cluster_weights(cluster_fraction, strength_percent):
+    """Returns (cluster_weight, calm_weight). cluster_fraction is the share of
+    the text still to be typed that lies inside clusters (0 to 1). The weights
+    are worked out so cluster_fraction * cluster_weight + (1 - cluster_fraction)
+    * calm_weight is 1.0, so the average number of mistakes does not change."""
+    strength = clamp_cluster_strength(strength_percent) / 100.0
+    if strength <= 0 or cluster_fraction <= 0 or cluster_fraction >= 1:
+        return 1.0, 1.0
+    cluster_weight = 1.0 + CLUSTER_BASE_BOOST * strength
+    # Calm stretches always keep a small share of the normal rate (a real typist
+    # still slips now and then), so the cluster weight has a ceiling. Solving
+    # fraction * cluster + (1 - fraction) * calm = 1 for the cluster weight gives it.
+    ceiling = (1.0 - (1.0 - cluster_fraction) * CLUSTER_MIN_CALM_WEIGHT) / cluster_fraction
+    cluster_weight = min(cluster_weight, ceiling)
+    calm_weight = (1.0 - cluster_fraction * cluster_weight) / (1.0 - cluster_fraction)
+    return cluster_weight, max(calm_weight, 0.0)
+
+
+def prefer_cluster_candidates(candidates, cluster_flags):
+    """candidates is a list of tuples whose first item is a word's start index.
+    Returns the ones inside a revision cluster when there are any, otherwise
+    all of them."""
+    if not cluster_flags:
+        return candidates
+    inside = [item for item in candidates if item[0] < len(cluster_flags) and cluster_flags[item[0]]]
+    return inside or candidates
 
 
 # --------------------------------------------
@@ -3968,6 +4170,9 @@ def type_text(settings, is_batch=False, is_last=True):
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
+    enable_revision_clusters = settings.get("enable_revision_clusters", True)
+    cluster_strength = settings.get("cluster_strength", 100.0)
+    revision_style = settings.get("revision_style", CLUSTER_STYLE_MIXED)
 
     try:
         with open(input_path, "r", encoding="utf-8") as file:
@@ -4085,6 +4290,38 @@ def type_text(settings, is_batch=False, is_last=True):
     state.lookback_pending = None
     state.select_retype_pending = None
 
+    # Revision clusters (Update #39): short stretches where typos, reworks, and
+    # other edits bunch together, with calmer stretches in between. Planned
+    # once, only for text still to be typed. The two weights keep the average
+    # number of mistakes the same. If planning ever fails, mistakes are spread
+    # evenly, as before.
+    cluster_flags = None
+    cluster_weight = 1.0
+    calm_weight = 1.0
+    revision_features_on = (
+        enable_typos or enable_mistakes or enable_paraphrase
+        or settings.get("enable_lookback_edit", False)
+        or settings.get("enable_select_retype", False)
+    )
+    if enable_revision_clusters and cluster_strength > 0 and revision_features_on:
+        try:
+            cluster_zones = plan_revision_clusters(text, resume_from, revision_style)
+            if cluster_zones:
+                cluster_flags = build_cluster_flags(len(text), cluster_zones)
+                chars_left = max(len(text) - resume_from, 1)
+                cluster_chars = sum(cluster_flags[resume_from:])
+                cluster_weight, calm_weight = get_cluster_weights(cluster_chars / chars_left, cluster_strength)
+                log_event(
+                    "revision_clusters",
+                    f"planned {len(cluster_zones)} cluster(s) covering {cluster_chars} of {chars_left} "
+                    f"characters, style {normalize_cluster_style(revision_style)}",
+                )
+        except Exception:
+            cluster_flags = None
+            cluster_weight = 1.0
+            calm_weight = 1.0
+            log_event("revision_clusters_failed", "could not plan revision clusters; spreading mistakes evenly")
+
     # Second revision pass (Update #34): words to type as a synonym first and
     # fix after the paragraph. Planned only for text that is still to be typed.
     # If planning ever fails, the file is simply typed without them.
@@ -4094,7 +4331,7 @@ def type_text(settings, is_batch=False, is_last=True):
         try:
             lookback_swaps, lookback_fixes = plan_lookback_edits(
                 text, protection_mask, settings, resume_from,
-                format_map, left_mistake_map, fix_actions, pause_map
+                format_map, left_mistake_map, fix_actions, pause_map, cluster_flags
             )
         except Exception:
             lookback_swaps = {}
@@ -4112,7 +4349,7 @@ def type_text(settings, is_batch=False, is_last=True):
         try:
             select_retype_plan = plan_select_retypes(
                 text, protection_mask, settings, resume_from,
-                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps
+                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps, cluster_flags
             )
         except Exception:
             select_retype_plan = {}
@@ -4218,6 +4455,11 @@ def type_text(settings, is_batch=False, is_last=True):
     for idx in range(resume_from, len(text)):
         char = text[idx]
         is_protected = protection_mask[idx]
+        # Update #39: how likely a mistake is here. Above 1 inside a revision
+        # cluster, below 1 in the calm stretches, 1 when there are no clusters.
+        zone_weight = 1.0
+        if cluster_flags:
+            zone_weight = cluster_weight if cluster_flags[idx] else calm_weight
         if stop_event.is_set():
             return
         if idx < left_skip_until:
@@ -4414,7 +4656,7 @@ def type_text(settings, is_batch=False, is_last=True):
         # the bold or italic from the cursor in some editors (Update #29).
         if enable_paraphrase and idx in paraphrase_map and not is_protected and not active_formats:
             candidate = paraphrase_map.pop(idx, None)
-            if candidate and random.uniform(0, 100) < paraphrase_chance:
+            if candidate and random.uniform(0, 100) < min(100.0, paraphrase_chance * zone_weight):
                 _end_idx, paraphrased_text, original_text = candidate
                 state.status = "Drafting paraphrase..."
                 log_event("paraphrase_rework", f"drafted: '{paraphrased_text}'")
@@ -4460,7 +4702,7 @@ def type_text(settings, is_batch=False, is_last=True):
         # (the final text has to stay exactly correct either way).
         # --------------------------------
         if enable_mistakes and char == " " and not is_protected:
-            word_count += 1
+            word_count += zone_weight
             if word_count >= next_mistake_target:
                 words_in_buffer = [w for w in recent_typed_buffer.split(" ") if w]
                 if rework_hold:
@@ -4492,7 +4734,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 next_mistake_target = random.randint(mistake_min, mistake_max)
                 state.next_mistake_words = next_mistake_target
         if enable_mistakes:
-            state.next_mistake_words = max(next_mistake_target - word_count, 0)
+            state.next_mistake_words = math.ceil(max(next_mistake_target - word_count, 0))
 
         # --------------------------------
         # SECOND REVISION PASS: go back and fix the word (Update #34)
@@ -4650,7 +4892,7 @@ def type_text(settings, is_batch=False, is_last=True):
         typo_corrected = False
         if enable_typos and not is_protected and idx not in left_mistake_map:
             can_typo = char.isalpha() or (use_extra_typos and char == " ")
-            if can_typo and random.uniform(0, 100) < typo_chance:
+            if can_typo and random.uniform(0, 100) < min(100.0, typo_chance * zone_weight):
                 if not use_extra_typos:
                     if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
                         _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, False)
@@ -5225,6 +5467,23 @@ def validate_settings():
     except ValueError:
         rhythm_strength = 100.0
         rhythm_strength_var.set("100")
+    enable_revision_clusters = bool(enable_revision_clusters_var.get())
+    try:
+        cluster_strength = float(cluster_strength_var.get())
+        if not math.isfinite(cluster_strength):
+            raise ValueError("not a finite number")
+        if cluster_strength < 0:
+            cluster_strength = 0.0
+            cluster_strength_var.set("0")
+        elif cluster_strength > CLUSTER_STRENGTH_MAX:
+            cluster_strength = CLUSTER_STRENGTH_MAX
+            cluster_strength_var.set(f"{CLUSTER_STRENGTH_MAX:g}")
+    except ValueError:
+        cluster_strength = 100.0
+        cluster_strength_var.set("100")
+    revision_style = normalize_cluster_style(revision_style_var.get())
+    if revision_style_var.get() != revision_style:
+        revision_style_var.set(revision_style)
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -5340,6 +5599,9 @@ def validate_settings():
         "decision_pause_strength": decision_pause_strength,
         "enable_uneven_rhythm": enable_uneven_rhythm,
         "rhythm_strength": rhythm_strength,
+        "enable_revision_clusters": enable_revision_clusters,
+        "cluster_strength": cluster_strength,
+        "revision_style": revision_style,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -6911,6 +7173,9 @@ def get_current_settings_snapshot():
         "decision_pause_strength": decision_pause_strength_var.get(),
         "enable_uneven_rhythm": enable_uneven_rhythm_var.get(),
         "rhythm_strength": rhythm_strength_var.get(),
+        "enable_revision_clusters": enable_revision_clusters_var.get(),
+        "cluster_strength": cluster_strength_var.get(),
+        "revision_style": revision_style_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -6989,6 +7254,9 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     decision_pause_strength_var.set(str(data.get("decision_pause_strength", "100")))
     enable_uneven_rhythm_var.set(bool(data.get("enable_uneven_rhythm", True)))
     rhythm_strength_var.set(str(data.get("rhythm_strength", "100")))
+    enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
+    cluster_strength_var.set(str(data.get("cluster_strength", "100")))
+    revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -8202,6 +8470,9 @@ enable_select_retype_var = tk.BooleanVar(value=False)
 select_retype_chance_var = tk.StringVar(value="20")
 enable_overshoot_var = tk.BooleanVar(value=True)
 overshoot_chance_var = tk.StringVar(value="30")
+enable_revision_clusters_var = tk.BooleanVar(value=True)
+cluster_strength_var = tk.StringVar(value="100")
+revision_style_var = tk.StringVar(value=CLUSTER_STYLE_MIXED)
 
 enable_smart_fixes_var = tk.BooleanVar(value=False)
 smart_fix_spacing_var = tk.BooleanVar(value=True)
@@ -8286,6 +8557,7 @@ SECTION_RESET_VARS = {
         enable_overshoot_var,
         overshoot_chance_var,
     ],
+    "Revision Clusters": [enable_revision_clusters_var, cluster_strength_var, revision_style_var],
     "Smart Text Fixes": [
         enable_smart_fixes_var,
         smart_fix_spacing_var,
@@ -8824,6 +9096,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.15.0",
+        "date": "2026-10-17",
+        "title": "Revision clusters",
+        "changes": [
+            "Added: revision clusters. Real revising bunches together: a writer changes a phrase, fixes a few more things in a row, then drafts calmly for a while. Amanuensis now groups its typos, sentence reworks, drafted paraphrases, second revision words, and select and retype words into short stretches of about 70 to 220 characters that start at the beginning of a sentence. Outside those stretches the typing is calmer.",
+            "Added: a Revision Clusters card on the Mistakes tab with three new settings (on or off, Cluster Strength from 0 to 200 percent, and a revision style: Mixed, Edit as I go, or Draft, then revise), on by default, saved with your profiles and restored on launch.",
+            "Modified: second revision pass and select and retype now pick a word inside a cluster when the paragraph has one.",
+            "Notes: the typo chance, the sentence rework count, and the paraphrase chance are raised inside a cluster and lowered outside it, with the two weights worked out so the average stays the same. You get about the same number of mistakes overall, so the time estimate does not change. Clusters are planned once before typing starts, only for text that is still to be typed, so resuming works, and only in paragraphs of 160 characters or more. Edit as I go spreads clusters through each paragraph. Draft, then revise keeps the start of a paragraph calm and puts one cluster at its end. Protected text is never touched. The session log records only how many clusters were planned, never the words. No new packages.",
+        ],
+    },
+    {
         "version": "5.14.0",
         "date": "2026-10-16",
         "title": "Uneven rhythm",
@@ -9327,6 +9610,7 @@ frame_typos = make_modern_card(tab_mistakes, "Character Typos")
 frame_mistakes = make_modern_card(tab_mistakes, "Sentence Reworks & Breaks")
 frame_lookback = make_modern_card(tab_mistakes, "Second Revision Pass")
 frame_select_retype = make_modern_card(tab_mistakes, "Select, Retype & Overshoot")
+frame_revision_clusters = make_modern_card(tab_mistakes, "Revision Clusters")
 frame_smart_fixes = make_modern_card(tab_mistakes, "Smart Text Fixes")
 frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
 
@@ -9961,6 +10245,44 @@ modern_label(
     wraplength=420,
 ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Revision clusters (Update #39) ---
+modern_checkbox(
+    frame_revision_clusters, "Enable revision clusters (bunch edits together)", enable_revision_clusters_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_revision_clusters, "Cluster Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_cluster_strength = modern_entry(frame_revision_clusters, cluster_strength_var, width=8)
+entry_cluster_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(frame_revision_clusters, "Revision style:").grid(
+    row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+)
+revision_style_combo = modern_combobox(frame_revision_clusters, revision_style_var, width=22)
+revision_style_combo.configure(values=list(CLUSTER_STYLES))
+revision_style_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+modern_label(
+    frame_revision_clusters,
+    "Real revising bunches together. A writer changes a phrase, fixes a few "
+    "more things in a row, then drafts calmly for a while. With this on, your "
+    "typos, sentence reworks, drafted paraphrases, and second revision or "
+    "select and retype words land in short stretches (about 70 to 220 "
+    "characters, starting at the beginning of a sentence) instead of being "
+    "spread evenly. The typing between those stretches is calmer, so you get "
+    "about the same number of mistakes overall and the time estimate does not "
+    "change.\n\n"
+    "Edit as I go spreads the stretches through each paragraph. Draft, then "
+    "revise keeps the start of a paragraph calm and puts one stretch at its "
+    "end, like rereading and fixing what you just wrote. Mixed uses a bit of "
+    "both. 100% is the normal size. Use less for a gentler difference or more "
+    "for stronger bunching (0 to 200). Only paragraphs of 160 characters or "
+    "more get stretches. This only moves your other mistake settings around, "
+    "so it does nothing when they are all off. Protected text is never "
+    "touched.",
+    kind="muted",
+    wraplength=420,
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Smart text fixes (Update #22) ---
 modern_checkbox(frame_smart_fixes, "Enable smart text fixes", enable_smart_fixes_var).grid(
     row=0, column=0, columnspan=2, sticky="w"
@@ -10224,6 +10546,7 @@ SECTION_CARDS = {
     "Sentence Reworks & Breaks": frame_mistakes,
     "Second Revision Pass": frame_lookback,
     "Select, Retype & Overshoot": frame_select_retype,
+    "Revision Clusters": frame_revision_clusters,
     "Smart Text Fixes": frame_smart_fixes,
     "Leave Mistakes For Me": frame_leave_mistakes,
     "Hotkeys": frame_hotkeys,
