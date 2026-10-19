@@ -24,6 +24,7 @@ Amanuensis reads text from a file and types it into whatever window currently ha
 - **Decision pauses**: an optional setting (on by default) where the typist stops a little longer at the spots where a writer has to decide something: before a new paragraph, before a sentence that states a claim (like "I believe" or "this shows"), and before a transition (like "however" or "for example"). A Pause Strength setting (0 to 300%) scales the pauses, and protected text never gets one
 - **Uneven rhythm**: an optional setting (on by default) so the typist does not keep one steady beat. Everyday words and familiar phrases (like "of the" or "a lot of") come out about 15% quicker. Names in the middle of a sentence, hard or technical words, numbers, punctuation marks, and hedged claims (like "perhaps" or "tends to") come out about 20 to 30% slower. A Rhythm Strength setting (0 to 200%) scales the changes. Only speed changes, and protected text always types at the normal speed
 - **Essay pace**: an optional setting (on by default) so the typist does not keep one pace from the first line to the last. The opening (the first 15% of the file) types about 10% slower and stops now and then to plan, the body in the middle gets about 8% quicker once the argument is set, and the closing (the last 15%) slows down again, about 12% slower, with a few stops to decide how to end. The speed eases between the parts so it never jumps. A Pace Strength setting (0 to 200%) scales the changes. Only files of 1,200 characters or more get it, protected text always types at the normal speed and never gets a pause, and the time estimate includes the change
+- **Start countdown**: the wait after you press Start, so you can click into the target window. It is 10 seconds by default, and you can set it from 0 (start right away) to 60 seconds on the Window tab. Each file in a batch gets it, and preview skips it
 - **Sentence reworks** — occasionally pauses, deletes the last few words just typed, and retypes them, simulating real hesitation (final text always stays exactly correct)
 - **Adjacent-key typos** — a configurable per-letter chance of a realistic, physically-nearby keyboard typo that gets caught and corrected
 - **Research breaks** — configurable frequency and duration for longer pauses every few paragraphs
@@ -77,7 +78,7 @@ If it's not installed, Amanuensis still runs fine — the window-lock section ju
    ```
 2. In the **Setup** tab, pick your input `.txt` file (or use the default `input.txt`), and adjust typing speed, pauses, typos, and reworks to taste.
 3. Optionally click **Preview Time Estimate** to see how long a run will take.
-4. Click **Start Typing**, then within the 10-second countdown, click into the window you want text typed into.
+4. Click **Start Typing**, then within the countdown (10 seconds by default, and you can change it from 0 to 60 seconds on the **Window** tab), click into the window you want text typed into.
 5. Use **Pause/Resume** or **Stop** (or your configured hotkeys) at any time. If you stop partway through, you'll be offered the chance to resume from that point next time.
 
 Hotkeys, profiles, and session logging live in the **Hotkeys & Data** tab.

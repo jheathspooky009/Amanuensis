@@ -9,6 +9,24 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.18.0 (2026-10-19) -- Custom start countdown
+#   - Added: Start Countdown. The wait before typing begins used to be fixed at 10
+#     seconds. You can now set it from 0 to 60 seconds, so you can have more time
+#     to click into the target window, or none at all when the window is already
+#     ready.
+#   - Added: A "Start Countdown" card on the Window tab with one new setting
+#     (start_countdown_seconds, 10 by default, whole seconds from 0 to 60), saved
+#     with profiles and restored on launch. It has its own Reset This Section
+#     button.
+#   - Modified: Each file in a batch queue gets the countdown. The batch time
+#     estimate uses the chosen length for each file instead of a fixed 10 seconds.
+#   - Notes: A box that cannot be read as a number goes back to 10, and a number
+#     outside 0 to 60 is pulled back into range, with the box corrected to match.
+#     Older settings and profile files without the setting load as 10, so nothing
+#     changes for them. 0 skips the wait completely. Preview runs still skip the
+#     countdown. The short warning after a long session break is separate and
+#     unchanged. No new packages.
+#
 # v5.17.0 (2026-10-18) -- A changing pace across the essay
 #   - Added: Essay Pace. A writer does not keep one pace from the first line to
 #     the last. The opening is typed a little slower and stops now and then to
@@ -55,30 +73,6 @@
 #     that does not end like a sentence, or a line that starts with #. Bullet
 #     lines are never headings. The typed text never changes. The log records the
 #     habit levels, the spot, and the kind, never the words. No new packages.
-#
-# v5.15.0 (2026-10-17) -- Revision clusters
-#   - Added: Revision Clusters. Real revising bunches together: a writer changes a
-#     phrase, then fixes several things in a row, then drafts calmly for a while.
-#     Amanuensis now groups its typos, sentence reworks, drafted paraphrases,
-#     second revision words, and select and retype words into short stretches of
-#     the text instead of scattering them evenly. A stretch is about 70 to 220
-#     characters long and starts at the beginning of a sentence. Outside those
-#     stretches the typing is calmer.
-#   - Added: A "Revision Clusters" card on the Mistakes tab with three new settings
-#     (enable_revision_clusters, on by default; cluster_strength, 100 by default,
-#     0 to 200; and revision_style, "Mixed" by default, or "Edit as I go" or
-#     "Draft, then revise"), saved with profiles and restored on launch.
-#   - Modified: Second revision pass and select and retype now pick a word inside
-#     a cluster when the paragraph has one.
-#   - Notes: The typo chance, the sentence rework count, and the paraphrase chance
-#     are raised inside a cluster and lowered outside it. The two weights are
-#     worked out so the average stays the same, so the file gets about the same
-#     number of mistakes overall and the time estimate is unchanged. Clusters are
-#     planned once before typing, only from the resume point on, and only in
-#     paragraphs of 160 characters or more. "Edit as I go" spreads clusters
-#     through each paragraph. "Draft, then revise" keeps the start of a paragraph
-#     calm and puts one cluster at its end. The log records only how many
-#     clusters were planned, never the words. No new packages.
 #
 # ============================================
 
@@ -2550,6 +2544,23 @@ SESSION_BREAK_EDGE_FRACTION = 0.03  # keep breaks away from the very start and v
 SESSION_BREAK_RESUME_SECONDS = 10  # warning countdown after a break when no window is locked
 SESSION_PACE_MIN_ESTIMATE_SECONDS = 60.0  # too little typing so far to judge the pace
 
+# START COUNTDOWN (Update #43): the wait before typing begins, so the person can
+# switch to the target window. Whole seconds, from 0 (no wait) to 60.
+START_COUNTDOWN_DEFAULT = 10
+START_COUNTDOWN_MAX = 60
+
+
+def clamp_start_countdown(seconds):
+    """Returns the start countdown as a whole number of seconds between 0 and
+    START_COUNTDOWN_MAX. Anything that is not a usable number gives the default."""
+    try:
+        value = float(seconds)
+    except (ValueError, TypeError):
+        return START_COUNTDOWN_DEFAULT
+    if not math.isfinite(value):
+        return START_COUNTDOWN_DEFAULT
+    return int(max(0, min(round(value), START_COUNTDOWN_MAX)))
+
 
 def format_duration_text(seconds):
     """Turns seconds into short text such as '45s', '12m 05s', or '7h 30m'."""
@@ -4812,10 +4823,14 @@ def type_text(settings, is_batch=False, is_last=True):
     if prepared.fixes:
         log_event("smart_fixes_planned", summarize_smart_fixes(prepared.fixes))
 
-    # 10 SECOND COUNTDOWN (skipped in preview mode -- there's no
-    # target window to switch focus to before typing starts).
+    # START COUNTDOWN (skipped in preview mode -- there's no target window to
+    # switch focus to before typing starts). The length comes from the Start
+    # Countdown setting (0 to 60 seconds, 10 by default). 0 means no wait.
     if not settings.get("preview_mode"):
-        for i in range(10, 0, -1):
+        countdown_seconds = clamp_start_countdown(
+            settings.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)
+        )
+        for i in range(countdown_seconds, 0, -1):
             if stop_event.is_set():
                 return
             state.status = f"Starting in {i}..."
@@ -6008,6 +6023,12 @@ def validate_settings():
     except ValueError:
         essay_pace_strength = 100.0
         essay_pace_strength_var.set("100")
+    # Start countdown (Update #43): whole seconds from 0 to 60. A box that cannot
+    # be read as a number goes back to the default, and out-of-range values are
+    # pulled back into range, with the box corrected to match.
+    start_countdown_seconds = clamp_start_countdown(start_countdown_seconds_var.get())
+    if start_countdown_seconds_var.get().strip() != str(start_countdown_seconds):
+        start_countdown_seconds_var.set(str(start_countdown_seconds))
     enable_revision_clusters = bool(enable_revision_clusters_var.get())
     try:
         cluster_strength = float(cluster_strength_var.get())
@@ -6144,6 +6165,7 @@ def validate_settings():
         "writing_habit_strength": writing_habit_strength,
         "enable_essay_pace": enable_essay_pace,
         "essay_pace_strength": essay_pace_strength,
+        "start_countdown_seconds": start_countdown_seconds,
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
         "revision_style": revision_style,
@@ -6295,7 +6317,9 @@ def preview_estimate():
             total_fixes += len(prepared.fixes)
             total_words += w_count
             total_chars += c_count
-            total_seconds += est_sec + 10.0  # 10s countdown allowance per file
+            total_seconds += est_sec + clamp_start_countdown(
+                settings.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)
+            )  # start countdown allowance per file
 
         if total_chars == 0:
             preview_result_var.set("All queued files are empty \u2014 nothing to preview.")
@@ -6388,7 +6412,7 @@ def split_target_time_across_files(settings, files, resume_dict):
 
 def run_typing_worker(settings, files, resume_dict):
     """Processes a list of files sequentially. Each file runs through
-    type_text() completely (including its own 10-second countdown).
+    type_text() completely (including its own start countdown).
     Stops if stop_event is set or if typing is no longer running."""
     total_files = len(files)
     target_shares = split_target_time_across_files(settings, files, resume_dict)
@@ -6634,7 +6658,7 @@ def open_preview_window():
     settings['preview_mode'] is True, so _send_char() / _send_backspace() /
     _send_ctrl_backspace() (see the PREVIEW MODE section above) write
     into the Text box via run_on_main_thread() instead of calling
-    pyautogui. type_text() itself skips the 10-second countdown when
+    pyautogui. type_text() itself skips the start countdown when
     preview_mode is set, since there's no target window to switch to.
     Preview runs always start from the top of the current input file
     and process just that one file -- never resume checkpoints, batch
@@ -7722,6 +7746,7 @@ def get_current_settings_snapshot():
         "writing_habit_strength": writing_habit_strength_var.get(),
         "enable_essay_pace": enable_essay_pace_var.get(),
         "essay_pace_strength": essay_pace_strength_var.get(),
+        "start_countdown_seconds": start_countdown_seconds_var.get(),
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
         "revision_style": revision_style_var.get(),
@@ -7807,6 +7832,9 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     writing_habit_strength_var.set(str(data.get("writing_habit_strength", "100")))
     enable_essay_pace_var.set(bool(data.get("enable_essay_pace", True)))
     essay_pace_strength_var.set(str(data.get("essay_pace_strength", "100")))
+    start_countdown_seconds_var.set(
+        str(clamp_start_countdown(data.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)))
+    )
     enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
     cluster_strength_var.set(str(data.get("cluster_strength", "100")))
     revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
@@ -8991,6 +9019,7 @@ enable_writing_habits_var = tk.BooleanVar(value=True)
 writing_habit_strength_var = tk.StringVar(value="100")
 enable_essay_pace_var = tk.BooleanVar(value=True)
 essay_pace_strength_var = tk.StringVar(value="100")
+start_countdown_seconds_var = tk.StringVar(value=str(START_COUNTDOWN_DEFAULT))
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -9076,6 +9105,7 @@ resume_status_var = tk.StringVar(value="")
 # setting, add its variable to the matching card's list below.
 SECTION_RESET_VARS = {
     "Auto Profile": [enable_auto_profile_var, auto_profile_rules_var],
+    "Start Countdown": [start_countdown_seconds_var],
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
     "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
@@ -9655,6 +9685,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.18.0",
+        "date": "2026-10-19",
+        "title": "Custom start countdown",
+        "changes": [
+            "Added: a custom start countdown. The wait before typing begins used to be fixed at 10 seconds. You can now set it from 0 to 60 seconds, so you can have more time to click into the target window, or none at all when the window is already ready.",
+            "Added: a Start Countdown card on the Window tab with one new setting (whole seconds from 0 to 60, 10 by default), saved with your profiles and restored on launch. It has its own Reset This Section button.",
+            "Modified: each file in a batch queue gets the countdown, and the batch time estimate uses the length you chose for each file instead of a fixed 10 seconds.",
+            "Notes: a box that cannot be read as a number goes back to 10, and a number outside 0 to 60 is pulled back into range, with the box corrected to match. Older settings and profile files without this setting load as 10, so nothing changes for them. 0 skips the wait completely. Preview runs still skip the countdown. The short warning after a long session break is separate and unchanged. No new packages.",
+        ],
+    },
+    {
         "version": "5.17.0",
         "date": "2026-10-18",
         "title": "A changing pace across the essay",
@@ -10170,6 +10211,7 @@ frame_file = make_modern_card(tab_input, "Input File")
 
 # --- Tab: Window (keeps typing going to the right place) ---
 frame_window = make_modern_card(tab_window, "Target Window Lock")
+frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
 frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
 frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
 
@@ -10401,6 +10443,23 @@ frame_auto_profile.columnconfigure(0, weight=1)
 refresh_auto_profile_choices()
 refresh_auto_profile_listbox()
 auto_profile_rules_var.trace_add("write", refresh_auto_profile_listbox)
+
+# --- Start countdown (Update #43) ---
+modern_label(frame_start_countdown, "Countdown Before Typing (seconds):").grid(
+    row=0, column=0, sticky="w", padx=(0, 8)
+)
+entry_start_countdown = modern_entry(frame_start_countdown, start_countdown_seconds_var, width=8)
+entry_start_countdown.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_start_countdown,
+    "How long Amanuensis waits after you press Start, so you have time to click "
+    "into the window you want it to type in. Use a whole number from 0 to 60. "
+    "10 is the default, and 0 starts typing right away. With a batch queue, "
+    "each file gets this countdown. Preview skips it.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Activity auto-pause ---
 modern_checkbox(
@@ -11161,6 +11220,7 @@ for _release_index, _release in enumerate(_past_releases):
 # after the card has been fully built above.
 SECTION_CARDS = {
     "Auto Profile": frame_auto_profile,
+    "Start Countdown": frame_start_countdown,
     "Activity Auto-Pause": frame_activity,
     "Typing Speed": frame_settings,
     "Target Time": frame_target_time,
