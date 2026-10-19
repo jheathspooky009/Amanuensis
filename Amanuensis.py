@@ -9,6 +9,28 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.17.0 (2026-10-18) -- A changing pace across the essay
+#   - Added: Essay Pace. A writer does not keep one pace from the first line to
+#     the last. The opening is typed a little slower and stops now and then to
+#     plan. Once the argument is set, the body speeds up. The closing slows down
+#     again, with a few stops to decide how to end. Files of 1,200 characters or
+#     more get this; shorter files are left alone.
+#   - Added: An "Essay Pace" card on the Speed tab with two new settings
+#     (enable_essay_pace, on by default, and essay_pace_strength, 100 by
+#     default, 0 to 200), saved with profiles and restored on launch.
+#   - Modified: The pre-start time estimate includes the speed change and the
+#     average opening and closing pauses. Session break planning measures each
+#     stretch of text by its place in the whole file.
+#   - Notes: The opening is the first 15% of the file and the closing is the last
+#     15%. Speed eases between zones, about 10% slower in the opening, 8% quicker
+#     in the body, and 12% slower in the closing, so the average barely moves.
+#     The pace uses no randomness. Opening and closing pauses are planned once at
+#     sentence starts, only from the resume point on, never in or next to
+#     protected text, never at the very start of the file, and never where
+#     another pause is planned. Only the speed and pauses change, never the
+#     typed text. The log records only counts and spots, never the words. No new
+#     packages.
+#
 # v5.16.0 (2026-10-18) -- Punctuation and formatting habits
 #   - Added: Writing Habits. A writer has habits, and they stay the same all the
 #     way through. Amanuensis now gives each file its own set. The typist may
@@ -57,27 +79,6 @@
 #     through each paragraph. "Draft, then revise" keeps the start of a paragraph
 #     calm and puts one cluster at its end. The log records only how many
 #     clusters were planned, never the words. No new packages.
-#
-# v5.14.0 (2026-10-16) -- Uneven rhythm
-#   - Added: Uneven Rhythm. The typist no longer keeps one steady beat. Everyday
-#     words and familiar phrases (like "of the", "as well as", or "a lot of")
-#     now type about 15% quicker. Names in the middle of a sentence, hard or
-#     technical words, numbers, acronyms, punctuation marks (commas, colons,
-#     brackets, quote marks, question and exclamation marks), and carefully
-#     hedged claims (words like "perhaps" and "might", or phrases like "tends
-#     to" and "in some cases") type about 20 to 30% slower.
-#   - Added: An "Uneven Rhythm" card on the Speed tab with two new settings
-#     (enable_uneven_rhythm, on by default, and rhythm_strength, 100 by default,
-#     0 to 200), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the average change. It is
-#     small, because the quicker and slower parts mostly balance out.
-#   - Notes: Only the speed of a key changes. No pause is added and the typed
-#     text never changes. The text is scanned once before typing (only from the
-#     resume point on) with no randomness, so the estimate uses the very same
-#     plan. Protected text always types at the normal speed. The change is
-#     applied before fatigue drift, together with flow and hesitation, finger
-#     timing, and the common letter pairs. The session log only records how many
-#     characters of each kind were planned, never the words. No new packages.
 #
 # ============================================
 
@@ -2571,7 +2572,9 @@ def estimate_active_seconds(text, settings, protection_mask, pause_map, start, e
     segment = text[start:end]
     segment_mask = protection_mask[start:end]
     marker_seconds = sum(secs for pos, secs in pause_map.items() if start <= pos < end)
-    _words, _chars, seconds = estimate_typing_time(segment, settings, segment_mask, marker_seconds)
+    _words, _chars, seconds = estimate_typing_time(
+        segment, settings, segment_mask, marker_seconds, essay_context=(start, len(text))
+    )
     return seconds
 
 
@@ -3649,6 +3652,167 @@ def estimate_rhythm_shift(text, protection_mask, settings):
 
 
 # --------------------------------------------
+# ESSAY PACE (Update #42)
+# --------------------------------------------
+# A writer does not keep one pace from the first line to the last. The opening
+# takes planning, so it is typed a little slower and stops now and then. Once
+# the argument is set, the body speeds up. The closing slows down again while
+# the writer decides how to end. The zones come from where a character sits in
+# the whole file (first 15% opening, last 15% closing). Speed eases between
+# zones. The pace uses no randomness, so the time estimate uses the same plan.
+# Short files have no real opening or closing, so they are left alone.
+ESSAY_OPENING = "opening"
+ESSAY_CLOSING = "closing"
+ESSAY_MIN_CHARS = 1200
+ESSAY_OPENING_END = 0.15      # the opening is the first 15% of the file
+ESSAY_EASE_IN_END = 0.30      # the body pace is fully reached here
+ESSAY_EASE_OUT_START = 0.75   # slowing toward the closing starts here
+ESSAY_CLOSING_START = 0.85    # the closing is the last 15% of the file
+# Delay multipliers at 100% strength. Above 1.0 is slower, below 1.0 quicker.
+ESSAY_OPENING_SPEED = 1.10
+ESSAY_BODY_SPEED = 0.92
+ESSAY_CLOSING_SPEED = 1.12
+ESSAY_MIN_MULTIPLIER = 0.5
+ESSAY_STRENGTH_MAX = 200.0
+ESSAY_PAUSE_CHANCE = {ESSAY_OPENING: 0.35, ESSAY_CLOSING: 0.40}
+ESSAY_PAUSE_SECONDS = {ESSAY_OPENING: (0.8, 2.2), ESSAY_CLOSING: (1.0, 2.8)}
+ESSAY_STATUS = {
+    ESSAY_OPENING: "Planning the opening...",
+    ESSAY_CLOSING: "Deciding how to end...",
+}
+
+
+def clamp_essay_strength(strength_percent):
+    """Returns the essay pace strength as a float between 0 and ESSAY_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), ESSAY_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_essay_zone(fraction):
+    """Returns ESSAY_OPENING, ESSAY_CLOSING, or None (the body) for a place in
+    the file given as a fraction from 0 to 1."""
+    if fraction < ESSAY_OPENING_END:
+        return ESSAY_OPENING
+    if fraction >= ESSAY_CLOSING_START:
+        return ESSAY_CLOSING
+    return None
+
+
+def get_essay_base_speed(fraction):
+    """The delay multiplier at 100% strength for a place in the file. It eases
+    from the opening pace to the body pace, and from the body pace to the
+    closing pace, so the speed never jumps."""
+    if fraction < ESSAY_OPENING_END:
+        return ESSAY_OPENING_SPEED
+    if fraction < ESSAY_EASE_IN_END:
+        progress = (fraction - ESSAY_OPENING_END) / (ESSAY_EASE_IN_END - ESSAY_OPENING_END)
+        return ESSAY_OPENING_SPEED + (ESSAY_BODY_SPEED - ESSAY_OPENING_SPEED) * progress
+    if fraction < ESSAY_EASE_OUT_START:
+        return ESSAY_BODY_SPEED
+    if fraction < ESSAY_CLOSING_START:
+        progress = (fraction - ESSAY_EASE_OUT_START) / (ESSAY_CLOSING_START - ESSAY_EASE_OUT_START)
+        return ESSAY_BODY_SPEED + (ESSAY_CLOSING_SPEED - ESSAY_BODY_SPEED) * progress
+    return ESSAY_CLOSING_SPEED
+
+
+def get_essay_pace_multiplier(position, total_length, strength_percent):
+    """Returns the delay multiplier for the character at `position` in a file of
+    `total_length` characters (never below ESSAY_MIN_MULTIPLIER). 1.0 means no
+    change, which is also the answer for a file shorter than ESSAY_MIN_CHARS."""
+    if total_length < ESSAY_MIN_CHARS:
+        return 1.0
+    fraction = max(0.0, min(position / total_length, 1.0))
+    strength = clamp_essay_strength(strength_percent) / 100.0
+    base = get_essay_base_speed(fraction)
+    return max(ESSAY_MIN_MULTIPLIER, 1.0 + (base - 1.0) * strength)
+
+
+def plan_essay_pauses(text, protection_mask, start_index=0, skip_positions=(), offset=0, total=None):
+    """Finds the sentence starts in the opening and the closing where the writer
+    may stop to plan. Returns {index of the first character: zone}. Only text
+    from start_index on is planned. Nothing is planned in or next to protected
+    text, at a spot in skip_positions, or at the very start of the file.
+    `offset` and `total` say where `text` sits inside the whole file, for
+    estimates on a stretch of it (the typing loop leaves them alone)."""
+    plan = {}
+    if total is None:
+        total = len(text)
+    if total < ESSAY_MIN_CHARS:
+        return plan
+    for span_start, span_end in find_sentence_spans(text):
+        if span_end <= start_index:
+            continue
+        first = DIFFICULTY_WORD_PATTERN.search(text, span_start, span_end)
+        if first is None:
+            continue
+        position = first.start()
+        zone = get_essay_zone((offset + position) / total)
+        if zone is None or position < start_index or position in skip_positions:
+            continue
+        if offset == 0 and not text[:position].strip():
+            continue
+        if any(protection_mask[max(0, position - 2):first.end()]):
+            continue
+        plan[position] = zone
+    return plan
+
+
+def draw_essay_pause_seconds(zone, strength_percent):
+    """Decides whether this planned spot really pauses and for how long.
+    Returns 0.0 for no pause. The length scales with the Pace Strength."""
+    if strength_percent <= 0 or random.random() >= ESSAY_PAUSE_CHANCE[zone]:
+        return 0.0
+    low, high = ESSAY_PAUSE_SECONDS[zone]
+    return random.uniform(low, high) * (strength_percent / 100.0)
+
+
+def summarize_essay_pause_plan(plan):
+    """Counts the planned spots per zone, for the session log."""
+    counts = {}
+    for zone in plan.values():
+        counts[zone] = counts.get(zone, 0) + 1
+    return counts
+
+
+def estimate_essay_pace_shift(text, protection_mask, settings, offset=0, total=None):
+    """Adds up how much the essay pace changes the typing time of `text`,
+    counted in average per-character delays (negative means faster). Uses the
+    same multipliers the typing loop uses."""
+    if not settings.get("enable_essay_pace", True):
+        return 0.0
+    strength = clamp_essay_strength(settings.get("essay_pace_strength", 100.0))
+    if strength <= 0:
+        return 0.0
+    if total is None:
+        total = len(text)
+    if total < ESSAY_MIN_CHARS:
+        return 0.0
+    shift = 0.0
+    for index in range(len(text)):
+        if protection_mask is not None and protection_mask[index]:
+            continue
+        shift += get_essay_pace_multiplier(offset + index, total, strength) - 1.0
+    return shift
+
+
+def estimate_essay_pause_seconds(text, protection_mask, settings, offset=0, total=None):
+    """Average extra time the opening and closing pauses add to `text`. Uses
+    the same plan, chances, and ranges the typing loop draws from."""
+    if not settings.get("enable_essay_pace", True):
+        return 0.0
+    strength = clamp_essay_strength(settings.get("essay_pace_strength", 100.0)) / 100.0
+    if strength <= 0:
+        return 0.0
+    mask = protection_mask if protection_mask is not None else [False] * len(text)
+    total_seconds = 0.0
+    for zone in plan_essay_pauses(text, mask, 0, (), offset, total).values():
+        total_seconds += ESSAY_PAUSE_CHANCE[zone] * (sum(ESSAY_PAUSE_SECONDS[zone]) / 2.0) * strength
+    return total_seconds
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -4394,6 +4558,8 @@ def type_text(settings, is_batch=False, is_last=True):
     rhythm_strength = settings.get("rhythm_strength", 100.0)
     enable_writing_habits = settings.get("enable_writing_habits", True)
     writing_habit_strength = settings.get("writing_habit_strength", 100.0)
+    enable_essay_pace = settings.get("enable_essay_pace", True)
+    essay_pace_strength = settings.get("essay_pace_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -4502,6 +4668,31 @@ def type_text(settings, is_batch=False, is_last=True):
             habit_chances = {}
             comma_pace_scale = 1.0
             log_event("writing_habits_failed", "could not plan writing habits; typing without them")
+
+    # Essay pace (Update #42): a slower opening and closing that stop now and then
+    # to plan, and a quicker body. The speed comes from where each character sits
+    # in the file. The pauses are planned once, only for text still to be typed,
+    # and never at a spot that already has another pause. Files shorter than
+    # ESSAY_MIN_CHARS are left alone. If planning ever fails, the file is typed
+    # at an even pace.
+    essay_pause_plan = {}
+    essay_pace_on = False
+    if enable_essay_pace and essay_pace_strength > 0 and len(text) >= ESSAY_MIN_CHARS:
+        try:
+            essay_pause_plan = plan_essay_pauses(
+                text, protection_mask, resume_from,
+                set(pause_map) | set(difficulty_plan) | set(decision_plan)
+                | set(burst_plan) | set(habit_plan)
+            )
+            essay_pace_on = True
+            essay_counts = summarize_essay_pause_plan(essay_pause_plan)
+            log_event("essay_pace", "planned " + (", ".join(
+                f"{zone} {count}" for zone, count in sorted(essay_counts.items())
+            ) or "no") + " pause spot(s)")
+        except Exception:
+            essay_pause_plan = {}
+            essay_pace_on = False
+            log_event("essay_pace_failed", "could not plan the essay pace; typing at an even pace")
 
     # Uneven rhythm (Update #40): familiar words and phrases a little quicker;
     # names, technical terms, punctuation, and hedged claims a little slower.
@@ -4890,6 +5081,29 @@ def type_text(settings, is_batch=False, is_last=True):
                     state.status = "Typing..."
 
         # --------------------------------
+        # ESSAY PACE PAUSE (Update #42)
+        # A short stop at a sentence start in the opening (planning) or the
+        # closing (deciding how to end). It runs at the same place as the pauses
+        # above (BEFORE the focus-lock and pause checks), stays stoppable and
+        # pausable, and is not added to paused_duration. Only the spot and zone
+        # (never the text) go in the log.
+        # --------------------------------
+        essay_zone = essay_pause_plan.get(idx)
+        if essay_zone:
+            essay_seconds = draw_essay_pause_seconds(essay_zone, essay_pace_strength)
+            if essay_seconds > 0:
+                state.status = ESSAY_STATUS[essay_zone]
+                log_event("essay_pause", f"{essay_zone} ~{essay_seconds:.1f}s before character {idx}")
+                for _ in range(int(essay_seconds * 10)):
+                    if stop_event.is_set() or pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                if stop_event.is_set():
+                    return
+                if not pause_event.is_set():
+                    state.status = "Typing..."
+
+        # --------------------------------
         # FOCUS-LOCK CHECK (throttled to ~2x/sec so we're not
         # calling into the OS window manager on every keystroke)
         # --------------------------------
@@ -5262,6 +5476,10 @@ def type_text(settings, is_batch=False, is_last=True):
             # punctuation, and hedged claims a little slower (before fatigue)
             delay *= rhythm_multipliers[rhythm_kind]
 
+        if essay_pace_on and not protection_mask[idx]:
+            # Update #42: slower opening and closing, quicker body (before fatigue)
+            delay *= get_essay_pace_multiplier(idx, len(text), essay_pace_strength)
+
         if enable_fatigue:
             delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
             fatigue_chars += 1
@@ -5398,7 +5616,8 @@ def estimate_format_toggle_seconds(prepared, start_index=0):
     return press_count * FORMAT_TOGGLE_ESTIMATE_SECONDS
 
 
-def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seconds=0.0, extra_seconds=0.0):
+def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seconds=0.0, extra_seconds=0.0,
+                         essay_context=None):
     """Rough estimate of total run time for the given text under the
     given settings, using averages of the same ranges type_text()
     actually draws from. This is an estimate, not a simulation --
@@ -5486,6 +5705,13 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     # Writing habits (Update #41): pauses before headings, quotes, and asides,
     # plus quicker or slower commas, averaged the same way.
     total_seconds += estimate_writing_habit_seconds(text, protection_mask, settings)
+
+    # Essay pace (Update #42): slower opening and closing, quicker body, plus the
+    # opening and closing pauses. essay_context is (where this text starts in the
+    # whole file, length of the whole file); it is only given for a stretch.
+    essay_offset, essay_total = essay_context if essay_context else (0, len(text))
+    total_seconds += estimate_essay_pace_shift(text, protection_mask, settings, essay_offset, essay_total) * avg_delay
+    total_seconds += estimate_essay_pause_seconds(text, protection_mask, settings, essay_offset, essay_total)
 
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
@@ -5770,6 +5996,18 @@ def validate_settings():
     except ValueError:
         writing_habit_strength = 100.0
         writing_habit_strength_var.set("100")
+    enable_essay_pace = bool(enable_essay_pace_var.get())
+    try:
+        essay_pace_strength = float(essay_pace_strength_var.get())
+        if not (essay_pace_strength >= 0):  # also catches NaN
+            essay_pace_strength = 0.0
+            essay_pace_strength_var.set("0")
+        elif essay_pace_strength > ESSAY_STRENGTH_MAX:
+            essay_pace_strength = ESSAY_STRENGTH_MAX
+            essay_pace_strength_var.set(f"{ESSAY_STRENGTH_MAX:g}")
+    except ValueError:
+        essay_pace_strength = 100.0
+        essay_pace_strength_var.set("100")
     enable_revision_clusters = bool(enable_revision_clusters_var.get())
     try:
         cluster_strength = float(cluster_strength_var.get())
@@ -5904,6 +6142,8 @@ def validate_settings():
         "rhythm_strength": rhythm_strength,
         "enable_writing_habits": enable_writing_habits,
         "writing_habit_strength": writing_habit_strength,
+        "enable_essay_pace": enable_essay_pace,
+        "essay_pace_strength": essay_pace_strength,
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
         "revision_style": revision_style,
@@ -7480,6 +7720,8 @@ def get_current_settings_snapshot():
         "rhythm_strength": rhythm_strength_var.get(),
         "enable_writing_habits": enable_writing_habits_var.get(),
         "writing_habit_strength": writing_habit_strength_var.get(),
+        "enable_essay_pace": enable_essay_pace_var.get(),
+        "essay_pace_strength": essay_pace_strength_var.get(),
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
         "revision_style": revision_style_var.get(),
@@ -7563,6 +7805,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     rhythm_strength_var.set(str(data.get("rhythm_strength", "100")))
     enable_writing_habits_var.set(bool(data.get("enable_writing_habits", True)))
     writing_habit_strength_var.set(str(data.get("writing_habit_strength", "100")))
+    enable_essay_pace_var.set(bool(data.get("enable_essay_pace", True)))
+    essay_pace_strength_var.set(str(data.get("essay_pace_strength", "100")))
     enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
     cluster_strength_var.set(str(data.get("cluster_strength", "100")))
     revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
@@ -8745,6 +8989,8 @@ enable_uneven_rhythm_var = tk.BooleanVar(value=True)
 rhythm_strength_var = tk.StringVar(value="100")
 enable_writing_habits_var = tk.BooleanVar(value=True)
 writing_habit_strength_var = tk.StringVar(value="100")
+enable_essay_pace_var = tk.BooleanVar(value=True)
+essay_pace_strength_var = tk.StringVar(value="100")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -8848,6 +9094,7 @@ SECTION_RESET_VARS = {
     "Typing Bursts": [enable_typing_bursts_var, burst_pause_strength_var],
     "Decision Pauses": [enable_decision_pauses_var, decision_pause_strength_var],
     "Writing Habits": [enable_writing_habits_var, writing_habit_strength_var],
+    "Essay Pace": [enable_essay_pace_var, essay_pace_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
     "Sentence Reworks & Breaks": [
@@ -9408,6 +9655,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.17.0",
+        "date": "2026-10-18",
+        "title": "A changing pace across the essay",
+        "changes": [
+            "Added: essay pace. A writer does not keep one pace from the first line to the last. The opening is typed a little slower (about 10 percent) and stops now and then to plan. Once the argument is set, the body speeds up (about 8 percent quicker). The closing slows down again (about 12 percent slower) with a few stops to decide how to end. Files of 1,200 characters or more get this, and shorter files are left alone.",
+            "Added: an Essay Pace card on the Speed tab with two new settings (on or off, and Pace Strength from 0 to 200 percent), on by default, saved with your profiles and restored on launch.",
+            "Modified: the pre-start time estimate includes the speed change and the average opening and closing pauses. Session break planning now measures each stretch of text by its place in the whole file.",
+            "Notes: the opening is the first 15 percent of the file and the closing is the last 15 percent. The speed eases between zones so it never jumps, and the quicker body balances the slower ends, so the total time barely moves. The pace uses no randomness. The pauses are planned once before typing starts, only for text that is still to be typed, so resuming works. Protected text always types at the normal speed and never gets a pause, and there is no pause at the very start of the file or where another pause is already planned. Only the speed and pauses change, never the typed text. The session log records only counts and spots, never the words.",
+        ],
+    },
+    {
         "version": "5.16.0",
         "date": "2026-10-18",
         "title": "Punctuation and formatting habits",
@@ -9927,6 +10185,7 @@ frame_difficulty_pauses = make_modern_card(tab_speed, "Difficulty Pauses")
 frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
 frame_decision_pauses = make_modern_card(tab_speed, "Decision Pauses")
 frame_writing_habits = make_modern_card(tab_speed, "Writing Habits")
+frame_essay_pace = make_modern_card(tab_speed, "Essay Pace")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -10425,6 +10684,30 @@ modern_label(
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Essay pace (Update #42) ---
+modern_checkbox(
+    frame_essay_pace, "Change the pace from the opening to the closing", enable_essay_pace_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_essay_pace, "Pace Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_essay_pace_strength = modern_entry(frame_essay_pace, essay_pace_strength_var, width=8)
+entry_essay_pace_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_essay_pace,
+    "A writer does not keep one pace from the first line to the last. The opening "
+    "(the first 15% of the file) is typed a little slower, about 10%, and the "
+    "typist stops now and then to plan. Once the argument is set, the body gets "
+    "quicker, about 8% faster. The closing (the last 15%) slows down again, about "
+    "12% slower, with a few stops to decide how to end.\n\n"
+    "100% is the normal size. Use less for an even pace or more for bigger "
+    "differences (0 to 200). Files shorter than 1,200 characters are left alone. "
+    "Protected text always types at the normal speed and never gets a pause, and "
+    "the time estimate includes the change.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Formatting markers (Update #29) ---
 modern_checkbox(
     frame_format_markers, "Press bold and italic shortcuts for formatting markers", enable_format_markers_var
@@ -10890,6 +11173,7 @@ SECTION_CARDS = {
     "Typing Bursts": frame_typing_bursts,
     "Decision Pauses": frame_decision_pauses,
     "Writing Habits": frame_writing_habits,
+    "Essay Pace": frame_essay_pace,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
