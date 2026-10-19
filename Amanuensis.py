@@ -9,6 +9,29 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.20.0 (2026-10-19) -- Warm-up after breaks
+#   - Added: Warm-Up After Breaks. A typist does not come back from a break at
+#     full speed. After a research break, a long session break, a long pause
+#     marker, a long natural pause, or a long pause by you, the first 20 or so
+#     characters are typed a little slower (about 30% slower on the first key)
+#     and the speed eases back to normal.
+#   - Added: A "Warm-Up After Breaks" card on the Speed tab with two new settings
+#     (enable_warmup, on by default, and warmup_strength, 100 by default, 0 to
+#     200), saved with profiles and restored on launch. It has its own Reset This
+#     Section button.
+#   - Modified: The pre-start time estimate includes the average effect of
+#     research breaks and long paragraph or sentence pauses.
+#   - Notes: A wait of 8 seconds or more starts a warm-up, so the short planned
+#     pauses (difficulty, burst, decision, habit, and essay pauses) never do.
+#     Only speed changes, never the typed text, and no pause is added. Protected
+#     text types at the normal speed but still counts toward the 20 characters.
+#     It stacks with flow and hesitation, essay pace, uneven rhythm, finger
+#     timing, and fatigue. A run or a resume starts with no warm-up. Session
+#     breaks and {{pause:N}} markers are not in the estimate, since they are not
+#     averages. The log records only the reason and the spot, never the words.
+#     Older settings and profile files without these settings load as on at
+#     100%. No new packages.
+#
 # v5.19.0 (2026-10-19) -- Capital letter slips
 #   - Added: Capital letter slips. A typist sometimes lets a letter come out as a
 #     capital in the middle of a word, like "tHe", notices it, and fixes it.
@@ -46,28 +69,6 @@
 #     changes for them. 0 skips the wait completely. Preview runs still skip the
 #     countdown. The short warning after a long session break is separate and
 #     unchanged. No new packages.
-#
-# v5.17.0 (2026-10-18) -- A changing pace across the essay
-#   - Added: Essay Pace. A writer does not keep one pace from the first line to
-#     the last. The opening is typed a little slower and stops now and then to
-#     plan. Once the argument is set, the body speeds up. The closing slows down
-#     again, with a few stops to decide how to end. Files of 1,200 characters or
-#     more get this; shorter files are left alone.
-#   - Added: An "Essay Pace" card on the Speed tab with two new settings
-#     (enable_essay_pace, on by default, and essay_pace_strength, 100 by
-#     default, 0 to 200), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the speed change and the
-#     average opening and closing pauses. Session break planning measures each
-#     stretch of text by its place in the whole file.
-#   - Notes: The opening is the first 15% of the file and the closing is the last
-#     15%. Speed eases between zones, about 10% slower in the opening, 8% quicker
-#     in the body, and 12% slower in the closing, so the average barely moves.
-#     The pace uses no randomness. Opening and closing pauses are planned once at
-#     sentence starts, only from the resume point on, never in or next to
-#     protected text, never at the very start of the file, and never where
-#     another pause is planned. Only the speed and pauses change, never the
-#     typed text. The log records only counts and spots, never the words. No new
-#     packages.
 #
 # ============================================
 
@@ -3826,6 +3827,118 @@ def estimate_essay_pause_seconds(text, protection_mask, settings, offset=0, tota
 
 
 # --------------------------------------------
+# WARM-UP AFTER BREAKS (Update #45)
+# --------------------------------------------
+# A typist does not come back from a break at full speed. After a research
+# break, a long session break, a long pause marker, or any other long wait, the
+# first characters are typed a little slower and the speed eases back to normal.
+# Only speed changes here, so no pauses are added and the typed text never
+# changes. Protected text always types at the normal speed.
+WARMUP_LONG_PAUSE_SECONDS = 8.0   # a wait this long (or longer) starts a warm-up
+WARMUP_CHARS = 20                 # how many characters the warm-up lasts
+WARMUP_SLOWDOWN = 0.30            # at 100% strength the first key is 30% slower
+WARMUP_STRENGTH_MAX = 200.0
+
+
+def clamp_warmup_strength(strength_percent):
+    """Returns the warm-up strength as a float between 0 and WARMUP_STRENGTH_MAX."""
+    try:
+        return max(0.0, min(float(strength_percent), WARMUP_STRENGTH_MAX))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def get_warmup_multiplier(chars_done, strength_percent):
+    """Returns the delay multiplier for a key typed `chars_done` characters after
+    a long break. The first key is the slowest, and the slowdown shrinks in
+    even steps to 1.0 (no change) at WARMUP_CHARS characters."""
+    if chars_done >= WARMUP_CHARS:
+        return 1.0
+    strength = clamp_warmup_strength(strength_percent) / 100.0
+    remaining = (WARMUP_CHARS - max(0, chars_done)) / WARMUP_CHARS
+    return 1.0 + WARMUP_SLOWDOWN * strength * remaining
+
+
+class TypingWarmUp:
+    """Tracks whether the typist is warming up after a long wait and gives a
+    delay multiplier per key."""
+
+    def __init__(self, strength_percent):
+        self.strength = clamp_warmup_strength(strength_percent)
+        self.chars_done = WARMUP_CHARS  # not warming up until a long wait happens
+
+    def note_wait(self, seconds):
+        """Call after any wait. A wait of WARMUP_LONG_PAUSE_SECONDS or more starts
+        a warm-up (or restarts one). Returns True when a warm-up started."""
+        try:
+            long_enough = float(seconds) >= WARMUP_LONG_PAUSE_SECONDS
+        except (ValueError, TypeError):
+            return False
+        if long_enough:
+            self.chars_done = 0
+        return long_enough
+
+    def step(self):
+        """Call once per typed character. Returns the delay multiplier."""
+        multiplier = get_warmup_multiplier(self.chars_done, self.strength)
+        if self.chars_done < WARMUP_CHARS:
+            self.chars_done += 1
+        return multiplier
+
+
+def get_long_pause_share(low, high):
+    """Returns the share (0 to 1) of a pause range, drawn evenly between low and
+    high seconds, that is long enough to start a warm-up."""
+    try:
+        low = float(low)
+        high = float(high)
+    except (ValueError, TypeError):
+        return 0.0
+    if high < low:
+        low, high = high, low
+    if high < WARMUP_LONG_PAUSE_SECONDS:
+        return 0.0
+    if low >= WARMUP_LONG_PAUSE_SECONDS or high == low:
+        return 1.0
+    return (high - WARMUP_LONG_PAUSE_SECONDS) / (high - low)
+
+
+def estimate_warmup_seconds(text, settings, avg_delay):
+    """Average extra time the warm-up adds to `text`. It counts the waits that
+    can be averaged: research breaks, paragraph pauses, and sentence pauses
+    whose range reaches WARMUP_LONG_PAUSE_SECONDS. Session breaks and
+    {{pause:N}} markers are not counted, since they are not averages."""
+    if not settings.get("enable_warmup", True):
+        return 0.0
+    strength = clamp_warmup_strength(settings.get("warmup_strength", 100.0)) / 100.0
+    if strength <= 0:
+        return 0.0
+    events = 0.0
+    newline_count = text.count("\n")
+    events += newline_count * get_long_pause_share(
+        settings.get("paragraph_pause_min", 0), settings.get("paragraph_pause_max", 0)
+    )
+    sentence_ender_count = sum(text.count(c) for c in [".", "!", "?"])
+    events += sentence_ender_count * get_long_pause_share(
+        settings.get("sentence_pause_min", 0), settings.get("sentence_pause_max", 0)
+    )
+    break_min = settings.get("break_min", 0)
+    break_max = settings.get("break_max", 0)
+    if settings.get("enable_breaks") and break_min and break_max:
+        avg_break_interval = (break_min + break_max) / 2
+        if avg_break_interval > 0:
+            events += (newline_count / avg_break_interval) * get_long_pause_share(
+                settings.get("break_duration_min", 0), settings.get("break_duration_max", 0)
+            )
+    # Each warm-up adds a slowdown that starts at WARMUP_SLOWDOWN * strength on
+    # the first key and shrinks in even steps to nothing over WARMUP_CHARS keys.
+    # Added up, that is (WARMUP_CHARS + 1) / 2 times WARMUP_SLOWDOWN * strength
+    # average delays per warm-up.
+    extra_delays = WARMUP_SLOWDOWN * strength * (WARMUP_CHARS + 1) / 2.0
+    return events * extra_delays * avg_delay
+
+
+# --------------------------------------------
 # FATIGUE DRIFT
 # --------------------------------------------
 def get_fatigue_multiplier(chars_since_break, fatigue_strength, ramp_chars=2000):
@@ -4610,6 +4723,8 @@ def type_text(settings, is_batch=False, is_last=True):
     writing_habit_strength = settings.get("writing_habit_strength", 100.0)
     enable_essay_pace = settings.get("enable_essay_pace", True)
     essay_pace_strength = settings.get("essay_pace_strength", 100.0)
+    enable_warmup = settings.get("enable_warmup", True)
+    warmup_strength = settings.get("warmup_strength", 100.0)
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
@@ -4933,6 +5048,16 @@ def type_text(settings, is_batch=False, is_last=True):
     # Like fatigue, a resumed run starts in the normal state.
     typing_mood = TypingMood(typing_mood_strength) if enable_typing_moods and typing_mood_strength > 0 else None
 
+    # Warm-up after breaks (Update #45). None when switched off or at 0%. Like
+    # fatigue and mood, a run (or a resumed run) starts with no warm-up. A long
+    # wait calls note_warm_up(), and the next 20 or so keys type a little slower.
+    # Only the reason and the spot (never the text) go in the log.
+    warm_up = TypingWarmUp(warmup_strength) if enable_warmup and warmup_strength > 0 else None
+
+    def note_warm_up(wait_seconds, reason, from_index):
+        if warm_up is not None and warm_up.note_wait(wait_seconds):
+            log_event("warm_up", f"easing back in after {reason}, from character {from_index}")
+
     # Tracks when we last wrote an autosave checkpoint. Initialized to 0
     # so the first eligible sentence-end immediately saves.
     last_autosave_time = 0.0
@@ -5008,6 +5133,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     fatigue_chars = 0  # a long rest fully recovers from fatigue
                 if typing_mood is not None:
                     typing_mood.reset()  # and the typist starts fresh in the normal state
+                note_warm_up(break_seconds, "a session break", idx)
                 state.status = "Typing..."
             else:
                 log_event("session_break_skipped", "no spare time left for this break")
@@ -5023,6 +5149,7 @@ def type_text(settings, is_batch=False, is_last=True):
             log_event("pause_marker", f"{marker_seconds:g}s before character {idx}")
             if not _wait_for_pause_marker(marker_seconds):
                 return
+            note_warm_up(marker_seconds, "a pause marker", idx)
             state.status = "Typing..."
 
         # --------------------------------
@@ -5198,6 +5325,7 @@ def type_text(settings, is_batch=False, is_last=True):
                         state.status = "Paused"
                 time.sleep(0.2)
             _note_blocked_time(time.time() - block_start)
+            note_warm_up(time.time() - block_start, "a long pause", idx)
             state.status = "Typing..."
 
         # --------------------------------
@@ -5315,6 +5443,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 return
             if not pause_event.is_set():
                 state.status = "Typing..."
+                note_warm_up(thinking_pause, "a long paragraph pause", idx + 1)
 
         # --------------------------------
         # RESEARCH BREAKS
@@ -5338,6 +5467,7 @@ def type_text(settings, is_batch=False, is_last=True):
 
                 state.paused_duration += time.time() - break_start
                 log_event("research_break_end", "")
+                note_warm_up(time.time() - break_start, "a research break", idx + 1)
 
                 if enable_fatigue:
                     # Partly recover from fatigue after a research break
@@ -5543,6 +5673,14 @@ def type_text(settings, is_batch=False, is_last=True):
             # Update #42: slower opening and closing, quicker body (before fatigue)
             delay *= get_essay_pace_multiplier(idx, len(text), essay_pace_strength)
 
+        if warm_up is not None:
+            # Update #45: the first keys after a long break are a little slower and
+            # ease back to normal. Protected text types at the normal speed, but
+            # it still counts toward the warm-up (before fatigue).
+            warm_up_multiplier = warm_up.step()
+            if not protection_mask[idx]:
+                delay *= warm_up_multiplier
+
         if enable_fatigue:
             delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
             fatigue_chars += 1
@@ -5626,6 +5764,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 return
             if not pause_event.is_set():
                 state.status = "Typing..."
+                note_warm_up(sentence_pause, "a long sentence pause", idx + 1)
 
     # The last paragraph has no line break after it, so its second revision
     # pass (if any) happens here, after the last character.
@@ -5775,6 +5914,9 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     essay_offset, essay_total = essay_context if essay_context else (0, len(text))
     total_seconds += estimate_essay_pace_shift(text, protection_mask, settings, essay_offset, essay_total) * avg_delay
     total_seconds += estimate_essay_pause_seconds(text, protection_mask, settings, essay_offset, essay_total)
+
+    # Warm-up after breaks (Update #45): the slower first keys after a long wait.
+    total_seconds += estimate_warmup_seconds(text, settings, avg_delay)
 
     if settings.get("enable_fatigue") and settings.get("fatigue_strength", 0) > 0:
         # Fatigue drift approximate adjustment: as characters are typed, delays gradually
@@ -6072,6 +6214,18 @@ def validate_settings():
     except ValueError:
         essay_pace_strength = 100.0
         essay_pace_strength_var.set("100")
+    enable_warmup = bool(enable_warmup_var.get())
+    try:
+        warmup_strength = float(warmup_strength_var.get())
+        if not (warmup_strength >= 0):  # also catches NaN
+            warmup_strength = 0.0
+            warmup_strength_var.set("0")
+        elif warmup_strength > WARMUP_STRENGTH_MAX:
+            warmup_strength = WARMUP_STRENGTH_MAX
+            warmup_strength_var.set(f"{WARMUP_STRENGTH_MAX:g}")
+    except ValueError:
+        warmup_strength = 100.0
+        warmup_strength_var.set("100")
     # Start countdown (Update #43): whole seconds from 0 to 60. A box that cannot
     # be read as a number goes back to the default, and out-of-range values are
     # pulled back into range, with the box corrected to match.
@@ -6214,6 +6368,8 @@ def validate_settings():
         "writing_habit_strength": writing_habit_strength,
         "enable_essay_pace": enable_essay_pace,
         "essay_pace_strength": essay_pace_strength,
+        "enable_warmup": enable_warmup,
+        "warmup_strength": warmup_strength,
         "start_countdown_seconds": start_countdown_seconds,
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
@@ -7797,6 +7953,8 @@ def get_current_settings_snapshot():
         "writing_habit_strength": writing_habit_strength_var.get(),
         "enable_essay_pace": enable_essay_pace_var.get(),
         "essay_pace_strength": essay_pace_strength_var.get(),
+        "enable_warmup": enable_warmup_var.get(),
+        "warmup_strength": warmup_strength_var.get(),
         "start_countdown_seconds": start_countdown_seconds_var.get(),
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
@@ -7884,6 +8042,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     writing_habit_strength_var.set(str(data.get("writing_habit_strength", "100")))
     enable_essay_pace_var.set(bool(data.get("enable_essay_pace", True)))
     essay_pace_strength_var.set(str(data.get("essay_pace_strength", "100")))
+    enable_warmup_var.set(bool(data.get("enable_warmup", True)))
+    warmup_strength_var.set(str(data.get("warmup_strength", "100")))
     start_countdown_seconds_var.set(
         str(clamp_start_countdown(data.get("start_countdown_seconds", START_COUNTDOWN_DEFAULT)))
     )
@@ -9071,6 +9231,8 @@ enable_writing_habits_var = tk.BooleanVar(value=True)
 writing_habit_strength_var = tk.StringVar(value="100")
 enable_essay_pace_var = tk.BooleanVar(value=True)
 essay_pace_strength_var = tk.StringVar(value="100")
+enable_warmup_var = tk.BooleanVar(value=True)
+warmup_strength_var = tk.StringVar(value="100")
 start_countdown_seconds_var = tk.StringVar(value=str(START_COUNTDOWN_DEFAULT))
 
 enable_target_time_var = tk.BooleanVar(value=False)
@@ -9178,6 +9340,7 @@ SECTION_RESET_VARS = {
     "Decision Pauses": [enable_decision_pauses_var, decision_pause_strength_var],
     "Writing Habits": [enable_writing_habits_var, writing_habit_strength_var],
     "Essay Pace": [enable_essay_pace_var, essay_pace_strength_var],
+    "Warm-Up After Breaks": [enable_warmup_var, warmup_strength_var],
     "Formatting Markers": [enable_format_markers_var],
     "Character Typos": [
         enable_typos_var,
@@ -9743,6 +9906,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.20.0",
+        "date": "2026-10-19",
+        "title": "Warm-up after breaks",
+        "changes": [
+            "Added: warm-up after breaks. A typist does not come back from a break at full speed. After a research break, a long session break, a long pause marker, a long natural pause, or a long pause by you, the first 20 or so characters are typed a little slower (about 30% slower on the first key) and the speed eases back to normal.",
+            "Added: a Warm-Up After Breaks card on the Speed tab with two new settings (on or off, and a strength from 0 to 200 percent, 100 by default), saved with your profiles and restored on launch. It has its own Reset This Section button.",
+            "Modified: the pre-start time estimate includes the average effect of research breaks and long paragraph or sentence pauses.",
+            "Notes: a wait of 8 seconds or more starts a warm-up, so the short planned pauses never do. Only the speed changes, never the typed text, and no pause is added. Protected text types at the normal speed but still counts toward the 20 characters. It stacks with flow and hesitation, essay pace, uneven rhythm, finger timing, and fatigue. A run or a resume starts with no warm-up. Session breaks and pause markers are not in the estimate, since they are not averages. The log records only the reason and the spot, never the words. Older settings and profile files without these settings load as on at 100%.",
+        ],
+    },
+    {
         "version": "5.19.0",
         "date": "2026-10-19",
         "title": "Capital letter slips",
@@ -10297,6 +10471,7 @@ frame_typing_bursts = make_modern_card(tab_speed, "Typing Bursts")
 frame_decision_pauses = make_modern_card(tab_speed, "Decision Pauses")
 frame_writing_habits = make_modern_card(tab_speed, "Writing Habits")
 frame_essay_pace = make_modern_card(tab_speed, "Essay Pace")
+frame_warmup = make_modern_card(tab_speed, "Warm-Up After Breaks")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
@@ -10836,6 +11011,29 @@ modern_label(
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Warm-up after breaks (Update #45) ---
+modern_checkbox(
+    frame_warmup, "Type a little slower right after a long break", enable_warmup_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_warmup, "Warm-Up Strength (%):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_warmup_strength = modern_entry(frame_warmup, warmup_strength_var, width=8)
+entry_warmup_strength.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_warmup,
+    "A typist does not come back from a break at full speed. After a research "
+    "break, a long session break, a long pause marker, or any other wait of 8 "
+    "seconds or more, the first 20 or so characters are typed a little slower "
+    "(about 30% slower on the first key), and the speed eases back to normal.\n\n"
+    "100% is the normal size. Use less for a smaller effect or more for a bigger "
+    "one (0 to 200). Only the speed changes, so no pauses are added. Protected "
+    "text always types at the normal speed, and the time estimate includes the "
+    "average effect of research breaks and long natural pauses.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Formatting markers (Update #29) ---
 modern_checkbox(
     frame_format_markers, "Press bold and italic shortcuts for formatting markers", enable_format_markers_var
@@ -11313,6 +11511,7 @@ SECTION_CARDS = {
     "Decision Pauses": frame_decision_pauses,
     "Writing Habits": frame_writing_habits,
     "Essay Pace": frame_essay_pace,
+    "Warm-Up After Breaks": frame_warmup,
     "Formatting Markers": frame_format_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
