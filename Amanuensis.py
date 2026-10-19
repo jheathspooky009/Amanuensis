@@ -9,6 +9,26 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.19.0 (2026-10-19) -- Capital letter slips
+#   - Added: Capital letter slips. A typist sometimes lets a letter come out as a
+#     capital in the middle of a word, like "tHe", notices it, and fixes it.
+#     Amanuensis now does the same, so some of the regular typos are capital
+#     slips instead of wrong-key slips.
+#   - Added: A "Capital letter slips" checkbox in the Character Typos card on the
+#     Mistakes tab with one new setting (enable_capital_slips, on by default),
+#     saved with profiles and restored on launch. It is part of the existing
+#     Character Typos reset.
+#   - Added: A new kind in Leave Mistakes For Me, "Wrong capital letter", inside
+#     the Typos group. It leaves one capital in the middle of a word, like the
+#     "H" in "tHe", for you to fix, and it shows up in the mistake list.
+#   - Notes: Capital slips share the typo chance, so the number of typos and the
+#     time estimate do not change. About 1 in 5 typos is a capital slip when the
+#     letter allows it. Only plain a to z letters inside a word, never the first
+#     letter, never in protected text. The typed text always ends up the same.
+#     Older settings and profile files without the setting load as on. With
+#     "Use extra typo types" on, the slip is noticed after 1 to 3 more letters,
+#     like the other typos. No new packages.
+#
 # v5.18.0 (2026-10-19) -- Custom start countdown
 #   - Added: Start Countdown. The wait before typing begins used to be fixed at 10
 #     seconds. You can now set it from 0 to 60 seconds, so you can have more time
@@ -48,31 +68,6 @@
 #     another pause is planned. Only the speed and pauses change, never the
 #     typed text. The log records only counts and spots, never the words. No new
 #     packages.
-#
-# v5.16.0 (2026-10-18) -- Punctuation and formatting habits
-#   - Added: Writing Habits. A writer has habits, and they stay the same all the
-#     way through. Amanuensis now gives each file its own set. The typist may
-#     always stop for a moment before an opening parenthesis or a dash used as an
-#     aside, before an opening quotation mark, or before a heading and the first
-#     line under it. Each of those three is "none", "light", or "strong" for the
-#     file, and at least two are always real habits. Commas are typed "quick",
-#     "even", or "slow" (half, normal, or one and a half times the usual comma
-#     pause).
-#   - Added: A "Writing Habits" card on the Speed tab with two new settings
-#     (enable_writing_habits, on by default, and writing_habit_strength, 100 by
-#     default, 0 to 200), saved with profiles and restored on launch.
-#   - Modified: The pre-start time estimate includes the average habit pauses and
-#     the change in comma time. The comma pause in the typing loop now takes the
-#     comma pace into account. Semicolons and colons are unchanged.
-#   - Notes: The habits are worked out from a hash of the final text, with no
-#     fresh random draw, so the estimate, the run, and a resume all agree. Spots
-#     are planned once before typing, only from the resume point on, never in or
-#     next to protected text, never at the very start of the file, and never
-#     where a {{pause}} marker, a difficulty pause, a decision pause, or a burst
-#     pause already sits. A heading is a short line with blank lines around it
-#     that does not end like a sentence, or a line that starts with #. Bullet
-#     lines are never headings. The typed text never changes. The log records the
-#     habit levels, the spot, and the kind, never the words. No new packages.
 #
 # ============================================
 
@@ -1154,7 +1149,8 @@ def describe_smart_fix(source_text, fix, context=24):
 #
 # Kinds of mistakes (three on/off groups):
 #   typos         wrong letter (a neighboring key), swapped letters, doubled
-#                 letter, missing letter, and two words run together
+#                 letter, missing letter, a wrong capital letter, and two
+#                 words run together
 #   commas        a comma that is left out
 #   punctuation   an end-of-sentence period, ? or !, or an apostrophe left out
 #
@@ -1177,6 +1173,7 @@ LEFT_MISTAKE_LABELS = {
     "swapped_letters": "Swapped letters",
     "doubled_letter": "Doubled letter",
     "missing_letter": "Missing letter",
+    "wrong_case": "Wrong capital letter (like tHe)",
     "run_together": "Missing space (two words run together)",
     "missing_comma": "Missing comma",
     "missing_period": "Missing end punctuation",
@@ -1252,6 +1249,9 @@ def _left_letter_kinds(text, index, protection_mask):
     kinds = []
     if char.lower() in QWERTY_ADJACENCY:
         kinds.append("wrong_letter")
+    if "a" <= char <= "z":
+        # Update #44: one capital in the middle of a word, like the H in "tHe"
+        kinds.append("wrong_case")
     if char != previous_char and (index + 1 >= len(text) or text[index + 1] != char):
         kinds.append("doubled_letter")
     if index + 1 < word_end:
@@ -1395,6 +1395,8 @@ def _build_left_mistake(text, kind, start, rng):
     if kind == "wrong_letter":
         wrong = rng.choice(QWERTY_ADJACENCY[char.lower()])
         return start, start + 1, (wrong.upper() if char.isupper() else wrong)
+    if kind == "wrong_case":
+        return start, start + 1, char.upper()
     if kind == "doubled_letter":
         return start, start + 1, char + char
     if kind == "swapped_letters":
@@ -3969,20 +3971,56 @@ class TypingMood:
 # --------------------------------------------
 # TYPO SIMULATION HELPERS
 # --------------------------------------------
-def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos):
+# Update #44: about 1 in 5 typos is a capital letter slip when the letter allows it.
+CAPITAL_SLIP_SHARE = 0.2
+
+
+def _capital_slip_possible(text, idx, protection_mask):
+    """True when text[idx] can come out as a wrong capital (like the H in
+    "tHe"): a plain a to z letter in the middle of a word, never the first
+    letter, and never next to protected text."""
+    char = text[idx]
+    if not ("a" <= char <= "z"):
+        return False
+    if idx == 0 or not text[idx - 1].isalpha():
+        return False
+    return not protection_mask[idx - 1]
+
+
+def _simulate_capital_slip_typo(settings, char, text, idx, protection_mask, use_extra_typos):
+    """Simulates a capital letter slip (Update #44): the letter comes out as a
+    capital, the typist notices, backspaces it, and the caller then types the
+    correct lowercase letter. Timing matches the adjacent-key typo."""
+    _simulate_adjacent_key_typo(
+        settings, char, text, idx, protection_mask, use_extra_typos, capital_slip=True
+    )
+
+
+def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos,
+                                capital_slip=False):
     """Simulates an adjacent-key typo on a QWERTY keyboard.
     When use_extra_typos is False, preserves the original quick wrong-and-backspace behavior.
-    When use_extra_typos is True, types 1-3 lookahead characters before pausing and backspacing."""
-    wrong_char = random.choice(QWERTY_ADJACENCY[char.lower()])
-    if char.isupper():
-        wrong_char = wrong_char.upper()
+    When use_extra_typos is True, types 1-3 lookahead characters before pausing and backspacing.
+    When capital_slip is True, the wrong character is the same letter as a capital
+    instead of a neighboring key (Update #44)."""
+    if capital_slip:
+        wrong_char = char.upper()
+        slip_name = "capital slip"
+    else:
+        wrong_char = random.choice(QWERTY_ADJACENCY[char.lower()])
+        slip_name = "adjacent-key"
+        if char.isupper():
+            wrong_char = wrong_char.upper()
 
     if not use_extra_typos:
         _send_char(settings, wrong_char)
         time.sleep(random.uniform(0.08, 0.25))
         _send_backspace(settings)
         time.sleep(random.uniform(0.05, 0.15))
-        log_event("typo", f"typed '{wrong_char}' instead of '{char}'")
+        if capital_slip:
+            log_event("typo", f"capital slip: typed '{wrong_char}' instead of '{char}'")
+        else:
+            log_event("typo", f"typed '{wrong_char}' instead of '{char}'")
         return
 
     # Extra typos enabled: delayed notice with 1-3 lookahead characters
@@ -4016,7 +4054,7 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
         time.sleep(random.uniform(0.05, 0.12))
 
     time.sleep(random.uniform(0.08, 0.18))
-    log_event("typo", f"adjacent-key: typed '{wrong_char}{lookahead_str}', backspaced to retype '{char}'")
+    log_event("typo", f"{slip_name}: typed '{wrong_char}{lookahead_str}', backspaced to retype '{char}'")
 
 
 def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
@@ -4548,6 +4586,7 @@ def type_text(settings, is_batch=False, is_last=True):
     enable_typos = settings["enable_typos"]
     typo_chance = settings["typo_chance"]
     use_extra_typos = settings.get("use_extra_typos", False)
+    enable_capital_slips = settings.get("enable_capital_slips", True)
     paragraph_pause_min = settings["paragraph_pause_min"]
     paragraph_pause_max = settings["paragraph_pause_max"]
     sentence_pause_min = settings["sentence_pause_min"]
@@ -5405,7 +5444,16 @@ def type_text(settings, is_batch=False, is_last=True):
         if enable_typos and not is_protected and idx not in left_mistake_map:
             can_typo = char.isalpha() or (use_extra_typos and char == " ")
             if can_typo and random.uniform(0, 100) < min(100.0, typo_chance * zone_weight):
-                if not use_extra_typos:
+                if (enable_capital_slips
+                        and _capital_slip_possible(text, idx, protection_mask)
+                        and random.random() < CAPITAL_SLIP_SHARE):
+                    # Capital letter slip (Update #44): takes the place of one
+                    # regular typo, so the typo count does not change.
+                    _simulate_capital_slip_typo(
+                        settings, char, text, idx, protection_mask, use_extra_typos
+                    )
+                    typo_corrected = True
+                elif not use_extra_typos:
                     if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
                         _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, False)
                         typo_corrected = True
@@ -5849,6 +5897,7 @@ def validate_settings():
 
     enable_typos = enable_typos_var.get()
     use_extra_typos = bool(use_extra_typos_var.get())
+    enable_capital_slips = bool(enable_capital_slips_var.get())
     typo_chance = 0.0
     if enable_typos:
         try:
@@ -6189,6 +6238,7 @@ def validate_settings():
         "enable_typos": enable_typos,
         "typo_chance": typo_chance,
         "use_extra_typos": use_extra_typos,
+        "enable_capital_slips": enable_capital_slips,
         "enable_paraphrase": enable_paraphrase,
         "paraphrase_chance": paraphrase_chance,
         "enable_lookback_edit": enable_lookback_edit,
@@ -7709,6 +7759,7 @@ def get_current_settings_snapshot():
         "enable_typos": enable_typos_var.get(),
         "typo_chance": typo_chance_var.get(),
         "use_extra_typos": use_extra_typos_var.get(),
+        "enable_capital_slips": enable_capital_slips_var.get(),
         "enable_paraphrase": enable_paraphrase_var.get(),
         "paraphrase_chance": paraphrase_chance_var.get(),
         "enable_lookback_edit": enable_lookback_edit_var.get(),
@@ -7799,6 +7850,7 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     enable_typos_var.set(data.get("enable_typos", True))
     typo_chance_var.set(data.get("typo_chance", "4"))
     use_extra_typos_var.set(data.get("use_extra_typos", False))
+    enable_capital_slips_var.set(bool(data.get("enable_capital_slips", True)))
     enable_paraphrase_var.set(data.get("enable_paraphrase", True))
     paraphrase_chance_var.set(data.get("paraphrase_chance", "15"))
     enable_lookback_edit_var.set(bool(data.get("enable_lookback_edit", False)))
@@ -9045,6 +9097,7 @@ break_duration_max_var = tk.StringVar(value="180")
 enable_typos_var = tk.BooleanVar(value=True)
 typo_chance_var = tk.StringVar(value="4")
 use_extra_typos_var = tk.BooleanVar(value=False)
+enable_capital_slips_var = tk.BooleanVar(value=True)
 
 enable_paraphrase_var = tk.BooleanVar(value=True)
 paraphrase_chance_var = tk.StringVar(value="15")
@@ -9126,7 +9179,12 @@ SECTION_RESET_VARS = {
     "Writing Habits": [enable_writing_habits_var, writing_habit_strength_var],
     "Essay Pace": [enable_essay_pace_var, essay_pace_strength_var],
     "Formatting Markers": [enable_format_markers_var],
-    "Character Typos": [enable_typos_var, typo_chance_var, use_extra_typos_var],
+    "Character Typos": [
+        enable_typos_var,
+        typo_chance_var,
+        use_extra_typos_var,
+        enable_capital_slips_var,
+    ],
     "Sentence Reworks & Breaks": [
         enable_mistakes_var,
         mistake_min_var,
@@ -9684,6 +9742,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.19.0",
+        "date": "2026-10-19",
+        "title": "Capital letter slips",
+        "changes": [
+            "Added: capital letter slips. A typist sometimes lets a letter come out as a capital in the middle of a word, like \"tHe\", notices it, and fixes it. Amanuensis now does the same, so some of the regular typos are capital slips instead of wrong-key slips.",
+            "Added: a Capital letter slips checkbox in the Character Typos card on the Mistakes tab with one new setting (on by default), saved with your profiles and restored on launch. It is part of the existing Character Typos reset.",
+            "Added: a new kind in Leave Mistakes For Me, Wrong capital letter, inside the Typos group. It leaves one capital in the middle of a word, like the H in \"tHe\", for you to fix, and it shows up in the mistake list.",
+            "Notes: capital slips share the typo chance, so the number of typos and the time estimate do not change. About 1 in 5 typos is a capital slip when the letter allows it. Only plain a to z letters inside a word are used, never the first letter and never protected text. The typed text always ends up the same. Older settings and profile files without this setting load as on. With Use extra typo types on, the slip is noticed after 1 to 3 more letters, like the other typos. No new packages.",
+        ],
+    },
     {
         "version": "5.18.0",
         "date": "2026-10-19",
@@ -10808,6 +10877,16 @@ modern_label(
     "noticed late and corrected after 1-3 extra characters (shares typo chance).",
     kind="muted",
 ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+modern_checkbox(
+    frame_typos, "Capital letter slips", enable_capital_slips_var
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+modern_label(
+    frame_typos,
+    "Now and then a letter inside a word comes out as a capital ('tHe'),\n"
+    "then gets fixed. It takes the place of some typos (shares typo chance).",
+    kind="muted",
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
 # --- Mistake & break frequency ---
 modern_checkbox(
