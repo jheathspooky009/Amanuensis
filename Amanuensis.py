@@ -9,6 +9,30 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.21.0 (2026-10-19) -- Scheduled start
+#   - Added: Scheduled Start. Pick a clock time, check the box, and press Start
+#     Typing. Amanuensis waits until that time and then starts on its own, using
+#     the normal start countdown. A time that has already passed today means the
+#     same time tomorrow.
+#   - Added: A "Scheduled Start" card on the Window tab with two new settings
+#     (enable_scheduled_start, off by default, and scheduled_start_time, 9:00 AM
+#     by default), saved and restored on launch but never saved in shared
+#     profiles. It has a Cancel Scheduled Start button and its own Reset This
+#     Section button. The Stop button and the Stop hotkey also cancel the wait.
+#   - Added: A confirmation before waiting. It shows the exact start time and how
+#     long the wait is, warns when no target window is locked, and warns that the
+#     computer must stay awake and unlocked.
+#   - Notes: While waiting, Amanuensis asks Windows not to go to sleep on its own
+#     (SetThreadExecutionState), and lets go when the wait ends. It cannot stop a
+#     closed lid, a manual Sleep, or a locked screen. If the computer wakes more
+#     than 5 minutes after the start time, the run is cancelled with a message
+#     instead of typing late. The box unchecks itself once the wait ends, so the
+#     next Start types right away. The wait happens once, before the first file
+#     of a batch. The activity watcher ignores mouse movement while waiting.
+#     Preview ignores the schedule. Older settings and profile files without
+#     these settings load as off. The log records only the clock time. No new
+#     packages.
+#
 # v5.20.0 (2026-10-19) -- Warm-up after breaks
 #   - Added: Warm-Up After Breaks. A typist does not come back from a break at
 #     full speed. After a research break, a long session break, a long pause
@@ -52,24 +76,6 @@
 #     "Use extra typo types" on, the slip is noticed after 1 to 3 more letters,
 #     like the other typos. No new packages.
 #
-# v5.18.0 (2026-10-19) -- Custom start countdown
-#   - Added: Start Countdown. The wait before typing begins used to be fixed at 10
-#     seconds. You can now set it from 0 to 60 seconds, so you can have more time
-#     to click into the target window, or none at all when the window is already
-#     ready.
-#   - Added: A "Start Countdown" card on the Window tab with one new setting
-#     (start_countdown_seconds, 10 by default, whole seconds from 0 to 60), saved
-#     with profiles and restored on launch. It has its own Reset This Section
-#     button.
-#   - Modified: Each file in a batch queue gets the countdown. The batch time
-#     estimate uses the chosen length for each file instead of a fixed 10 seconds.
-#   - Notes: A box that cannot be read as a number goes back to 10, and a number
-#     outside 0 to 60 is pulled back into range, with the box corrected to match.
-#     Older settings and profile files without the setting load as 10, so nothing
-#     changes for them. 0 skips the wait completely. Preview runs still skip the
-#     countdown. The short warning after a long session break is separate and
-#     unchanged. No new packages.
-#
 # ============================================
 
 import pyautogui
@@ -90,7 +96,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, filedialog
 from tkinter import messagebox as native_messagebox
@@ -2480,7 +2486,8 @@ def _activity_watcher(sensitivity):
         # a long session break (target time): the person is expected to be away or
         # busy, and may click back into the document when the break is ending.
         if (state.status.startswith("Starting in") or state.status == "Countdown..."
-                or state.status.startswith("Session break")):
+                or state.status.startswith("Session break")
+                or state.status.startswith("Waiting to start")):
             try:
                 last_pos = pyautogui.position()
             except Exception:
@@ -2563,6 +2570,58 @@ def clamp_start_countdown(seconds):
     if not math.isfinite(value):
         return START_COUNTDOWN_DEFAULT
     return int(max(0, min(round(value), START_COUNTDOWN_MAX)))
+
+
+# SCHEDULED START (Update #46): the person picks a clock time and the run waits
+# for it. A time that has already passed today means the same time tomorrow.
+SCHEDULED_START_DEFAULT = "9:00 AM"
+SCHEDULE_GRACE_SECONDS = 300  # a computer that wakes this late (or later) cancels the run
+SCHEDULE_POLL_SECONDS = 0.5  # how often the wait checks the clock and the Stop button
+SCHEDULE_CLOCK_PATTERN = re.compile(r"^(\d{1,2})(?::(\d{2}))?(am|pm)?$")
+
+
+def parse_clock_time(text):
+    """Turns a typed clock time such as '15:30', '3:30 PM', '3pm', or '9 a.m.'
+    into (hour, minute) on a 24-hour clock. Returns None when it cannot be
+    read. A bare number such as '3' is refused, because it could mean 3 AM or
+    3 PM."""
+    if not isinstance(text, str):
+        return None
+    cleaned = re.sub(r"\s+", "", text.strip().lower()).replace(".", "")
+    match = SCHEDULE_CLOCK_PATTERN.match(cleaned)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute_text = match.group(2)
+    suffix = match.group(3)
+    if minute_text is None and suffix is None:
+        return None
+    minute = int(minute_text) if minute_text is not None else 0
+    if minute > 59:
+        return None
+    if suffix:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if suffix == "pm" else 0)
+    elif hour > 23:
+        return None
+    return hour, minute
+
+
+def format_clock_time(hour, minute):
+    """Returns a clock time such as '3:30 PM' (12-hour clock, no leading zero)."""
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{hour % 12 or 12}:{minute:02d} {suffix}"
+
+
+def next_scheduled_datetime(clock, now=None):
+    """Returns the next moment the clock time (hour, minute) happens, as a
+    datetime. A time that is now or already past today means tomorrow."""
+    now = now if now is not None else datetime.now()
+    target = now.replace(hour=clock[0], minute=clock[1], second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
 
 
 def format_duration_text(seconds):
@@ -6232,6 +6291,24 @@ def validate_settings():
     start_countdown_seconds = clamp_start_countdown(start_countdown_seconds_var.get())
     if start_countdown_seconds_var.get().strip() != str(start_countdown_seconds):
         start_countdown_seconds_var.set(str(start_countdown_seconds))
+    # Scheduled start (Update #46): the time must be readable when the box is
+    # checked. While it is unchecked, a bad time just goes back to the default so
+    # it never blocks a normal run or a preview.
+    enable_scheduled_start = bool(enable_scheduled_start_var.get())
+    scheduled_clock = parse_clock_time(scheduled_start_time_var.get())
+    if scheduled_clock is None:
+        if enable_scheduled_start:
+            messagebox.showerror(
+                "Invalid Start Time",
+                "The scheduled start time could not be read.\n\n"
+                "Type a clock time such as 3:30 PM or 15:30 on the Window tab.",
+            )
+            return None
+        scheduled_start_time = SCHEDULED_START_DEFAULT
+    else:
+        scheduled_start_time = format_clock_time(scheduled_clock[0], scheduled_clock[1])
+    if scheduled_start_time_var.get() != scheduled_start_time:
+        scheduled_start_time_var.set(scheduled_start_time)
     enable_revision_clusters = bool(enable_revision_clusters_var.get())
     try:
         cluster_strength = float(cluster_strength_var.get())
@@ -6371,6 +6448,8 @@ def validate_settings():
         "enable_warmup": enable_warmup,
         "warmup_strength": warmup_strength,
         "start_countdown_seconds": start_countdown_seconds,
+        "enable_scheduled_start": enable_scheduled_start,
+        "scheduled_start_time": scheduled_start_time,
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
         "revision_style": revision_style,
@@ -6616,10 +6695,146 @@ def split_target_time_across_files(settings, files, resume_dict):
     return [total_target * chars / total_chars for chars in remaining_chars]
 
 
+ES_CONTINUOUS = 0x80000000  # Windows: keep the request until it is changed
+ES_SYSTEM_REQUIRED = 0x00000001  # Windows: the computer should not sleep on its own
+
+
+def set_keep_awake(keep_awake):
+    """Update #46: while True, asks Windows not to put the computer to sleep on
+    its own (the screen may still turn off). False goes back to normal. The
+    request belongs to the thread that makes it, so the thread that turns it
+    on must also turn it off. Returns True if the request was made."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) if keep_awake else ES_CONTINUOUS
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint32(flags))
+        return True
+    except Exception:
+        return False
+
+
+def confirm_scheduled_start(settings):
+    """Update #46: works out when a scheduled run will begin and asks the person
+    to confirm, with warnings. Returns the start moment as a timestamp (seconds
+    since 1970), or None if they chose to go back."""
+    clock = parse_clock_time(settings.get("scheduled_start_time", ""))
+    if clock is None:
+        return None  # validate_settings() already told the person about a bad time
+    now = datetime.now()
+    target = next_scheduled_datetime(clock, now)
+    wait_seconds = (target - now).total_seconds()
+    day_word = "today" if target.date() == now.date() else "tomorrow"
+    clock_text = format_clock_time(clock[0], clock[1])
+
+    lines = [f"Typing will start {day_word} at {clock_text} (in {format_duration_text(wait_seconds)}).", ""]
+    if not (settings.get("locked_window") and HAS_PYGETWINDOW):
+        lines.append(
+            "No target window is locked. When the time comes, Amanuensis will type into "
+            "whichever window is active then. Lock a window on the Window tab if you want "
+            "it to type in one place only."
+        )
+        lines.append("")
+    lines.append(
+        "Keep the computer awake and unlocked until then. Amanuensis asks Windows not to "
+        "go to sleep on its own, but it cannot stop a closed lid, the Sleep command, or a "
+        f"locked screen. If the computer wakes up more than {SCHEDULE_GRACE_SECONDS // 60} "
+        "minutes after the start time, the run is cancelled instead of typing late."
+    )
+    lines.append("")
+    lines.append(
+        "Leave Amanuensis open. After the start time, the normal start countdown runs, "
+        "so be ready. Use Stop or Cancel Scheduled Start to cancel."
+    )
+    lines.append("")
+    lines.append("Click OK to wait for the start time, or Cancel to go back.")
+    if not messagebox.askokcancel("Confirm Scheduled Start", "\n".join(lines)):
+        return None
+    return target.timestamp()
+
+
+def clear_scheduled_start_flag():
+    """A scheduled start is a one-time request. Once the wait is over, the box is
+    unchecked so the next press of Start types right away."""
+    enable_scheduled_start_var.set(False)
+    save_last_settings()
+
+
+def report_missed_scheduled_start(clock_text):
+    """Runs on the main thread when the computer was not awake at the start time
+    and came back more than SCHEDULE_GRACE_SECONDS late."""
+    stop_typing()
+    state.status = "Scheduled start missed"
+    messagebox.showinfo(
+        "Scheduled Start Missed",
+        f"The computer was not awake at {clock_text}, and it came back more than "
+        f"{SCHEDULE_GRACE_SECONDS // 60} minutes late, so nothing was typed.\n\n"
+        "Press Start Typing again to pick a new time.",
+    )
+
+
+def cancel_scheduled_start():
+    """The Cancel Scheduled Start button (Update #46)."""
+    if state.is_running and state.status.startswith("Waiting to start"):
+        stop_typing()
+        state.status = "Scheduled start cancelled"
+    else:
+        messagebox.showinfo("Nothing To Cancel", "No scheduled start is waiting right now.")
+
+
+def wait_for_scheduled_start(settings):
+    """Update #46: runs on the typing thread before the first file. Waits until
+    the scheduled moment (settings['scheduled_start_at']), keeping the computer
+    awake. Returns True when it is time to start, and False when the person
+    cancelled or the start time was missed. Returns True right away when no
+    start time is scheduled or this is a preview."""
+    target = settings.get("scheduled_start_at", 0.0)
+    if not target or settings.get("preview_mode"):
+        return True
+
+    when = datetime.fromtimestamp(target)
+    clock_text = format_clock_time(when.hour, when.minute)
+    log_event("scheduled_wait", f"waiting for {clock_text}")
+    keep_awake = set_keep_awake(True)
+    missed = False
+    last_text = ""
+    try:
+        while True:
+            if stop_event.is_set() or not state.is_running:
+                return False
+            remaining = target - time.time()
+            if remaining <= 0:
+                # A computer that slept through the start time can wake up hours
+                # late. Typing then would surprise the person, so it is cancelled.
+                missed = -remaining > SCHEDULE_GRACE_SECONDS
+                break
+            text = f"Waiting to start at {clock_text} ({format_duration_text(remaining)} left)"
+            if text != last_text:
+                state.status = text
+                last_text = text
+            time.sleep(min(SCHEDULE_POLL_SECONDS, remaining))
+    finally:
+        if keep_awake:
+            set_keep_awake(False)
+
+    run_on_main_thread(clear_scheduled_start_flag)
+    if missed:
+        log_event("scheduled_missed", f"woke up late for {clock_text}")
+        run_on_main_thread(lambda: report_missed_scheduled_start(clock_text))
+        return False
+    state.status = "Countdown..."
+    log_event("scheduled_start", f"reached {clock_text}")
+    return True
+
+
 def run_typing_worker(settings, files, resume_dict):
     """Processes a list of files sequentially. Each file runs through
     type_text() completely (including its own start countdown).
-    Stops if stop_event is set or if typing is no longer running."""
+    Stops if stop_event is set or if typing is no longer running. A scheduled
+    start (Update #46) is waited for once, before the first file."""
+    if not wait_for_scheduled_start(settings):
+        return
     total_files = len(files)
     target_shares = split_target_time_across_files(settings, files, resume_dict)
     for idx, file_path in enumerate(files):
@@ -6742,6 +6957,15 @@ def start_typing():
     if not confirm_target_time_plan(files_to_run, settings):
         return
 
+    # Scheduled Start (Update #46): ask before anything else happens, so Cancel
+    # leaves everything as it was. The wait itself happens in the worker thread.
+    settings["scheduled_start_at"] = 0.0
+    if settings.get("enable_scheduled_start"):
+        scheduled_at = confirm_scheduled_start(settings)
+        if scheduled_at is None:
+            return
+        settings["scheduled_start_at"] = scheduled_at
+
     resume_dict = {}
     for fpath in files_to_run:
         entry = load_resume_entry(fpath)
@@ -6821,7 +7045,7 @@ def start_typing():
     state.start_time = time.time()
     state.paused_duration = 0.0
     state.wpm = 0
-    state.status = "Countdown..."
+    state.status = "Waiting to start..." if settings.get("scheduled_start_at") else "Countdown..."
     state.logging_enabled = log_enabled_var.get()
     state.log_entries = []
     if auto_profile_used:
@@ -7785,6 +8009,9 @@ def stop_typing():
     global preview_text_widget
     was_running = state.is_running
     was_preview = state.settings.get("preview_mode", False)
+    if state.status.startswith("Waiting to start"):
+        # Stopping during a scheduled wait cancels the schedule (Update #46).
+        enable_scheduled_start_var.set(False)
     state.is_running = False
     stop_event.set()
     pause_event.clear()
@@ -7956,6 +8183,8 @@ def get_current_settings_snapshot():
         "enable_warmup": enable_warmup_var.get(),
         "warmup_strength": warmup_strength_var.get(),
         "start_countdown_seconds": start_countdown_seconds_var.get(),
+        "enable_scheduled_start": enable_scheduled_start_var.get(),
+        "scheduled_start_time": scheduled_start_time_var.get(),
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
         "revision_style": revision_style_var.get(),
@@ -8078,6 +8307,13 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     if include_files:
         enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
         set_auto_profile_rules(data.get("auto_profile_rules", []))
+        # A scheduled start belongs to this computer and this moment, so shared
+        # profiles never carry it (Update #46). Older files load as off.
+        loaded_clock = parse_clock_time(data.get("scheduled_start_time", ""))
+        scheduled_start_time_var.set(
+            format_clock_time(loaded_clock[0], loaded_clock[1]) if loaded_clock else SCHEDULED_START_DEFAULT
+        )
+        enable_scheduled_start_var.set(bool(data.get("enable_scheduled_start", False)))
     if rebind_hotkeys:
         apply_hotkeys()
 
@@ -8100,6 +8336,8 @@ def save_profile():
         profile_data.pop("file_queue", None)
         profile_data.pop("enable_auto_profile", None)
         profile_data.pop("auto_profile_rules", None)
+        profile_data.pop("enable_scheduled_start", None)
+        profile_data.pop("scheduled_start_time", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -8152,6 +8390,8 @@ AUTO_PROFILE_KEEP_KEYS = (
     "file_queue",
     "enable_auto_profile",
     "auto_profile_rules",
+    "enable_scheduled_start",
+    "scheduled_start_time",
 )
 
 
@@ -8916,7 +9156,8 @@ def update_gui():
 
         elapsed = time.time() - state.start_time - state.paused_duration
         elapsed_mins = elapsed / 60
-        if elapsed_mins > 0 and state.chars_typed > 0:
+        if (elapsed_mins > 0 and state.chars_typed > 0
+                and not state.status.startswith("Waiting to start")):
             words_typed = state.chars_typed / 5
             state.wpm = int(words_typed / elapsed_mins)
             wpm_var.set(f"{state.wpm} WPM")
@@ -8951,6 +9192,12 @@ def update_gui():
             next_break_var.set(f"~{state.next_break_paragraphs} paragraphs")
         else:
             next_break_var.set("Disabled")
+
+    # The Scheduled Start card shows the wait on its own line too (Update #46).
+    if state.is_running and state.status.startswith("Waiting to start"):
+        scheduled_status_var.set(state.status)
+    elif scheduled_status_var.get():
+        scheduled_status_var.set("")
 
     if state.is_running and state.left_mistakes:
         status_var.set(f"{state.status}  |  Mistakes left: {len(state.left_mistakes)}")
@@ -9234,6 +9481,9 @@ essay_pace_strength_var = tk.StringVar(value="100")
 enable_warmup_var = tk.BooleanVar(value=True)
 warmup_strength_var = tk.StringVar(value="100")
 start_countdown_seconds_var = tk.StringVar(value=str(START_COUNTDOWN_DEFAULT))
+enable_scheduled_start_var = tk.BooleanVar(value=False)
+scheduled_start_time_var = tk.StringVar(value=SCHEDULED_START_DEFAULT)
+scheduled_status_var = tk.StringVar(value="")
 
 enable_target_time_var = tk.BooleanVar(value=False)
 target_hours_var = tk.StringVar(value="2")
@@ -9321,6 +9571,7 @@ resume_status_var = tk.StringVar(value="")
 SECTION_RESET_VARS = {
     "Auto Profile": [enable_auto_profile_var, auto_profile_rules_var],
     "Start Countdown": [start_countdown_seconds_var],
+    "Scheduled Start": [enable_scheduled_start_var, scheduled_start_time_var],
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
     "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
@@ -9906,6 +10157,17 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.21.0",
+        "date": "2026-10-19",
+        "title": "Scheduled start",
+        "changes": [
+            "Added: scheduled start. Pick a clock time, check the box, and press Start Typing. Amanuensis waits until that time and then starts on its own, using the normal start countdown. A time that has already passed today means the same time tomorrow.",
+            "Added: a Scheduled Start card on the Window tab with two new settings (on or off, and the start time, 9:00 AM by default), saved and restored on launch but never saved in shared profiles. It has a Cancel Scheduled Start button and its own Reset This Section button. The Stop button and the Stop hotkey also cancel the wait.",
+            "Added: a confirmation before waiting. It shows the exact start time and how long the wait is, warns when no target window is locked, and warns that the computer must stay awake and unlocked.",
+            "Notes: while waiting, Amanuensis asks Windows not to go to sleep on its own, and lets go when the wait ends. It cannot stop a closed lid, a manual Sleep, or a locked screen. If the computer wakes more than 5 minutes after the start time, the run is cancelled with a message instead of typing late. The box unchecks itself once the wait ends, so the next Start types right away. The wait happens once, before the first file of a batch. Moving the mouse while waiting does not pause anything. Preview ignores the schedule. Older settings and profile files without these settings load as off. The log records only the clock time. No new packages.",
+        ],
+    },
+    {
         "version": "5.20.0",
         "date": "2026-10-19",
         "title": "Warm-up after breaks",
@@ -10455,6 +10717,7 @@ frame_file = make_modern_card(tab_input, "Input File")
 # --- Tab: Window (keeps typing going to the right place) ---
 frame_window = make_modern_card(tab_window, "Target Window Lock")
 frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
+frame_scheduled_start = make_modern_card(tab_window, "Scheduled Start")
 frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
 frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
 
@@ -10704,6 +10967,34 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Scheduled start (Update #46) ---
+modern_checkbox(
+    frame_scheduled_start, "Start typing at a set time", enable_scheduled_start_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_scheduled_start, "Start Time:").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_scheduled_start = modern_entry(frame_scheduled_start, scheduled_start_time_var, width=12)
+entry_scheduled_start.grid(row=1, column=1, sticky="w")
+
+modern_label(
+    frame_scheduled_start,
+    "Check the box, type a clock time like 3:30 PM or 15:30, and press Start Typing. "
+    "You will be asked to confirm, then Amanuensis waits and starts on its own. A time "
+    "that has already passed today means the same time tomorrow. The start countdown "
+    "above still runs after the start time. Leave this app open and keep the computer "
+    "awake and unlocked. Lock a target window above so it types in the right place. "
+    "Stop also cancels the wait. Preview ignores this.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_label(frame_scheduled_start, textvariable=scheduled_status_var, kind="muted", wraplength=420).grid(
+    row=3, column=0, columnspan=2, sticky="w", pady=(6, 0)
+)
+modern_button(
+    frame_scheduled_start, "Cancel Scheduled Start", cancel_scheduled_start, kind="amber"
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Activity auto-pause ---
 modern_checkbox(
@@ -11498,6 +11789,7 @@ for _release_index, _release in enumerate(_past_releases):
 SECTION_CARDS = {
     "Auto Profile": frame_auto_profile,
     "Start Countdown": frame_start_countdown,
+    "Scheduled Start": frame_scheduled_start,
     "Activity Auto-Pause": frame_activity,
     "Typing Speed": frame_settings,
     "Target Time": frame_target_time,
