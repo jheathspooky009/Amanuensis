@@ -9,6 +9,24 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.22.0 (2026-10-20) -- Starter profiles
+#   - Added: Starter profiles. Four built-in typing styles (Careful student, Fast
+#     typist, Tired late night, and Hands-free dictation) so a new person can start
+#     with a good setup. Pick one in the new Starter Profiles part of the Profiles
+#     card on the Data tab and press Load Starter Profile.
+#   - Added: A short description under the list that changes with the choice, and
+#     a confirmation before anything is replaced.
+#   - Notes: A starter profile sets the typing style (speed, mistakes, breaks,
+#     pauses, and the realism cards) and puts every other typing setting back to
+#     its default. Hotkeys, theme, update settings, the session log, completion
+#     alerts, activity auto-pause, start countdown, target time, the input file
+#     and queue, Auto Profile rules, and the Scheduled Start stay as they are.
+#     The starter profiles live in the code, not in the profiles folder, so they
+#     never show up as files and cannot be changed or damaged. Loading is refused
+#     during a run, and if anything goes wrong the earlier settings are put back.
+#     There are no new settings, so nothing new is saved and older files load the
+#     same way. No new packages.
+#
 # v5.21.0 (2026-10-19) -- Scheduled start
 #   - Added: Scheduled Start. Pick a clock time, check the box, and press Start
 #     Typing. Amanuensis waits until that time and then starts on its own, using
@@ -55,26 +73,6 @@
 #     averages. The log records only the reason and the spot, never the words.
 #     Older settings and profile files without these settings load as on at
 #     100%. No new packages.
-#
-# v5.19.0 (2026-10-19) -- Capital letter slips
-#   - Added: Capital letter slips. A typist sometimes lets a letter come out as a
-#     capital in the middle of a word, like "tHe", notices it, and fixes it.
-#     Amanuensis now does the same, so some of the regular typos are capital
-#     slips instead of wrong-key slips.
-#   - Added: A "Capital letter slips" checkbox in the Character Typos card on the
-#     Mistakes tab with one new setting (enable_capital_slips, on by default),
-#     saved with profiles and restored on launch. It is part of the existing
-#     Character Typos reset.
-#   - Added: A new kind in Leave Mistakes For Me, "Wrong capital letter", inside
-#     the Typos group. It leaves one capital in the middle of a word, like the
-#     "H" in "tHe", for you to fix, and it shows up in the mistake list.
-#   - Notes: Capital slips share the typo chance, so the number of typos and the
-#     time estimate do not change. About 1 in 5 typos is a capital slip when the
-#     letter allows it. Only plain a to z letters inside a word, never the first
-#     letter, never in protected text. The typed text always ends up the same.
-#     Older settings and profile files without the setting load as on. With
-#     "Use extra typo types" on, the slip is noticed after 1 to 3 more letters,
-#     like the other typos. No new packages.
 #
 # ============================================
 
@@ -8583,6 +8581,220 @@ def load_auto_profile(profile_name):
     return True
 
 
+# --------------------------------------------
+# STARTER PROFILES (Update #47)
+# --------------------------------------------
+# A few built-in typing styles so a new person can start with a good setup.
+# They live here in the code, not in the profiles folder, so they never show
+# up as files and cannot be changed or damaged. Each one lists only the
+# settings that differ from the app's defaults. Loading one puts every other
+# typing setting back to its default first. Keys must match the names used by
+# get_current_settings_snapshot(), and values are written the same way the
+# snapshot stores them (text for boxes, True or False for checkboxes).
+STARTER_PROFILES = {
+    "Careful student": {
+        "description": (
+            "A steady, careful pace with thinking pauses, a few typos fixed right away, "
+            "regular sentence reworks, and a second look back at earlier words. Research "
+            "breaks come every few paragraphs."
+        ),
+        "settings": {
+            "min_delay": "0.08",
+            "max_delay": "0.22",
+            "enable_typos": True,
+            "typo_chance": "3",
+            "use_extra_typos": False,
+            "enable_mistakes": True,
+            "mistake_min_words": "80",
+            "mistake_max_words": "160",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "20",
+            "enable_lookback_edit": True,
+            "lookback_edit_chance": "30",
+            "enable_breaks": True,
+            "break_min_paragraphs": "2",
+            "break_max_paragraphs": "4",
+            "break_duration_min_seconds": "45",
+            "break_duration_max_seconds": "120",
+            "paragraph_pause_min": "12",
+            "paragraph_pause_max": "25",
+            "sentence_pause_min": "3",
+            "sentence_pause_max": "6",
+            "difficulty_pause_strength": "120",
+            "decision_pause_strength": "120",
+        },
+    },
+    "Fast typist": {
+        "description": (
+            "Quick, confident typing with short pauses and only a few reworks. Typos are "
+            "noticed a little later, and breaks are short and far apart."
+        ),
+        "settings": {
+            "min_delay": "0.03",
+            "max_delay": "0.09",
+            "enable_typos": True,
+            "typo_chance": "3",
+            "use_extra_typos": True,
+            "enable_mistakes": True,
+            "mistake_min_words": "200",
+            "mistake_max_words": "400",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "5",
+            "enable_breaks": True,
+            "break_min_paragraphs": "5",
+            "break_max_paragraphs": "9",
+            "break_duration_min_seconds": "30",
+            "break_duration_max_seconds": "60",
+            "paragraph_pause_min": "3",
+            "paragraph_pause_max": "6",
+            "sentence_pause_min": "1",
+            "sentence_pause_max": "2",
+            "burst_pause_strength": "60",
+            "difficulty_pause_strength": "60",
+            "decision_pause_strength": "50",
+            "essay_pace_strength": "60",
+        },
+    },
+    "Tired late night": {
+        "description": (
+            "Slow, uneven typing that gets slower over a long run. More typos and reworks, "
+            "second thoughts about earlier words, longer pauses, and long breaks every few "
+            "paragraphs."
+        ),
+        "settings": {
+            "min_delay": "0.10",
+            "max_delay": "0.30",
+            "enable_typos": True,
+            "typo_chance": "6",
+            "use_extra_typos": True,
+            "enable_mistakes": True,
+            "mistake_min_words": "60",
+            "mistake_max_words": "120",
+            "enable_paraphrase": True,
+            "paraphrase_chance": "20",
+            "enable_lookback_edit": True,
+            "lookback_edit_chance": "35",
+            "enable_select_retype": True,
+            "select_retype_chance": "20",
+            "enable_breaks": True,
+            "break_min_paragraphs": "2",
+            "break_max_paragraphs": "4",
+            "break_duration_min_seconds": "90",
+            "break_duration_max_seconds": "240",
+            "paragraph_pause_min": "15",
+            "paragraph_pause_max": "30",
+            "sentence_pause_min": "6",
+            "sentence_pause_max": "10",
+            "enable_fatigue": True,
+            "fatigue_strength": "30",
+            "typing_mood_strength": "140",
+            "warmup_strength": "140",
+            "cluster_strength": "120",
+            "burst_pause_strength": "120",
+            "difficulty_pause_strength": "130",
+            "decision_pause_strength": "130",
+        },
+    },
+    "Hands-free dictation": {
+        "description": (
+            "A steady, even speed with no mistakes, no reworks, and no breaks, for text you "
+            "already prepared with speech-to-text. Every realism setting is off, so the text "
+            "is typed straight through."
+        ),
+        "settings": {
+            "min_delay": "0.06",
+            "max_delay": "0.10",
+            "enable_typos": False,
+            "use_extra_typos": False,
+            "enable_capital_slips": False,
+            "enable_mistakes": False,
+            "enable_paraphrase": False,
+            "enable_lookback_edit": False,
+            "enable_select_retype": False,
+            "enable_overshoot": False,
+            "enable_revision_clusters": False,
+            "enable_breaks": False,
+            "paragraph_pause_min": "1",
+            "paragraph_pause_max": "2",
+            "sentence_pause_min": "0.2",
+            "sentence_pause_max": "0.5",
+            "enable_fatigue": False,
+            "enable_finger_timing": False,
+            "enable_typing_moods": False,
+            "enable_difficulty_pauses": False,
+            "enable_typing_bursts": False,
+            "enable_decision_pauses": False,
+            "enable_uneven_rhythm": False,
+            "enable_writing_habits": False,
+            "enable_essay_pace": False,
+            "enable_warmup": False,
+        },
+    },
+}
+
+# A starter profile never changes these. They belong to the app, this
+# computer, or the current run, not to a typing style.
+STARTER_PROFILE_KEEP_KEYS = AUTO_PROFILE_KEEP_KEYS + (
+    "log_enabled",
+    "enable_notify",
+    "enable_sound",
+    "auto_pause_activity",
+    "activity_sensitivity",
+    "start_countdown_seconds",
+    "enable_target_time",
+    "target_time_hours",
+    "target_time_minutes",
+)
+
+
+def get_starter_profile_names():
+    """The names of the built-in starter profiles, in the order shown."""
+    return list(STARTER_PROFILES)
+
+
+def refresh_starter_profile_description(*_args):
+    """Shows the short description of the chosen starter profile."""
+    profile = STARTER_PROFILES.get(starter_profile_choice_var.get())
+    starter_profile_description_var.set(profile["description"] if profile else "")
+
+
+def load_starter_profile():
+    """Loads the chosen starter profile after asking. Every typing setting not
+    listed in the profile goes back to its default, while the settings in
+    STARTER_PROFILE_KEEP_KEYS stay as they are. If anything goes wrong part
+    way, the earlier settings are put back."""
+    if state.is_running:
+        messagebox.showinfo(
+            "Load Unavailable",
+            "Stop the current run before loading a starter profile.",
+        )
+        return
+    name = starter_profile_choice_var.get()
+    profile = STARTER_PROFILES.get(name)
+    if profile is None:
+        messagebox.showinfo("Pick a Starter Profile", "Choose a starter profile from the list first.")
+        return
+    if not messagebox.askyesno(
+        f"Load {name}",
+        f"Load the '{name}' starter profile?\n\n"
+        "This replaces your current typing settings (speed, mistakes, breaks, pauses, "
+        "and the realism cards).\n"
+        "Your hotkeys, theme, input file, file queue, target time, start countdown, "
+        "scheduled start, Auto Profile rules, and update settings will not change.",
+    ):
+        return
+    backup = get_current_settings_snapshot()
+    merged = {key: backup[key] for key in STARTER_PROFILE_KEEP_KEYS if key in backup}
+    merged.update(profile["settings"])
+    try:
+        apply_settings_snapshot(merged, include_files=False, rebind_hotkeys=False)
+    except (ValueError, TypeError, AttributeError, tk.TclError):
+        apply_settings_snapshot(backup, include_files=False, rebind_hotkeys=False)
+        messagebox.showerror("Load Failed", "The starter profile could not be loaded, so your settings were not changed.")
+        return
+    messagebox.showinfo("Starter Profile Loaded", f"The '{name}' starter profile is now loaded.")
+
+
 def apply_auto_profile_for_start():
     """Runs when Start is pressed, before the settings are checked. Returns
     (keep_starting, profile_name). keep_starting is False only when the person
@@ -9455,6 +9667,11 @@ auto_profile_rules_var = tk.StringVar(value="[]")  # the rules, saved as JSON te
 auto_profile_keyword_var = tk.StringVar(value="")  # new-rule boxes (not saved)
 auto_profile_choice_var = tk.StringVar(value="")
 auto_profile_status_var = tk.StringVar(value="")
+# Starter profiles (Update #47): a screen choice only, never saved.
+starter_profile_choice_var = tk.StringVar(value=get_starter_profile_names()[0])
+starter_profile_description_var = tk.StringVar(value="")
+starter_profile_choice_var.trace_add("write", refresh_starter_profile_description)
+refresh_starter_profile_description()
 auto_pause_activity_var = tk.BooleanVar(value=False)
 activity_sensitivity_var = tk.StringVar(value="20")
 
@@ -10156,6 +10373,16 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.22.0",
+        "date": "2026-10-20",
+        "title": "Starter profiles",
+        "changes": [
+            "Added: starter profiles. Four built-in typing styles (Careful student, Fast typist, Tired late night, and Hands-free dictation) so a new person can start with a good setup. Pick one in the new Starter Profiles part of the Profiles card on the Data tab and press Load Starter Profile.",
+            "Added: a short description under the list that changes with the choice, and a confirmation before anything is replaced.",
+            "Notes: a starter profile sets the typing style (speed, mistakes, breaks, pauses, and the realism cards) and puts every other typing setting back to its default. Hotkeys, theme, update settings, the session log, completion alerts, activity auto-pause, start countdown, target time, the input file and queue, Auto Profile rules, and the Scheduled Start stay as they are. The starter profiles live in the code, not in the profiles folder, so they never show up as files and cannot be changed or damaged. Loading is refused during a run, and if anything goes wrong the earlier settings are put back. There are no new settings, so nothing new is saved and older files load the same way. No new packages.",
+        ],
+    },
     {
         "version": "5.21.0",
         "date": "2026-10-19",
@@ -11674,6 +11901,23 @@ modern_label(
     "Your settings are also remembered automatically between launches --\nuse these only if you want named presets to switch between.",
     kind="muted",
 ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+# Starter profiles (Update #47): built-in typing styles to begin from.
+modern_label(frame_profiles, "Starter profiles (built in, a good place to begin):").grid(
+    row=2, column=0, columnspan=3, sticky="w", pady=(14, 0)
+)
+starter_profile_combo = modern_combobox(frame_profiles, starter_profile_choice_var, width=24)
+starter_profile_combo.configure(values=get_starter_profile_names())
+starter_profile_combo.grid(row=3, column=0, columnspan=2, padx=(0, 8), pady=(4, 8), sticky="w")
+modern_button(frame_profiles, "Load Starter Profile", load_starter_profile).grid(
+    row=3, column=2, pady=(4, 8), sticky="w"
+)
+modern_label(
+    frame_profiles,
+    textvariable=starter_profile_description_var,
+    kind="muted",
+    wraplength=520,
+).grid(row=4, column=0, columnspan=3, sticky="w")
 
 # --- Logging ---
 modern_checkbox(

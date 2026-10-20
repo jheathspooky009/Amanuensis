@@ -40,6 +40,7 @@ Amanuensis reads text from a file and types it into whatever window currently ha
 - **Pre-start time estimate** — preview word/character count and a rough total duration before clicking Start
 - **Session logging** — optional CSV log of mistakes, typos, breaks, and focus changes for QA review
 - **Auto-saved settings** — your last-used setup is restored automatically; named profiles are also available for switching between distinct presets
+- **Starter profiles**: four built-in typing styles on the Data tab (Careful student, Fast typist, Tired late night, and Hands-free dictation) so a new person can start with a good setup. Pick one and press Load Starter Profile. It sets the typing style and puts the other typing settings back to their defaults, and your hotkeys, theme, files, target time, start countdown, scheduled start, Auto Profile rules, and update settings stay as they are
 - **Configurable hotkeys** — remap Start/Pause/Stop; ESC-style safety is always available via the Stop hotkey
 - **Live stats** — WPM, ETA, progress, and countdowns to the next mistake/break, all visible while running
 - **Protected text** — wrap exact text in `[[double brackets]]` (e.g. `[[ACC-4471-2290]]`) to type it with no typos or reworks applied, for account numbers, URLs, or other values that must be exact
