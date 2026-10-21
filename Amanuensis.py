@@ -9,6 +9,24 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.23.0 (2026-10-20) -- App text size
+#   - Added: App Text Size. A new "Text Size" card on the Window tab makes the
+#     text, buttons, boxes, and pop-up windows of the whole app larger, which
+#     helps people who find small text hard to read. Choose 100%, 125%, 150%,
+#     175%, or 200% from the list. 100% is the normal size and the default.
+#   - Added: One new setting (text_size_percent), saved and restored on launch.
+#   - Notes: Like the theme, the new size takes effect the next time Amanuensis
+#     launches, and a message says so. The size belongs to this computer, so
+#     shared profiles never carry it, loading a profile, an Auto Profile, or a
+#     starter profile never changes it, and Reset All Settings leaves it alone.
+#     Older settings and profile files without it load as 100%, and a value that
+#     is not a number goes back to 100%. A number between the choices snaps to
+#     the nearest choice. If a size is too big for the screen, the next launch
+#     warns and picks the largest size that fits, instead of leaving the buttons
+#     cut off. Compact view and the pop-up windows grow with the size. The
+#     scaling comes from CustomTkinter (set_widget_scaling), and the few plain Tk
+#     parts (the file lists and the log table) use scaled fonts. No new packages.
+#
 # v5.22.0 (2026-10-20) -- Starter profiles
 #   - Added: Starter profiles. Four built-in typing styles (Careful student, Fast
 #     typist, Tired late night, and Hands-free dictation) so a new person can start
@@ -50,29 +68,6 @@
 #     Preview ignores the schedule. Older settings and profile files without
 #     these settings load as off. The log records only the clock time. No new
 #     packages.
-#
-# v5.20.0 (2026-10-19) -- Warm-up after breaks
-#   - Added: Warm-Up After Breaks. A typist does not come back from a break at
-#     full speed. After a research break, a long session break, a long pause
-#     marker, a long natural pause, or a long pause by you, the first 20 or so
-#     characters are typed a little slower (about 30% slower on the first key)
-#     and the speed eases back to normal.
-#   - Added: A "Warm-Up After Breaks" card on the Speed tab with two new settings
-#     (enable_warmup, on by default, and warmup_strength, 100 by default, 0 to
-#     200), saved with profiles and restored on launch. It has its own Reset This
-#     Section button.
-#   - Modified: The pre-start time estimate includes the average effect of
-#     research breaks and long paragraph or sentence pauses.
-#   - Notes: A wait of 8 seconds or more starts a warm-up, so the short planned
-#     pauses (difficulty, burst, decision, habit, and essay pauses) never do.
-#     Only speed changes, never the typed text, and no pause is added. Protected
-#     text types at the normal speed but still counts toward the 20 characters.
-#     It stacks with flow and hesitation, essay pace, uneven rhythm, finger
-#     timing, and fatigue. A run or a resume starts with no warm-up. Session
-#     breaks and {{pause:N}} markers are not in the estimate, since they are not
-#     averages. The log records only the reason and the spot, never the words.
-#     Older settings and profile files without these settings load as on at
-#     100%. No new packages.
 #
 # ============================================
 
@@ -2568,6 +2563,26 @@ def clamp_start_countdown(seconds):
     if not math.isfinite(value):
         return START_COUNTDOWN_DEFAULT
     return int(max(0, min(round(value), START_COUNTDOWN_MAX)))
+
+
+# APP TEXT SIZE (Update #48): how large the text and buttons of the whole app
+# are, as a percent of the normal size. Only these choices are allowed, so a
+# damaged settings file can never make the app unusably big or small.
+TEXT_SIZE_CHOICES = (100, 125, 150, 175, 200)
+TEXT_SIZE_DEFAULT = 100
+
+
+def clamp_text_size_percent(value):
+    """Returns the allowed text size percent closest to value. A number between
+    two choices snaps to the nearest one. Anything that is not a usable number
+    (including text like 'big') gives the default."""
+    try:
+        number = float(str(value).strip().rstrip("%"))
+    except (ValueError, TypeError):
+        return TEXT_SIZE_DEFAULT
+    if not math.isfinite(number):
+        return TEXT_SIZE_DEFAULT
+    return min(TEXT_SIZE_CHOICES, key=lambda choice: abs(choice - number))
 
 
 # SCHEDULED START (Update #46): the person picks a clock time and the run waits
@@ -6408,6 +6423,12 @@ def validate_settings():
     if theme not in ("light", "dark"):
         theme = "light"
 
+    # App text size (Update #48): only the allowed choices. A box that cannot be
+    # read goes back to 100%, and a number between choices snaps to the nearest.
+    text_size_percent = clamp_text_size_percent(text_size_percent_var.get())
+    if text_size_percent_var.get() != f"{text_size_percent}%":
+        text_size_percent_var.set(f"{text_size_percent}%")
+
     return {
         "input_path": input_path if not queue_files else queue_files[0],
         "file_queue": queue_files,
@@ -6485,6 +6506,7 @@ def validate_settings():
         "sentence_pause_min": sentence_pause_min,
         "sentence_pause_max": sentence_pause_max,
         "theme": theme,
+        "text_size_percent": text_size_percent,
     }
 
 
@@ -8205,6 +8227,7 @@ def get_current_settings_snapshot():
         "enable_update_check": enable_update_check_var.get(),
         "skipped_update_version": skipped_update_version_var.get(),
         "theme": theme_var.get(),
+        "text_size_percent": clamp_text_size_percent(text_size_percent_var.get()),
     }
 
 
@@ -8303,6 +8326,11 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     if include_files and "file_queue" in data and isinstance(data["file_queue"], (list, tuple)):
         file_queue_var.set(list(data["file_queue"]))
     if include_files:
+        # The text size belongs to this computer, so shared profiles never carry
+        # it (Update #48). Older files load as 100%.
+        text_size_percent_var.set(
+            f"{clamp_text_size_percent(data.get('text_size_percent', TEXT_SIZE_DEFAULT))}%"
+        )
         enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
         set_auto_profile_rules(data.get("auto_profile_rules", []))
         # A scheduled start belongs to this computer and this moment, so shared
@@ -8336,6 +8364,7 @@ def save_profile():
         profile_data.pop("auto_profile_rules", None)
         profile_data.pop("enable_scheduled_start", None)
         profile_data.pop("scheduled_start_time", None)
+        profile_data.pop("text_size_percent", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -8390,6 +8419,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "auto_profile_rules",
     "enable_scheduled_start",
     "scheduled_start_time",
+    "text_size_percent",
 )
 
 
@@ -8779,7 +8809,7 @@ def load_starter_profile():
         f"Load the '{name}' starter profile?\n\n"
         "This replaces your current typing settings (speed, mistakes, breaks, pauses, "
         "and the realism cards).\n"
-        "Your hotkeys, theme, input file, file queue, target time, start countdown, "
+        "Your hotkeys, theme, text size, input file, file queue, target time, start countdown, "
         "scheduled start, Auto Profile rules, and update settings will not change.",
     ):
         return
@@ -8886,7 +8916,7 @@ def reset_to_defaults():
         "Reset All Settings",
         "Reset all settings to their default values?\n\n"
         "This will overwrite whatever you currently have entered.\n"
-        "Your theme, input file, and file queue will not change.",
+        "Your theme, text size, input file, and file queue will not change.",
     ):
         return
     for section_name in SECTION_DEFAULTS:
@@ -9271,12 +9301,18 @@ MIN_WINDOW_HEIGHT = 620
 SCREEN_MARGIN_WIDTH = 40         # space always left free at the sides of the screen
 SCREEN_MARGIN_HEIGHT = 100       # room for the title bar and the Windows taskbar
 TAB_SCROLLBAR_ALLOWANCE = 80     # scrollbar + notebook + card padding around tab content
+TEXT_SIZE_TAB_BAR_HEIGHT = 60    # the row of tab buttons, at the normal text size
+TEXT_SIZE_MIN_TAB_AREA = 220     # the least room the tab content needs to stay usable
 
 full_view_size = (PREFERRED_WINDOW_WIDTH, PREFERRED_WINDOW_HEIGHT)
 full_view_min = (480, MIN_WINDOW_HEIGHT)
 compact_view_size = (440, 460)
 
 compact_mode_active = False
+
+# Set by calculate_window_sizes() when the chosen text size is too big for this
+# screen (Update #48): (needed width, fixed height, max width, max height).
+text_size_fit_report = None
 
 
 def calculate_window_sizes():
@@ -9286,7 +9322,7 @@ def calculate_window_sizes():
     size to the window, and centers it on the screen. Sizes are capped
     to the screen so the window can never open bigger than the display.
     Call this once, after every widget has been created."""
-    global full_view_size, full_view_min, compact_view_size
+    global full_view_size, full_view_min, compact_view_size, text_size_fit_report
 
     window.update_idletasks()
     screen_w = window.winfo_screenwidth()
@@ -9296,7 +9332,9 @@ def calculate_window_sizes():
 
     # The tabs scroll vertically only, so the window must be wide enough
     # to show the widest tab, the footer buttons, and the header.
-    tabs_w = max(frame.winfo_reqwidth() for frame in tab_frames.values()) + TAB_SCROLLBAR_ALLOWANCE
+    tabs_w = max(frame.winfo_reqwidth() for frame in tab_frames.values()) + int(
+        TAB_SCROLLBAR_ALLOWANCE * TEXT_SCALE
+    )
     footer_w = footer.winfo_reqwidth() + 24    # footer has 12px padding on each side
     header_w = header.winfo_reqwidth()
     notebook_w = notebook.winfo_reqwidth() + 24    # the row of tab titles must fit as well
@@ -9312,10 +9350,48 @@ def calculate_window_sizes():
     compact_h = min(header.winfo_reqheight() + footer.winfo_reqheight() + 20, max_h)
     compact_view_size = (compact_w, compact_h)
 
+    # Text size (Update #48): note when the chosen size is too big for this
+    # screen, so fit_text_size_to_screen() can warn and step down. Nothing is
+    # measured at the normal size.
+    if TEXT_SCALE > 1.0:
+        fixed_h = (
+            header.winfo_reqheight()
+            + footer.winfo_reqheight()
+            + int(TEXT_SIZE_TAB_BAR_HEIGHT * TEXT_SCALE)
+        )
+        if needed_w > max_w or fixed_h + TEXT_SIZE_MIN_TAB_AREA > max_h:
+            text_size_fit_report = (needed_w, fixed_h, max_w, max_h)
     x = max((screen_w - full_w) // 2, 0)
     y = max((screen_h - full_h) // 2 - 30, 0)
     window.minsize(*full_view_min)
     window.geometry(f"{full_w}x{full_h}+{x}+{y}")
+
+
+def fit_text_size_to_screen():
+    """Runs once, just after the window is shown. If the saved text size made
+    the interface too big for this screen, picks the largest smaller size that
+    should fit, saves it for the next launch, and says so. Does nothing when the
+    size fits, which is almost always."""
+    if text_size_fit_report is None:
+        return
+    needed_w, fixed_h, max_w, max_h = text_size_fit_report
+    fallback = TEXT_SIZE_DEFAULT
+    for choice in sorted(TEXT_SIZE_CHOICES, reverse=True):
+        if choice >= startup_text_size:
+            continue
+        ratio = choice / startup_text_size
+        if needed_w * ratio <= max_w and fixed_h * ratio + TEXT_SIZE_MIN_TAB_AREA <= max_h:
+            fallback = choice
+            break
+    text_size_percent_var.set(f"{fallback}%")
+    save_last_settings()
+    messagebox.showinfo(
+        "Text Size Too Large",
+        f"The {startup_text_size}% text size is too big for this screen, so parts of "
+        "Amanuensis may be cut off.\n\n"
+        f"The text size was changed to {fallback}%. Close and reopen Amanuensis to "
+        "use it. You can pick another size on the Window tab.",
+    )
 
 
 def toggle_compact_mode():
@@ -9338,6 +9414,22 @@ def toggle_compact_mode():
         window.geometry(f"{compact_view_size[0]}x{compact_view_size[1]}")
         btn_compact_toggle.configure(text="Full View")
         compact_mode_active = True
+
+
+def on_text_size_chosen(_choice=None):
+    """Runs when a text size is picked in the Text Size card. Saves it right
+    away. Like the theme, the new size shows up the next time Amanuensis
+    launches, since every widget is sized when it is built."""
+    chosen = clamp_text_size_percent(_choice if _choice is not None else text_size_percent_var.get())
+    text_size_percent_var.set(f"{chosen}%")
+    save_last_settings()
+    if chosen == startup_text_size:
+        messagebox.showinfo("Text Size", f"Text size is {chosen}%, the size you are using now.")
+        return
+    messagebox.showinfo(
+        "Text Size Changed",
+        f"Text size set to {chosen}%.\n\nThis will take effect the next time you launch Amanuensis.",
+    )
 
 
 def toggle_theme():
@@ -9441,6 +9533,23 @@ try:
 except Exception:
     startup_theme = "light"
 
+# Startup text size check (Update #48): read straight from last_settings.json
+# before any widget is built, just like the theme above. CustomTkinter scales
+# every modern widget and font by this number, so the size applies on launch.
+# TEXT_SCALE is 1.0 at the normal size, and nothing below changes at 1.0.
+startup_text_size = TEXT_SIZE_DEFAULT
+try:
+    if os.path.exists(LAST_SETTINGS_PATH):
+        with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as _f:
+            startup_text_size = clamp_text_size_percent(
+                json.load(_f).get("text_size_percent", TEXT_SIZE_DEFAULT)
+            )
+except Exception:
+    startup_text_size = TEXT_SIZE_DEFAULT
+TEXT_SCALE = startup_text_size / 100.0
+if TEXT_SCALE != 1.0:
+    ctk.set_widget_scaling(TEXT_SCALE)
+
 LIGHT_PALETTE = {
     "bg": "#eef1f5",
     "panel_bg": "#ffffff",
@@ -9487,13 +9596,19 @@ DARK_PALETTE = {
 
 PALETTE = DARK_PALETTE if startup_theme == "dark" else LIGHT_PALETTE
 
-FONT_BODY = ("Segoe UI", 9)
-FONT_BODY_BOLD = ("Segoe UI", 9, "bold")
-FONT_HEADER = ("Segoe UI", 10, "bold")
-FONT_TITLE = ("Segoe UI", 14, "bold")
-FONT_SUBTITLE = ("Segoe UI", 9)
-FONT_STAT = ("Segoe UI", 12, "bold")
-FONT_STATUS = ("Segoe UI", 10, "bold")
+
+def scaled_font_size(points):
+    """A plain Tk font size made larger or smaller by the text size setting."""
+    return max(1, int(round(points * TEXT_SCALE)))
+
+
+FONT_BODY = ("Segoe UI", scaled_font_size(9))
+FONT_BODY_BOLD = ("Segoe UI", scaled_font_size(9), "bold")
+FONT_HEADER = ("Segoe UI", scaled_font_size(10), "bold")
+FONT_TITLE = ("Segoe UI", scaled_font_size(14), "bold")
+FONT_SUBTITLE = ("Segoe UI", scaled_font_size(9))
+FONT_STAT = ("Segoe UI", scaled_font_size(12), "bold")
+FONT_STATUS = ("Segoe UI", scaled_font_size(10), "bold")
 
 window = tk.Tk()
 window.title("Amanuensis")
@@ -9644,7 +9759,8 @@ style.configure(
     foreground=PALETTE["text"],
     fieldbackground=PALETTE["input_bg"],
     borderwidth=0,
-    rowheight=26,
+    rowheight=int(round(26 * TEXT_SCALE)),
+    font=FONT_BODY,
 )
 style.configure(
     "Treeview.Heading",
@@ -9652,11 +9768,13 @@ style.configure(
     foreground=PALETTE["text"],
     relief="flat",
     borderwidth=0,
+    font=FONT_BODY,
 )
 
 
 # Variables
 theme_var = tk.StringVar(value=startup_theme)
+text_size_percent_var = tk.StringVar(value=f"{startup_text_size}%")
 input_path_var = tk.StringVar(value="input.txt")
 file_queue_var = tk.Variable(value=[])
 
@@ -10128,8 +10246,24 @@ def modern_progressbar(parent, percent_var):
     return bar
 
 
+def scale_popup_size(width, height):
+    """Makes a pop-up window size bigger to match the text size, never bigger
+    than the screen (Update #48). Unchanged at the normal text size."""
+    if TEXT_SCALE <= 1.0:
+        return width, height
+    max_w = max(window.winfo_screenwidth() - SCREEN_MARGIN_WIDTH, 300)
+    max_h = max(window.winfo_screenheight() - SCREEN_MARGIN_HEIGHT, 300)
+    return min(int(width * TEXT_SCALE), max_w), min(int(height * TEXT_SCALE), max_h)
+
+
 def modern_toplevel(parent, title, size, min_size):
     """A rounded-look pop-up window (Preview Run, Session Log Viewer)."""
+    try:
+        width, height = (int(part) for part in size.split("x"))
+        size = "{}x{}".format(*scale_popup_size(width, height))
+    except ValueError:
+        pass  # an unusual size text is used as it is
+    min_size = scale_popup_size(*min_size)
     top = ctk.CTkToplevel(parent, fg_color=PALETTE["bg"])
     top.title(title)
     top.geometry(size)
@@ -10373,6 +10507,16 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.23.0",
+        "date": "2026-10-20",
+        "title": "App text size",
+        "changes": [
+            "Added: app text size. A new Text Size card on the Window tab makes the text, buttons, boxes, and pop-up windows of the whole app larger, which helps people who find small text hard to read. Choose 100%, 125%, 150%, 175%, or 200%. 100% is the normal size and the default.",
+            "Added: one new setting (the text size), saved and restored on launch.",
+            "Notes: like the theme, the new size takes effect the next time Amanuensis launches, and a message says so. The size belongs to this computer, so shared profiles never carry it, loading a profile, an Auto Profile, or a starter profile never changes it, and Reset All Settings leaves it alone. Older settings and profile files without it load as 100%, and a value that is not a number goes back to 100%. If a size is too big for the screen, the next launch warns and picks the largest size that fits, instead of leaving the buttons cut off. Compact view and the pop-up windows grow with the size. No new packages.",
+        ],
+    },
     {
         "version": "5.22.0",
         "date": "2026-10-20",
@@ -10947,6 +11091,7 @@ frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
 frame_scheduled_start = make_modern_card(tab_window, "Scheduled Start")
 frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
 frame_activity = make_modern_card(tab_window, "Activity Auto-Pause")
+frame_text_size = make_modern_card(tab_window, "Text Size")
 
 # --- Tab: Speed (how fast and how steadily it types) ---
 frame_settings = make_modern_card(tab_speed, "Typing Speed")
@@ -11222,6 +11367,23 @@ modern_label(frame_scheduled_start, textvariable=scheduled_status_var, kind="mut
 modern_button(
     frame_scheduled_start, "Cancel Scheduled Start", cancel_scheduled_start, kind="amber"
 ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# --- Text size (Update #48) ---
+modern_label(frame_text_size, "App Text Size:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+text_size_combo = modern_combobox(frame_text_size, text_size_percent_var, width=10)
+text_size_combo.configure(values=[f"{choice}%" for choice in TEXT_SIZE_CHOICES], command=on_text_size_chosen)
+text_size_combo.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_text_size,
+    "Makes the text, buttons, boxes, and pop-up windows of the whole app larger. "
+    "100% is the normal size. The new size is saved right away and takes effect the "
+    "next time you launch Amanuensis. If a size is too big for your screen, the next "
+    "launch picks the largest size that fits. This setting stays on this computer: "
+    "profiles do not carry it, and Reset All Settings does not change it.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Activity auto-pause ---
 modern_checkbox(
@@ -12095,4 +12257,5 @@ window.after(UPDATE_STARTUP_DELAY_MS, run_startup_update_check)
 window.after(UPDATE_CLEANUP_DELAY_MS, cleanup_update_leftovers)
 window.after(500, update_gui)
 window.after(50, process_gui_queue)
+window.after(900, fit_text_size_to_screen)
 window.mainloop()
