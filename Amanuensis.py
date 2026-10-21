@@ -9,6 +9,17 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.23.1 (2026-10-21) -- Shorter README
+#   - Modified: The README now lists only the key features, in a short Key
+#     features section. The full list of every feature and setting moved to
+#     docs/FEATURES.md, and the README links to it.
+#   - Added: docs/FEATURES.md, with all the features grouped by topic. It also
+#     lists two features the README had left out (Warm-up after breaks and
+#     Writing habits).
+#   - Notes: Nothing in the app itself changed, so no settings changed and older
+#     files load the same way. The version in pyproject.toml and uv.lock was
+#     still 5.22.0, and is now 5.23.1 to match this history. No new packages.
+#
 # v5.23.0 (2026-10-20) -- App text size
 #   - Added: App Text Size. A new "Text Size" card on the Window tab makes the
 #     text, buttons, boxes, and pop-up windows of the whole app larger, which
@@ -44,30 +55,6 @@
 #     during a run, and if anything goes wrong the earlier settings are put back.
 #     There are no new settings, so nothing new is saved and older files load the
 #     same way. No new packages.
-#
-# v5.21.0 (2026-10-19) -- Scheduled start
-#   - Added: Scheduled Start. Pick a clock time, check the box, and press Start
-#     Typing. Amanuensis waits until that time and then starts on its own, using
-#     the normal start countdown. A time that has already passed today means the
-#     same time tomorrow.
-#   - Added: A "Scheduled Start" card on the Window tab with two new settings
-#     (enable_scheduled_start, off by default, and scheduled_start_time, 9:00 AM
-#     by default), saved and restored on launch but never saved in shared
-#     profiles. It has a Cancel Scheduled Start button and its own Reset This
-#     Section button. The Stop button and the Stop hotkey also cancel the wait.
-#   - Added: A confirmation before waiting. It shows the exact start time and how
-#     long the wait is, warns when no target window is locked, and warns that the
-#     computer must stay awake and unlocked.
-#   - Notes: While waiting, Amanuensis asks Windows not to go to sleep on its own
-#     (SetThreadExecutionState), and lets go when the wait ends. It cannot stop a
-#     closed lid, a manual Sleep, or a locked screen. If the computer wakes more
-#     than 5 minutes after the start time, the run is cancelled with a message
-#     instead of typing late. The box unchecks itself once the wait ends, so the
-#     next Start types right away. The wait happens once, before the first file
-#     of a batch. The activity watcher ignores mouse movement while waiting.
-#     Preview ignores the schedule. Older settings and profile files without
-#     these settings load as off. The log records only the clock time. No new
-#     packages.
 #
 # ============================================
 
@@ -10507,6 +10494,16 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.23.1",
+        "date": "2026-10-21",
+        "title": "Shorter README",
+        "changes": [
+            "Modified: the README now lists only the key features, in a short Key features section. The full list of every feature and setting moved to docs/FEATURES.md, and the README links to it.",
+            "Added: docs/FEATURES.md, with all the features grouped by topic. It also lists two features the README had left out (Warm-up after breaks and Writing habits).",
+            "Notes: nothing in the app itself changed, so no settings changed and older files load the same way. The version in pyproject.toml and uv.lock was still 5.22.0, and is now 5.23.1 to match this history. No new packages.",
+        ],
+    },
     {
         "version": "5.23.0",
         "date": "2026-10-20",
