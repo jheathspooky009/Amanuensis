@@ -9,6 +9,27 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.25.0 (2026-10-22) -- Check typed text
+#   - Added: Typed text check. When a run finishes, Amanuensis compares the text
+#     that is really on screen with the text it meant to type, and opens a Typed
+#     Text Check report if anything differs (line number, what is on screen, and
+#     what it should be). A preview run is always checked by reading the Preview
+#     Run box, with no keys and no clipboard. For a real run, the new Check Typed
+#     Text card on the Hotkeys tab (off by default) copies everything before the
+#     cursor in the target window (Ctrl+Shift+Home, then Ctrl+C), compares it,
+#     collapses the selection with Right, and puts the earlier clipboard text back.
+#   - Added: One new setting (check_typed_text), saved and restored on launch, with
+#     its own Reset This Section button, and a View Last Text Check button.
+#   - Notes: Purposely left mistakes (Leave Mistakes For Me) are expected, so they
+#     are not counted as differences. Text already in the document before the
+#     cursor is ignored. Curly quotes, non-breaking spaces, and spaces at the very
+#     end count as the same text. The check is skipped with a message if the target
+#     window is not in front or copying is blocked, and it never changes the typed
+#     text. The log records only counts and line numbers, never the text. The
+#     setting belongs to this computer, so shared profiles, Auto Profiles, and
+#     starter profiles never carry or change it. No new packages (difflib is
+#     part of Python).
+#
 # v5.24.0 (2026-10-21) -- Skip a research break
 #   - Added: Skip Break. While a research break is counting down, press the new
 #     Skip Break button in the footer (or the Skip Break hotkey, Ctrl+Alt+B by
@@ -35,24 +56,6 @@
 #     files load the same way. The version in pyproject.toml and uv.lock was
 #     still 5.22.0, and is now 5.23.1 to match this history. No new packages.
 #
-# v5.23.0 (2026-10-20) -- App text size
-#   - Added: App Text Size. A new "Text Size" card on the Window tab makes the
-#     text, buttons, boxes, and pop-up windows of the whole app larger, which
-#     helps people who find small text hard to read. Choose 100%, 125%, 150%,
-#     175%, or 200% from the list. 100% is the normal size and the default.
-#   - Added: One new setting (text_size_percent), saved and restored on launch.
-#   - Notes: Like the theme, the new size takes effect the next time Amanuensis
-#     launches, and a message says so. The size belongs to this computer, so
-#     shared profiles never carry it, loading a profile, an Auto Profile, or a
-#     starter profile never changes it, and Reset All Settings leaves it alone.
-#     Older settings and profile files without it load as 100%, and a value that
-#     is not a number goes back to 100%. A number between the choices snaps to
-#     the nearest choice. If a size is too big for the screen, the next launch
-#     warns and picks the largest size that fits, instead of leaving the buttons
-#     cut off. Compact view and the pop-up windows grow with the size. The
-#     scaling comes from CustomTkinter (set_widget_scaling), and the few plain Tk
-#     parts (the file lists and the log table) use scaled fonts. No new packages.
-#
 # ============================================
 
 import pyautogui
@@ -66,6 +69,7 @@ import json
 import csv
 import os
 import sys
+import difflib
 import hashlib
 import math
 import subprocess
@@ -182,6 +186,7 @@ class TyperState:
         self.lookback_pending = None  # second revision pass in progress: {draft, original, stage} (Update #34)
         self.select_retype_pending = None  # select and retype in progress: {draft, original} (Update #35)
         self.in_research_break = False  # True only while a research break is counting down (Update #50)
+        self.text_check_results = []  # one record per file checked after typing (Update #51)
 
 
 state = TyperState()
@@ -2133,6 +2138,400 @@ def prefer_cluster_candidates(candidates, cluster_flags):
         return candidates
     inside = [item for item in candidates if item[0] < len(cluster_flags) and cluster_flags[item[0]]]
     return inside or candidates
+
+
+# --------------------------------------------
+# CHECK TYPED TEXT (Update #51)
+# --------------------------------------------
+# After a run finishes, the text that really ended up on screen is compared with
+# the text Amanuensis meant to type. A preview run is always checked (the Preview
+# Run box is read directly). A real run is checked only when the person turns on
+# "Check typed text" (the Hotkeys tab): Amanuensis selects everything before the
+# cursor in the target window, copies it, and compares the copy. The comparison
+# itself (below) is plain text work with no windows or keys, so it is easy to test.
+CHECK_CONTEXT_CHARS = 20            # characters of text shown on each side of a difference
+CHECK_MAX_DIFFERENCES_SHOWN = 25    # most differences listed in the report
+CHECK_MAX_PIECE_CHARS = 60          # longest piece of text shown for one difference
+CHECK_MAX_CHAR_DIFF_CELLS = 4000000  # bigger blocks are reported as one difference
+CHECK_MERGE_GAP_CHARS = 2           # changes this close together count as one difference
+CHECK_SETTLE_SECONDS = 1.0          # let the editor catch up before reading it back
+CHECK_COPY_WAIT_SECONDS = 4.0       # how long to wait for the copy to land on the clipboard
+CHECK_MAIN_THREAD_WAIT_SECONDS = 10.0
+
+# Editors often swap straight quotes for curly ones, or use non-breaking spaces.
+# Those are not typing mistakes, so they are treated as the same text.
+_CHECK_CHARACTER_MAP = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"',
+    "\u00a0": " ", "\u2007": " ", "\u202f": " ",
+    "\u000b": "\n", "\u2028": "\n", "\u2029": "\n",
+    "\u200b": None, "\u200c": None, "\u200d": None, "\u2060": None, "\ufeff": None,
+})
+
+
+def normalize_for_check(text):
+    """Makes line endings, curly quotes, non-breaking spaces, and invisible
+    characters the same on both sides, and drops spaces and line breaks at the
+    very end, so only real differences are left."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.translate(_CHECK_CHARACTER_MAP).rstrip()
+
+
+def build_expected_typed_text(text, resume_from, left_mistake_map):
+    """The text that should be on screen after a run: text[resume_from:], with
+    each purposely left mistake (Update #24) in place of the correct text. Every
+    other edit (typos, reworks, second revision words, smart fixes) ends with
+    the correct text, so nothing else changes it."""
+    pieces = []
+    position = resume_from
+    for start in sorted(left_mistake_map):
+        entry = left_mistake_map[start]
+        if start < position:
+            continue
+        pieces.append(text[position:start])
+        pieces.append(entry["typed"])
+        position = max(entry["end"], start + 1)
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
+def _check_show(piece):
+    piece = piece.replace("\n", "\u21b5")
+    if len(piece) > CHECK_MAX_PIECE_CHARS:
+        half = CHECK_MAX_PIECE_CHARS // 2
+        piece = piece[:half] + "\u2026" + piece[-half:]
+    return piece
+
+
+def _check_snippets(expected, exp_start, exp_end, found_piece):
+    """Returns (on_screen, should_be) text for one difference: the whole word
+    around it, with a little text on each side. The part to look at is shown
+    between \u00ab \u00bb."""
+    chunk_start = exp_start
+    while chunk_start > 0 and not expected[chunk_start - 1].isspace():
+        chunk_start -= 1
+    chunk_end = exp_end
+    while chunk_end < len(expected) and not expected[chunk_end].isspace():
+        chunk_end += 1
+    head = expected[max(0, chunk_start - CHECK_CONTEXT_CHARS):chunk_start].split("\n")[-1]
+    tail = expected[chunk_end:chunk_end + CHECK_CONTEXT_CHARS].split("\n")[0]
+    head = _check_show(head)
+    tail = _check_show(tail)
+    found_chunk = expected[chunk_start:exp_start] + found_piece + expected[exp_end:chunk_end]
+    expected_chunk = expected[chunk_start:chunk_end]
+    return (
+        f"{head}\u00ab{_check_show(found_chunk)}\u00bb{tail}",
+        f"{head}\u00ab{_check_show(expected_chunk)}\u00bb{tail}",
+    )
+
+
+def _split_earlier_text(found_lines, expected_lines):
+    """When the document already had text before the cursor on the same line as
+    the first typed line, that line ends with the first expected line. Splits it
+    so the earlier part is its own line and can be ignored."""
+    first = expected_lines[0]
+    if not first:
+        return found_lines
+    candidates = [i for i, line in enumerate(found_lines) if line.endswith(first)]
+    if not candidates:
+        return found_lines
+    wanted_after = len(expected_lines) - 1
+    best = min(candidates, key=lambda i: (abs((len(found_lines) - 1 - i) - wanted_after), -i))
+    line = found_lines[best]
+    if len(line) == len(first):
+        return found_lines
+    return found_lines[:best] + [line[:len(line) - len(first)], first] + found_lines[best + 1:]
+
+
+def compare_typed_text(expected, found):
+    """Compares the text that should be on screen with what was read back.
+    Anything in `found` before the typed text (earlier text already in the
+    document) is ignored. Returns a dict:
+      matched: True when they are the same
+      difference_count: how many differences there are
+      differences: the first CHECK_MAX_DIFFERENCES_SHOWN, each with line,
+        kind (wrong, missing, or extra), on_screen, and should_be
+      expected_length: characters that should have been typed"""
+    expected = normalize_for_check(expected)
+    found = normalize_for_check(found)
+    result = {"matched": True, "difference_count": 0, "differences": [], "expected_length": len(expected)}
+    if found.endswith(expected):
+        return result
+
+    expected_lines = expected.split("\n")
+    found_lines = _split_earlier_text(found.split("\n"), expected_lines)
+    expected_offsets = []
+    running = 0
+    for line in expected_lines:
+        expected_offsets.append(running)
+        running += len(line) + 1
+
+    line_matcher = difflib.SequenceMatcher(None, found_lines, expected_lines, autojunk=False)
+    differences = []
+    for op_index, (tag, i1, i2, j1, j2) in enumerate(line_matcher.get_opcodes()):
+        if tag == "equal":
+            continue
+        if op_index == 0 and tag == "delete":
+            continue  # earlier text that was already in the document
+        found_block = "\n".join(found_lines[i1:i2])
+        expected_block = "\n".join(expected_lines[j1:j2])
+        block_start = expected_offsets[j1] if j1 < len(expected_offsets) else len(expected)
+        if len(found_block) * len(expected_block) > CHECK_MAX_CHAR_DIFF_CELLS:
+            char_ops = [("replace", 0, len(found_block), 0, len(expected_block))]
+        else:
+            char_ops = difflib.SequenceMatcher(None, found_block, expected_block, autojunk=False).get_opcodes()
+        changes = []
+        for char_index, (char_tag, a1, a2, b1, b2) in enumerate(char_ops):
+            if char_tag == "equal":
+                continue
+            if op_index == 0 and char_index == 0 and char_tag == "delete":
+                continue  # earlier text on the first line
+            if changes and a1 - changes[-1][1] <= CHECK_MERGE_GAP_CHARS and b1 - changes[-1][3] <= CHECK_MERGE_GAP_CHARS:
+                # Changes only a letter or two apart are one mistake (like swapped letters).
+                changes[-1] = (changes[-1][0], a2, changes[-1][2], b2)
+            else:
+                changes.append((a1, a2, b1, b2))
+        for a1, a2, b1, b2 in changes:
+            exp_start = block_start + b1
+            exp_end = block_start + b2
+            found_piece = found_block[a1:a2]
+            kind = "wrong"
+            if a1 == a2:
+                kind = "missing"
+            elif b1 == b2:
+                kind = "extra"
+            on_screen, should_be = _check_snippets(expected, exp_start, exp_end, found_piece)
+            differences.append({
+                "line": expected.count("\n", 0, min(exp_start, len(expected))) + 1,
+                "kind": kind,
+                "on_screen": on_screen,
+                "should_be": should_be,
+            })
+    result["matched"] = not differences
+    result["difference_count"] = len(differences)
+    result["differences"] = differences[:CHECK_MAX_DIFFERENCES_SHOWN]
+    return result
+
+
+def _call_on_main_thread_and_wait(func):
+    """Runs func on the main thread (from the typing thread) and waits for its
+    answer. Returns (True, value), or (False, None) when it failed or took too
+    long. The call goes through the same queue as the preview writes, so it runs
+    after all of them."""
+    done = threading.Event()
+    box = {}
+
+    def runner():
+        try:
+            box["value"] = func()
+        except (tk.TclError, ValueError, RuntimeError):
+            box["failed"] = True
+        finally:
+            done.set()
+
+    run_on_main_thread(runner)
+    if not done.wait(CHECK_MAIN_THREAD_WAIT_SECONDS) or box.get("failed"):
+        return False, None
+    return True, box.get("value")
+
+
+def _read_preview_text():
+    """Main thread: everything in the Preview Run box, or None when it is gone."""
+    if preview_text_widget is None:
+        return None
+    return preview_text_widget.get("1.0", "end-1c")
+
+
+def _read_clipboard_text():
+    """Main thread: the text on the clipboard, or None when it is empty or not text."""
+    try:
+        return window.clipboard_get()
+    except tk.TclError:
+        return None
+
+
+def _write_clipboard_text(text):
+    """Main thread: puts `text` on the clipboard (None or empty clears it)."""
+    window.clipboard_clear()
+    if text:
+        window.clipboard_append(text)
+
+
+def _read_back_window_text(settings, expected):
+    """Copies everything before the cursor in the target window and returns
+    (text, reason). The text is None when it could not be read, and the reason
+    says why. Ctrl+Shift+Home selects from the cursor back to the start, Ctrl+C
+    copies, and Right collapses the selection so the cursor is where it was.
+    The clipboard is put back the way it was."""
+    locked_window = settings.get("locked_window", "")
+    if locked_window and HAS_PYGETWINDOW:
+        active = gw.getActiveWindow()
+        if (active.title if active else "") != locked_window:
+            return None, "the target window was not in front"
+    time.sleep(CHECK_SETTLE_SECONDS)
+    if stop_event.is_set():
+        return None, "the run was stopped"
+    ok, old_clipboard = _call_on_main_thread_and_wait(_read_clipboard_text)
+    if not ok:
+        return None, "the clipboard could not be read"
+
+    pyautogui.hotkey("ctrl", "shift", "home")
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "c")
+    found = None
+    waited = 0.0
+    while waited < CHECK_COPY_WAIT_SECONDS and not stop_event.is_set():
+        time.sleep(0.2)
+        waited += 0.2
+        ok, clipboard_now = _call_on_main_thread_and_wait(_read_clipboard_text)
+        if ok and clipboard_now is not None and clipboard_now != old_clipboard:
+            found = clipboard_now
+            break
+    pyautogui.press("right")
+
+    if found is None and old_clipboard is not None and normalize_for_check(old_clipboard).endswith(
+        normalize_for_check(expected)
+    ):
+        found = old_clipboard  # the copy gave the same text that was already there
+    _call_on_main_thread_and_wait(lambda: _write_clipboard_text(old_clipboard))
+    if found is None:
+        return None, "copying from the window did not work (copy may be blocked there)"
+    return found, ""
+
+
+def run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path):
+    """Called by type_text() after the last character. A preview run is always
+    checked. A real run is checked only when 'Check typed text' is on. The result
+    goes in state.text_check_results and the log gets only counts and line
+    numbers, never the text. Returns quietly if Stop was pressed."""
+    preview = bool(settings.get("preview_mode"))
+    if not preview and not settings.get("check_typed_text", False):
+        return
+    expected = build_expected_typed_text(text, resume_from, left_mistake_map)
+    if not normalize_for_check(expected):
+        return
+    state.status = "Checking the typed text..."
+    file_name = os.path.basename(input_path)
+    record = {
+        "file": file_name, "preview": preview, "status": "unreadable", "reason": "",
+        "expected_length": len(normalize_for_check(expected)), "difference_count": 0, "differences": [],
+    }
+    try:
+        if preview:
+            ok, found = _call_on_main_thread_and_wait(_read_preview_text)
+            if not ok or found is None:
+                found, record["reason"] = None, "the Preview Run box could not be read"
+        else:
+            found, record["reason"] = _read_back_window_text(settings, expected)
+        if found is not None:
+            outcome = compare_typed_text(expected, found)
+            record["expected_length"] = outcome["expected_length"]
+            record["difference_count"] = outcome["difference_count"]
+            record["differences"] = outcome["differences"]
+            record["status"] = "match" if outcome["matched"] else "differences"
+    except Exception:
+        # Default to safety: a failed check must never spoil a finished run.
+        record["status"] = "unreadable"
+        record["reason"] = "the check ran into a problem"
+    if stop_event.is_set() and record["status"] == "unreadable":
+        return
+    state.text_check_results.append(record)
+    if record["status"] == "match":
+        log_event("text_check", f"matched, {record['expected_length']} characters")
+    elif record["status"] == "differences":
+        line_numbers = ", ".join(str(item["line"]) for item in record["differences"][:10])
+        log_event("text_check", f"{record['difference_count']} difference(s), first on line(s) {line_numbers}")
+    else:
+        log_event("text_check", f"could not check: {record['reason']}")
+
+
+def get_text_check_summary():
+    """One or two plain lines about the text check for the finished message,
+    or an empty string when no check ran."""
+    results = state.text_check_results
+    if not results:
+        return ""
+    problems = [item for item in results if item["status"] == "differences"]
+    unreadable = [item for item in results if item["status"] == "unreadable"]
+    if problems:
+        total = sum(item["difference_count"] for item in problems)
+        return f"Text check: {total} difference(s) found. A report opens next."
+    if unreadable:
+        return f"Text check: could not read the text back ({unreadable[0]['reason']})."
+    total_chars = sum(item["expected_length"] for item in results)
+    return f"Text check: all {total_chars:,} characters match."
+
+
+def build_text_check_report_text(results):
+    """The plain-text report for the Typed Text Check window."""
+    show_file_names = len(results) > 1
+    lines = []
+    for item in results:
+        name = f"{item['file']}: " if show_file_names else ""
+        where = "Preview" if item["preview"] else "Target window"
+        if item["status"] == "match":
+            lines.append(f"{name}OK. All {item['expected_length']:,} characters match ({where}).")
+        elif item["status"] == "unreadable":
+            lines.append(f"{name}Could not be checked: {item['reason']}.")
+        else:
+            lines.append(f"{name}{item['difference_count']} difference(s) in {item['expected_length']:,} characters ({where}).")
+            lines.append("")
+            for number, difference in enumerate(item["differences"], start=1):
+                lines.append(f"{number}. Line {difference['line']}: {difference['kind']}")
+                lines.append(f"     on screen:  {difference['on_screen']}")
+                lines.append(f"     should be:  {difference['should_be']}")
+                lines.append("")
+            if item["difference_count"] > len(item["differences"]):
+                lines.append(
+                    f"Only the first {len(item['differences'])} of {item['difference_count']} are listed."
+                )
+        lines.append("")
+    lines.append("The part to look at is shown between \u00ab \u00bb (\u21b5 is a line break).")
+    lines.append(
+        "Curly quotes, non-breaking spaces, and spaces at the very end are treated as the same "
+        "text. An editor's own autocorrect (like turning -- into a dash) can still show up here."
+    )
+    lines.append(
+        "Purposely left mistakes are expected and are not counted as differences."
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def open_text_check_report():
+    """Opens the Typed Text Check window for the most recent run. It opens by
+    itself when a check finds a difference or could not read the text back, and
+    the button on the Check Typed Text card opens it again."""
+    results = list(state.text_check_results)
+    if not results:
+        messagebox.showinfo(
+            "No Text Check Yet",
+            "No typed text has been checked yet.\n\n"
+            "Preview runs are always checked. For a real run, turn on 'Check typed text' "
+            "on the Hotkeys tab, then start a run.",
+        )
+        return
+    report_text = build_text_check_report_text(results)
+    report_win = modern_toplevel(window, "Typed Text Check", "780x580", (520, 340))
+    modern_label(
+        report_win,
+        get_text_check_summary(),
+        kind="muted",
+        wraplength=720,
+    ).pack(anchor="w", padx=12, pady=(10, 4))
+
+    report_box = modern_textbox(report_win)
+    report_box.insert("1.0", report_text)
+    report_box.configure(state=tk.DISABLED)
+    report_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    def copy_report():
+        window.clipboard_clear()
+        window.clipboard_append(report_text)
+
+    button_row = modern_frame(report_win)
+    button_row.pack(anchor="w", padx=12, pady=(0, 12))
+    modern_button(button_row, "Copy Report", copy_report, kind="primary").pack(side="left")
+    modern_button(button_row, "Close", report_win.destroy, kind="neutral").pack(side="left", padx=(8, 0))
 
 
 # --------------------------------------------
@@ -5864,6 +6263,11 @@ def type_text(settings, is_batch=False, is_last=True):
         if not _wait_for_pause_marker(trailing_pause):
             return
 
+    # Check that what is on screen matches what was meant to be typed (Update #51).
+    run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path)
+    if stop_event.is_set():
+        return
+
     log_event("session_end", "finished")
     if is_last:
         state.status = "Finished!"
@@ -6429,6 +6833,9 @@ def validate_settings():
     if theme not in ("light", "dark"):
         theme = "light"
 
+    # Check typed text (Update #51): on or off.
+    check_typed_text = bool(check_typed_text_var.get())
+
     # App text size (Update #48): only the allowed choices. A box that cannot be
     # read goes back to 100%, and a number between choices snaps to the nearest.
     text_size_percent = clamp_text_size_percent(text_size_percent_var.get())
@@ -6513,6 +6920,7 @@ def validate_settings():
         "sentence_pause_max": sentence_pause_max,
         "theme": theme,
         "text_size_percent": text_size_percent,
+        "check_typed_text": check_typed_text,
     }
 
 
@@ -6694,7 +7102,11 @@ def notify_finished():
         except Exception:
             pass
     if enable_notify_var.get():
-        messagebox.showinfo("Amanuensis", "Typing session finished!")
+        check_summary = get_text_check_summary()
+        message = "Typing session finished!"
+        if check_summary:
+            message += "\n\n" + check_summary
+        messagebox.showinfo("Amanuensis", message)
 
 
 def split_target_time_across_files(settings, files, resume_dict):
@@ -7077,6 +7489,7 @@ def start_typing():
     if auto_profile_used:
         # Only the profile's name is logged, never the window title.
         log_event("auto_profile", f"loaded profile {auto_profile_used}")
+    state.text_check_results = []
     state.left_mistakes = []
     state.left_mistakes_resumed = False
     state.locked_window_title = settings["locked_window"]
@@ -7174,6 +7587,7 @@ def open_preview_window():
     state.status = "Typing..."
     state.logging_enabled = False
     state.log_entries = []
+    state.text_check_results = []
     state.left_mistakes = []
     state.left_mistakes_resumed = False
     state.locked_window_title = ""
@@ -8099,6 +8513,11 @@ def stop_typing():
     if was_running and state.left_mistakes:
         open_left_mistake_report()
 
+    # A text check that found a difference, or could not read the text back,
+    # opens its report (Update #51). A check that matched needs no window.
+    if was_running and any(item["status"] != "match" for item in state.text_check_results):
+        open_text_check_report()
+
     # A second revision pass was cut off by Stop (Update #34).
     pending_lookback = state.lookback_pending
     state.lookback_pending = None
@@ -8261,6 +8680,7 @@ def get_current_settings_snapshot():
         "skipped_update_version": skipped_update_version_var.get(),
         "theme": theme_var.get(),
         "text_size_percent": clamp_text_size_percent(text_size_percent_var.get()),
+        "check_typed_text": check_typed_text_var.get(),
     }
 
 
@@ -8365,6 +8785,9 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
         text_size_percent_var.set(
             f"{clamp_text_size_percent(data.get('text_size_percent', TEXT_SIZE_DEFAULT))}%"
         )
+        # Reading the text back uses this computer's clipboard, so it is never
+        # saved in shared profiles either (Update #51). Older files load as off.
+        check_typed_text_var.set(bool(data.get("check_typed_text", False)))
         enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
         set_auto_profile_rules(data.get("auto_profile_rules", []))
         # A scheduled start belongs to this computer and this moment, so shared
@@ -8399,6 +8822,7 @@ def save_profile():
         profile_data.pop("enable_scheduled_start", None)
         profile_data.pop("scheduled_start_time", None)
         profile_data.pop("text_size_percent", None)
+        profile_data.pop("check_typed_text", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -8455,6 +8879,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "enable_scheduled_start",
     "scheduled_start_time",
     "text_size_percent",
+    "check_typed_text",
 )
 
 
@@ -9917,6 +10342,7 @@ hotkey_warning_var = tk.StringVar(value="")
 log_enabled_var = tk.BooleanVar(value=False)
 enable_notify_var = tk.BooleanVar(value=True)
 enable_sound_var = tk.BooleanVar(value=True)
+check_typed_text_var = tk.BooleanVar(value=False)
 enable_update_check_var = tk.BooleanVar(value=True)
 skipped_update_version_var = tk.StringVar(value="")
 update_status_var = tk.StringVar(value="Not checked yet this session.")
@@ -10008,6 +10434,7 @@ SECTION_RESET_VARS = {
     "Hotkeys": [hotkey_start_var, hotkey_pause_var, hotkey_stop_var, hotkey_skip_break_var],
     "Session Log": [log_enabled_var],
     "On Completion": [enable_notify_var, enable_sound_var],
+    "Check Typed Text": [check_typed_text_var],
     "Updates": [enable_update_check_var, skipped_update_version_var],
 }
 
@@ -10547,6 +10974,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.25.0",
+        "date": "2026-10-22",
+        "title": "Check typed text",
+        "changes": [
+            "Added: typed text check. When a run finishes, Amanuensis compares the text that is really on screen with the text it meant to type, and opens a Typed Text Check report if anything differs. The report lists each difference by line number, with what is on screen and what it should be, and has a Copy Report button.",
+            "Added: a preview run is always checked, by reading the Preview Run box, with no keys and no clipboard. For a real run, the new Check Typed Text card on the Hotkeys tab (off by default) copies everything before the cursor in the target window (Ctrl+Shift+Home, then Ctrl+C), compares it, collapses the selection with the Right arrow key, and puts your earlier clipboard text back. A View Last Text Check button opens the last report again.",
+            "Added: one new setting (check typed text), saved and restored on launch, with its own Reset This Section button.",
+            "Notes: purposely left mistakes (Leave Mistakes For Me) are expected, so they are not counted as differences. Text that was already in the document before the cursor is ignored. Curly quotes, non-breaking spaces, and spaces at the very end count as the same text, but an editor's own autocorrect can still show up as a difference. The check is skipped with a message if the target window is not in front or copying is blocked, and it never changes the typed text. The log records only counts and line numbers, never the text. The setting belongs to this computer, so shared profiles, Auto Profiles, and starter profiles never carry or change it. Older settings and profile files without it load as off. No new packages.",
+        ],
+    },
     {
         "version": "5.24.0",
         "date": "2026-10-21",
@@ -11181,6 +11619,7 @@ frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
 # --- Tab: Hotkeys (controls and what happens when a run ends) ---
 frame_hotkeys = make_modern_card(tab_hotkeys, "Hotkeys")
 frame_completion = make_modern_card(tab_hotkeys, "On Completion")
+frame_check_text = make_modern_card(tab_hotkeys, "Check Typed Text")
 
 # --- Tab: Data (saved settings and logs) ---
 frame_profiles = make_modern_card(tab_data, "Profiles")
@@ -12185,6 +12624,23 @@ modern_label(
     kind="muted",
 ).grid(row=3, column=0, sticky="w", pady=(6, 0))
 
+# --- Check Typed Text (Update #51) ---
+modern_checkbox(
+    frame_check_text, "Check typed text when a run finishes", check_typed_text_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_check_text,
+    "Reads the text back from the target window and compares it with the text that\n"
+    "should be there. It presses Ctrl+Shift+Home and Ctrl+C there, then puts your\n"
+    "earlier clipboard text back. Keep the target window in front until it is done.\n"
+    "It cannot work where copying is blocked. Preview runs are always checked,\n"
+    "with no clipboard.",
+    kind="muted",
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+modern_button(
+    frame_check_text, "View Last Text Check", open_text_check_report, kind="neutral"
+).grid(row=2, column=0, sticky="w", pady=(10, 0))
+
 # --- Updates (Update #25) ---
 modern_checkbox(
     frame_updates, "Check for updates when the app starts", enable_update_check_var
@@ -12293,6 +12749,7 @@ SECTION_CARDS = {
     "Hotkeys": frame_hotkeys,
     "Session Log": frame_logging,
     "On Completion": frame_completion,
+    "Check Typed Text": frame_check_text,
     "Updates": frame_updates,
 }
 
