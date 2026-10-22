@@ -9,6 +9,21 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.24.0 (2026-10-21) -- Skip a research break
+#   - Added: Skip Break. While a research break is counting down, press the new
+#     Skip Break button in the footer (or the Skip Break hotkey, Ctrl+Alt+B by
+#     default) to end just that break, and typing carries on right away. Later
+#     breaks are not changed, and pressing it when no break is running does
+#     nothing, so it can never skip a break ahead of time.
+#   - Added: One new setting (hotkey_skip_break), shown on the Hotkeys tab, saved
+#     and restored on launch, and part of the Hotkeys reset.
+#   - Notes: A skipped break still counts as a break afterward (fatigue partly
+#     recovers, the mood resets, and the next break is planned as usual). The
+#     time really spent in the break is what is left out of WPM and ETA, and the
+#     run simply finishes sooner. The log records only research_break_skipped
+#     and the seconds. Like the other hotkeys, it belongs to this computer, so
+#     an auto-picked or starter profile never changes it. No new packages.
+#
 # v5.23.1 (2026-10-21) -- Shorter README
 #   - Modified: The README now lists only the key features, in a short Key
 #     features section. The full list of every feature and setting moved to
@@ -37,24 +52,6 @@
 #     cut off. Compact view and the pop-up windows grow with the size. The
 #     scaling comes from CustomTkinter (set_widget_scaling), and the few plain Tk
 #     parts (the file lists and the log table) use scaled fonts. No new packages.
-#
-# v5.22.0 (2026-10-20) -- Starter profiles
-#   - Added: Starter profiles. Four built-in typing styles (Careful student, Fast
-#     typist, Tired late night, and Hands-free dictation) so a new person can start
-#     with a good setup. Pick one in the new Starter Profiles part of the Profiles
-#     card on the Data tab and press Load Starter Profile.
-#   - Added: A short description under the list that changes with the choice, and
-#     a confirmation before anything is replaced.
-#   - Notes: A starter profile sets the typing style (speed, mistakes, breaks,
-#     pauses, and the realism cards) and puts every other typing setting back to
-#     its default. Hotkeys, theme, update settings, the session log, completion
-#     alerts, activity auto-pause, start countdown, target time, the input file
-#     and queue, Auto Profile rules, and the Scheduled Start stay as they are.
-#     The starter profiles live in the code, not in the profiles folder, so they
-#     never show up as files and cannot be changed or damaged. Loading is refused
-#     during a run, and if anything goes wrong the earlier settings are put back.
-#     There are no new settings, so nothing new is saved and older files load the
-#     same way. No new packages.
 #
 # ============================================
 
@@ -114,6 +111,10 @@ except ImportError:
 stop_event = threading.Event()
 pause_event = threading.Event()
 focus_lost_event = threading.Event()
+# Set by the Skip Break button or hotkey to end the research break that is
+# counting down right now (Update #50). It is only ever set while a break is
+# running, and the typing thread clears it when that break ends.
+skip_break_event = threading.Event()
 
 # Protects every read-modify-write on resume_state.json. Both the
 # background typing thread (autosave) and the main thread (Stop,
@@ -180,6 +181,7 @@ class TyperState:
         self.session_breaks_left = 0  # long session breaks still ahead in the current file
         self.lookback_pending = None  # second revision pass in progress: {draft, original, stage} (Update #34)
         self.select_retype_pending = None  # select and retype in progress: {draft, original} (Update #35)
+        self.in_research_break = False  # True only while a research break is counting down (Update #50)
 
 
 state = TyperState()
@@ -5514,19 +5516,36 @@ def type_text(settings, is_batch=False, is_last=True):
                 state.status = f"Research Break ({int(break_duration)}s left)..."
                 log_event("research_break_start", f"~{break_duration:.0f}s")
                 break_start = time.time()
+                break_skipped = False
+
+                # Skip Break (Update #50) only works while this countdown runs,
+                # so it can never skip a break before it starts.
+                skip_break_event.clear()
+                state.in_research_break = True
+                run_on_main_thread(refresh_skip_break_button)
 
                 total_ticks = int(break_duration * 10)
                 for tick in range(total_ticks):
                     if stop_event.is_set() or pause_event.is_set():
+                        break
+                    if skip_break_event.is_set():
+                        break_skipped = True
                         break
                     if tick % 10 == 0:
                         remaining = max(0, int(break_duration) - (tick // 10))
                         state.status = f"Research Break ({remaining}s left)..."
                     time.sleep(0.1)
 
-                state.paused_duration += time.time() - break_start
+                state.in_research_break = False
+                skip_break_event.clear()
+                run_on_main_thread(refresh_skip_break_button)
+
+                break_seconds = time.time() - break_start
+                state.paused_duration += break_seconds
+                if break_skipped:
+                    log_event("research_break_skipped", f"after {break_seconds:.0f}s of ~{break_duration:.0f}s")
                 log_event("research_break_end", "")
-                note_warm_up(time.time() - break_start, "a research break", idx + 1)
+                note_warm_up(break_seconds, "a research break", idx + 1)
 
                 if enable_fatigue:
                     # Partly recover from fatigue after a research break
@@ -7065,6 +7084,8 @@ def start_typing():
     stop_event.clear()
     pause_event.clear()
     focus_lost_event.clear()
+    skip_break_event.clear()
+    state.in_research_break = False
 
     btn_start.configure(state=tk.DISABLED)
     btn_preview.configure(state=tk.DISABLED)
@@ -7160,6 +7181,8 @@ def open_preview_window():
     stop_event.clear()
     pause_event.clear()
     focus_lost_event.clear()
+    skip_break_event.clear()
+    state.in_research_break = False
 
     btn_start.configure(state=tk.DISABLED)
     btn_preview.configure(state=tk.DISABLED)
@@ -7979,6 +8002,25 @@ def toggle_pause():
         log_event("manual_pause", "")
 
 
+def refresh_skip_break_button():
+    """Turns the Skip Break button on only while a research break is counting
+    down in a run that is still going (Update #50). Runs on the main thread."""
+    if state.is_running and state.in_research_break:
+        btn_skip_break.configure(state=tk.NORMAL)
+    else:
+        btn_skip_break.configure(state=tk.DISABLED)
+
+
+def skip_research_break():
+    """Ends the research break that is counting down right now, from the Skip
+    Break button or hotkey (Update #50). Does nothing when no break is running,
+    so a press at any other time can never skip a later break."""
+    if not (state.is_running and state.in_research_break):
+        return
+    skip_break_event.set()
+    state.status = "Skipping the research break..."
+
+
 def show_lookback_stopped_message(pending):
     """Tells the person what to fix by hand when Stop was pressed in the middle
     of a second revision pass (Update #34)."""
@@ -8023,6 +8065,8 @@ def stop_typing():
     stop_event.set()
     pause_event.clear()
     focus_lost_event.clear()
+    skip_break_event.clear()
+    refresh_skip_break_button()
 
     btn_start.configure(state=tk.NORMAL)
     btn_preview.configure(state=tk.NORMAL)
@@ -8098,6 +8142,7 @@ def apply_hotkeys(event=None):
         (hotkey_start_var.get().strip(), start_typing, "Start"),
         (hotkey_pause_var.get().strip(), toggle_pause, "Pause"),
         (hotkey_stop_var.get().strip(), stop_typing, "Stop"),
+        (hotkey_skip_break_var.get().strip(), skip_research_break, "Skip Break"),
     ]
     for hotkey, func, label in bindings:
         if not hotkey:
@@ -8137,6 +8182,7 @@ def get_current_settings_snapshot():
         "hotkey_start": hotkey_start_var.get(),
         "hotkey_pause": hotkey_pause_var.get(),
         "hotkey_stop": hotkey_stop_var.get(),
+        "hotkey_skip_break": hotkey_skip_break_var.get(),
         "mistake_min_words": mistake_min_var.get(),
         "mistake_max_words": mistake_max_var.get(),
         "break_min_paragraphs": break_min_var.get(),
@@ -8233,6 +8279,7 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     hotkey_start_var.set(data.get("hotkey_start", "f8"))
     hotkey_pause_var.set(data.get("hotkey_pause", "f9"))
     hotkey_stop_var.set(data.get("hotkey_stop", "esc"))
+    hotkey_skip_break_var.set(data.get("hotkey_skip_break", "ctrl+alt+b"))
     mistake_min_var.set(data.get("mistake_min_words", "100"))
     mistake_max_var.set(data.get("mistake_max_words", "200"))
     break_min_var.set(data.get("break_min_paragraphs", "3"))
@@ -8397,6 +8444,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "hotkey_start",
     "hotkey_pause",
     "hotkey_stop",
+    "hotkey_skip_break",
     "theme",
     "enable_update_check",
     "skipped_update_version",
@@ -9863,6 +9911,7 @@ leave_mistakes_punctuation_var = tk.BooleanVar(value=True)
 hotkey_start_var = tk.StringVar(value="f8")
 hotkey_pause_var = tk.StringVar(value="f9")
 hotkey_stop_var = tk.StringVar(value="esc")
+hotkey_skip_break_var = tk.StringVar(value="ctrl+alt+b")
 hotkey_warning_var = tk.StringVar(value="")
 
 log_enabled_var = tk.BooleanVar(value=False)
@@ -9956,7 +10005,7 @@ SECTION_RESET_VARS = {
         leave_mistakes_commas_var,
         leave_mistakes_punctuation_var,
     ],
-    "Hotkeys": [hotkey_start_var, hotkey_pause_var, hotkey_stop_var],
+    "Hotkeys": [hotkey_start_var, hotkey_pause_var, hotkey_stop_var, hotkey_skip_break_var],
     "Session Log": [log_enabled_var],
     "On Completion": [enable_notify_var, enable_sound_var],
     "Updates": [enable_update_check_var, skipped_update_version_var],
@@ -10484,6 +10533,10 @@ btn_pause.pack(side="left", expand=True, padx=4, fill="x")
 btn_stop = modern_button(controls_row, "Stop Typing", stop_typing, kind="danger", state=tk.DISABLED)
 btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 
+# Skip Break (Update #50): only turns on while a research break is counting down.
+btn_skip_break = modern_button(controls_row, "Skip Break", skip_research_break, kind="neutral", state=tk.DISABLED)
+btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
+
 # --------------------------------------------
 # VERSION HISTORY DATA (Idea #23)
 # --------------------------------------------
@@ -10494,6 +10547,16 @@ btn_stop.pack(side="left", expand=True, padx=(4, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.24.0",
+        "date": "2026-10-21",
+        "title": "Skip a research break",
+        "changes": [
+            "Added: Skip Break. While a research break is counting down, press the new Skip Break button in the footer (or the Skip Break hotkey, Ctrl+Alt+B by default) to end just that break, and typing carries on right away. Later breaks are not changed, and pressing it when no break is running does nothing, so it can never skip a break ahead of time.",
+            "Added: one new setting (hotkey_skip_break), shown on the Hotkeys tab, saved and restored on launch, and part of the Hotkeys reset.",
+            "Notes: a skipped break still counts as a break afterward (fatigue partly recovers, the mood resets, and the next break is planned as usual). The time really spent in the break is what is left out of WPM and ETA, and the run simply finishes sooner. The log records only research_break_skipped and the seconds. Like the other hotkeys, it belongs to this computer, so an auto-picked or starter profile never changes it. No new packages.",
+        ],
+    },
     {
         "version": "5.23.1",
         "date": "2026-10-21",
@@ -12031,6 +12094,7 @@ modern_label(
 entry_hotkey_start = modern_entry(frame_hotkeys, hotkey_start_var)
 entry_hotkey_pause = modern_entry(frame_hotkeys, hotkey_pause_var)
 entry_hotkey_stop = modern_entry(frame_hotkeys, hotkey_stop_var)
+entry_hotkey_skip_break = modern_entry(frame_hotkeys, hotkey_skip_break_var)
 
 modern_label(frame_hotkeys, "Start").grid(row=0, column=0, sticky="w")
 modern_label(frame_hotkeys, "Pause").grid(row=0, column=1, sticky="w", padx=(16, 0))
@@ -12039,17 +12103,28 @@ entry_hotkey_start.grid(row=1, column=0, sticky="w", pady=(2, 0))
 entry_hotkey_pause.grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(2, 0))
 entry_hotkey_stop.grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(2, 0))
 
+modern_label(frame_hotkeys, "Skip Break").grid(row=2, column=0, sticky="w", pady=(10, 0))
+entry_hotkey_skip_break.grid(row=3, column=0, sticky="w", pady=(2, 0))
+modern_label(
+    frame_hotkeys,
+    "Ends the research break that is counting down right now, and only that\n"
+    "one. It does nothing when no break is running. The Skip Break button\n"
+    "at the bottom does the same thing.",
+    kind="muted",
+).grid(row=3, column=1, columnspan=2, sticky="w", padx=(16, 0), pady=(2, 0))
+
 modern_button(frame_hotkeys, "Apply Hotkeys", apply_hotkeys).grid(
-    row=2, column=0, columnspan=3, pady=(12, 0), sticky="w"
+    row=4, column=0, columnspan=3, pady=(12, 0), sticky="w"
 )
 modern_label(frame_hotkeys, textvariable=hotkey_warning_var, kind="warning").grid(
-    row=3, column=0, columnspan=3, pady=(6, 0), sticky="w"
+    row=5, column=0, columnspan=3, pady=(6, 0), sticky="w"
 )
 
 # Rebind only on focus-out (debounced) rather than on every keystroke
 entry_hotkey_start.bind("<FocusOut>", apply_hotkeys)
 entry_hotkey_pause.bind("<FocusOut>", apply_hotkeys)
 entry_hotkey_stop.bind("<FocusOut>", apply_hotkeys)
+entry_hotkey_skip_break.bind("<FocusOut>", apply_hotkeys)
 
 # --- Profiles ---
 modern_button(frame_profiles, "Save Profile...", save_profile, kind="neutral").grid(row=0, column=0, padx=(0, 8))
