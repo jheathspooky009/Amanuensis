@@ -9,6 +9,24 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.25.1 (2026-10-22) -- Fix mistakes left behind
+#   - Fixed: Sentence reworks and paraphrase drafts deleted words with
+#     Ctrl+Backspace, which editors disagree about (commas, apostrophes, and
+#     hyphens can count as word breaks), so text could be left behind or too
+#     much deleted. They now press Backspace exactly once for each character
+#     that was typed, using the exact text on screen (new helpers
+#     _erase_typed_text and get_rework_text).
+#   - Fixed: Double spaces, or a word cut off at the start of the 120-character
+#     rework buffer, were changed by a rework. The exact text is now deleted
+#     and typed again, so nothing changes.
+#   - Fixed: Pressing Stop in the middle of a typo, a sentence rework, or a
+#     paraphrase draft could leave a wrong letter or a deleted sentence on
+#     screen. Each one now finishes putting things back before stopping, and a
+#     doubled-letter typo is counted so Resume does not type that letter twice.
+#   - Notes: The Preview Run box now uses the same Backspace steps as a real run,
+#     so the preview check (v5.25.0) matches what a real editor does. The unused
+#     Ctrl+Backspace helpers were removed. No settings changed. No new packages.
+#
 # v5.25.0 (2026-10-22) -- Check typed text
 #   - Added: Typed text check. When a run finishes, Amanuensis compares the text
 #     that is really on screen with the text it meant to type, and opens a Typed
@@ -44,17 +62,6 @@
 #     run simply finishes sooner. The log records only research_break_skipped
 #     and the seconds. Like the other hotkeys, it belongs to this computer, so
 #     an auto-picked or starter profile never changes it. No new packages.
-#
-# v5.23.1 (2026-10-21) -- Shorter README
-#   - Modified: The README now lists only the key features, in a short Key
-#     features section. The full list of every feature and setting moved to
-#     docs/FEATURES.md, and the README links to it.
-#   - Added: docs/FEATURES.md, with all the features grouped by topic. It also
-#     lists two features the README had left out (Warm-up after breaks and
-#     Writing habits).
-#   - Notes: Nothing in the app itself changed, so no settings changed and older
-#     files load the same way. The version in pyproject.toml and uv.lock was
-#     still 5.22.0, and is now 5.23.1 to match this history. No new packages.
 #
 # ============================================
 
@@ -2728,27 +2735,6 @@ def _preview_backspace(count=1):
         pass
 
 
-def _preview_ctrl_backspace():
-    """Runs on the main thread via run_on_main_thread. Deletes back to
-    the start of the last word (mirroring a Ctrl+Backspace word-delete)
-    from the preview Text box."""
-    if preview_text_widget is None:
-        return
-    try:
-        preview_text_widget.configure(state=tk.NORMAL)
-        content = preview_text_widget.get("1.0", "end-1c")
-        trimmed = content.rstrip()
-        boundary = max(trimmed.rfind(" "), trimmed.rfind("\n"))
-        cut_at = boundary + 1
-        delete_count = len(content) - cut_at
-        if delete_count > 0:
-            preview_text_widget.delete(f"end-{delete_count + 1}c", "end-1c")
-        preview_text_widget.see(tk.END)
-        preview_text_widget.configure(state=tk.DISABLED)
-    except tk.TclError:
-        pass
-
-
 def _preview_replace_near_end(distance, remove_count, new_text):
     """Runs on the main thread via run_on_main_thread. The Preview Run box has
     no cursor to move, so the second revision pass (Update #34) swaps the
@@ -2788,13 +2774,32 @@ def _send_backspace(settings):
         pyautogui.press("backspace")
 
 
-def _send_ctrl_backspace(settings):
-    """Sends Ctrl+Backspace (word delete), or -- in preview mode --
-    removes the last word from the Preview Run Text box."""
-    if settings.get("preview_mode"):
-        run_on_main_thread(_preview_ctrl_backspace)
-    else:
-        pyautogui.hotkey("ctrl", "backspace")
+def _erase_typed_text(settings, count):
+    """Presses Backspace exactly `count` times, one per character, in a quick
+    burst like a held key. Used to undo text that was just typed (sentence
+    reworks and paraphrase drafts). It counts characters on purpose and never
+    uses Ctrl+Backspace: editors disagree about where a word ends (commas,
+    apostrophes, and hyphens), and a wrong guess leaves text behind or deletes
+    too much (Update #52). It always finishes once started, even if Stop is
+    pressed, so a half-deleted sentence is never left on screen."""
+    for _ in range(count):
+        _send_backspace(settings)
+        time.sleep(random.uniform(0.02, 0.06))
+
+
+_REWORK_WORD_PATTERN = re.compile(r"[^ ]+")
+
+
+def get_rework_text(recent_typed_text, word_count):
+    """Returns the exact tail of `recent_typed_text` that starts at the first of
+    its last `word_count` words and runs to the end, spaces and all, or an empty
+    string when there are not that many words. Because it is exactly what is on
+    screen, deleting len() characters and typing it again changes nothing, even
+    with double spaces or a word cut off at the start of the buffer (Update #52)."""
+    words = list(_REWORK_WORD_PATTERN.finditer(recent_typed_text))
+    if word_count < 1 or len(words) < word_count:
+        return ""
+    return recent_typed_text[words[-word_count].start():]
 
 
 def _send_format_toggle(settings, kind):
@@ -4611,18 +4616,15 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
     _send_char(settings, wrong_char)
     time.sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
-        if stop_event.is_set():
-            return
         _send_char(settings, lc)
         time.sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
     time.sleep(random.uniform(0.25, 0.55))
 
-    # Backspace lookahead + wrong_char
+    # Backspace lookahead + wrong_char (always finishes, even if Stop is pressed,
+    # so no wrong letters are ever left on screen)
     for _ in range(len(lookahead_str) + 1):
-        if stop_event.is_set():
-            return
         _send_backspace(settings)
         time.sleep(random.uniform(0.05, 0.12))
 
@@ -4653,18 +4655,15 @@ def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
     _send_char(settings, c1)
     time.sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
-        if stop_event.is_set():
-            return
         _send_char(settings, lc)
         time.sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
     time.sleep(random.uniform(0.25, 0.55))
 
-    # Backspace lookahead + both swapped letters
+    # Backspace lookahead + both swapped letters (always finishes, even if Stop
+    # is pressed, so no wrong letters are ever left on screen)
     for _ in range(len(lookahead_str) + 2):
-        if stop_event.is_set():
-            return
         _send_backspace(settings)
         time.sleep(random.uniform(0.05, 0.12))
 
@@ -4696,18 +4695,15 @@ def _simulate_doubled_letter_typo(settings, text, idx, protection_mask):
     _send_char(settings, char)
     time.sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
-        if stop_event.is_set():
-            return False
         _send_char(settings, lc)
         time.sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
     time.sleep(random.uniform(0.20, 0.50))
 
-    # Backspace lookahead + single extra duplicate letter
+    # Backspace lookahead + single extra duplicate letter (always finishes, even
+    # if Stop is pressed, so no extra letters are ever left on screen)
     for _ in range(len(lookahead_str) + 1):
-        if stop_event.is_set():
-            return False
         _send_backspace(settings)
         time.sleep(random.uniform(0.05, 0.12))
 
@@ -4735,18 +4731,15 @@ def _simulate_missed_space_typo(settings, text, idx, protection_mask):
     lookahead_str = "".join(lookahead[:k])
 
     for lc in lookahead_str:
-        if stop_event.is_set():
-            return
         _send_char(settings, lc)
         time.sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
     time.sleep(random.uniform(0.25, 0.55))
 
-    # Backspace all run-together characters
+    # Backspace all run-together characters (always finishes, even if Stop is
+    # pressed, so no run-together letters are ever left on screen)
     for _ in range(len(lookahead_str)):
-        if stop_event.is_set():
-            return
         _send_backspace(settings)
         time.sleep(random.uniform(0.05, 0.12))
 
@@ -5799,11 +5792,15 @@ def type_text(settings, is_batch=False, is_last=True):
                 _end_idx, paraphrased_text, original_text = candidate
                 state.status = "Drafting paraphrase..."
                 log_event("paraphrase_rework", f"drafted: '{paraphrased_text}'")
+                typed_paraphrase_chars = 0
 
                 for p_char in paraphrased_text:
                     if stop_event.is_set():
+                        # Take back the part already typed, so no draft is left on screen.
+                        _erase_typed_text(settings, typed_paraphrase_chars)
                         return
                     _send_char(settings, p_char)
+                    typed_paraphrase_chars += 1
                     p_delay = random.uniform(min_delay, max_delay)
                     if p_char.isalpha():
                         p_delay += random.uniform(0.01, 0.03)
@@ -5818,16 +5815,15 @@ def type_text(settings, is_batch=False, is_last=True):
                 reconsider_pause = random.uniform(0.8, 1.8)
                 for _ in range(int(reconsider_pause * 10)):
                     if stop_event.is_set():
+                        _erase_typed_text(settings, typed_paraphrase_chars)
                         return
                     time.sleep(0.1)
 
                 state.status = "Deleting and rewriting..."
-                p_words = [w for w in paraphrased_text.split() if w]
-                for _ in range(len(p_words)):
-                    if stop_event.is_set():
-                        return
-                    _send_ctrl_backspace(settings)
-                    time.sleep(random.uniform(0.1, 0.25))
+                # One Backspace per typed character (Update #52), not Ctrl+Backspace.
+                _erase_typed_text(settings, typed_paraphrase_chars)
+                if stop_event.is_set():
+                    return
 
                 time.sleep(random.uniform(0.3, 0.6))
                 word_count = 0  # avoid immediately firing mistake rework
@@ -5843,7 +5839,7 @@ def type_text(settings, is_batch=False, is_last=True):
         if enable_mistakes and char == " " and not is_protected:
             word_count += zone_weight
             if word_count >= next_mistake_target:
-                words_in_buffer = [w for w in recent_typed_buffer.split(" ") if w]
+                words_in_buffer = _REWORK_WORD_PATTERN.findall(recent_typed_buffer)
                 if rework_hold:
                     # A mistake was purposely left in the last few words.
                     # Never redo them, or the mistake would be erased.
@@ -5854,15 +5850,19 @@ def type_text(settings, is_batch=False, is_last=True):
                     # formatted character is never deleted (an editor could drop
                     # the style when that happens). Update #29.
                     redo_count = min(redo_count, len(words_in_buffer) - 1)
-                if redo_count > 0:
-                    redo_text = " ".join(words_in_buffer[-redo_count:])
+                # The exact text on screen for those words, spaces and all (Update #52).
+                redo_text = get_rework_text(recent_typed_buffer, redo_count) if redo_count > 0 else ""
+                if redo_text:
                     state.status = "Reworking last words..."
                     log_event("sentence_rework", f"redid: '{redo_text}'")
 
                     time.sleep(random.uniform(0.6, 1.5))
-                    for _ in range(redo_count):
-                        _send_ctrl_backspace(settings)
-                        time.sleep(random.uniform(0.1, 0.3))
+                    if stop_event.is_set():
+                        return
+                    # One Backspace per character, then the same text again. Once
+                    # the first Backspace is pressed this always finishes, even if
+                    # Stop is pressed, so no words are ever left deleted.
+                    _erase_typed_text(settings, len(redo_text))
                     time.sleep(random.uniform(0.3, 0.8))
                     _send_char(settings, redo_text)
                     time.sleep(random.uniform(0.2, 0.5))
@@ -6096,6 +6096,8 @@ def type_text(settings, is_batch=False, is_last=True):
                         typo_corrected = True
 
         if stop_event.is_set():
+            if char_already_typed:
+                state.chars_typed += 1  # the intended letter is already on screen
             return
 
         # --------------------------------
@@ -7526,8 +7528,8 @@ def open_preview_window():
     type_text() session against it instead of the real screen. Reuses
     type_text() and the same background-thread + stop/pause
     infrastructure as a real run -- the only difference is that
-    settings['preview_mode'] is True, so _send_char() / _send_backspace() /
-    _send_ctrl_backspace() (see the PREVIEW MODE section above) write
+    settings['preview_mode'] is True, so _send_char() / _send_backspace()
+    (see the PREVIEW MODE section above) write
     into the Text box via run_on_main_thread() instead of calling
     pyautogui. type_text() itself skips the start countdown when
     preview_mode is set, since there's no target window to switch to.
@@ -10974,6 +10976,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.25.1",
+        "date": "2026-10-22",
+        "title": "Fix mistakes left behind",
+        "changes": [
+            "Fixed: sentence reworks and paraphrase drafts deleted words with Ctrl+Backspace, which editors disagree about (commas, apostrophes, and hyphens can count as word breaks), so text could be left behind or too much deleted. They now press Backspace exactly once for each character that was typed.",
+            "Fixed: double spaces, or a word cut off at the start of the rework memory, were changed by a rework. The exact text on screen is now deleted and typed again, so nothing changes.",
+            "Fixed: pressing Stop in the middle of a typo, a sentence rework, or a paraphrase draft could leave a wrong letter or a deleted sentence on screen. Each one now finishes putting things back before stopping, and Resume no longer types a doubled letter twice.",
+            "Notes: the Preview Run box now uses the same Backspace steps as a real run, so the preview text check matches what a real editor does. No settings changed and older settings and profile files load the same way. No new packages.",
+        ],
+    },
     {
         "version": "5.25.0",
         "date": "2026-10-22",
