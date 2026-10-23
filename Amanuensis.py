@@ -9,6 +9,20 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.26.0 (2026-10-23) -- Preview playback speed
+#   - Added: Playback speed in the Preview Run window. Pick 1x, 1.25x, 1.5x,
+#     1.75x, 2x, 3x, 5x, 10x, or 20x, and it changes right away, even in the
+#     middle of a preview. Only the waiting is shortened, so the same text,
+#     typos, reworks, and pauses happen in the same order, just sooner. Real
+#     runs always use real time.
+#   - Added: One new setting (preview_speed), saved and restored on launch. It
+#     belongs to this computer, so shared profiles, Auto Profiles, and starter
+#     profiles never carry or change it, and Reset All Settings leaves it alone.
+#   - Notes: Typing delays now go through a new helper, paced_sleep(), which
+#     waits the full time unless the run is a preview. Waits for Stop, Pause, and
+#     focus checks still use real time. Pause markers count down faster in a
+#     preview. Older settings load as 1x. No new packages.
+#
 # v5.25.1 (2026-10-22) -- Fix mistakes left behind
 #   - Fixed: Sentence reworks and paraphrase drafts deleted words with
 #     Ctrl+Backspace, which editors disagree about (commas, apostrophes, and
@@ -47,21 +61,6 @@
 #     setting belongs to this computer, so shared profiles, Auto Profiles, and
 #     starter profiles never carry or change it. No new packages (difflib is
 #     part of Python).
-#
-# v5.24.0 (2026-10-21) -- Skip a research break
-#   - Added: Skip Break. While a research break is counting down, press the new
-#     Skip Break button in the footer (or the Skip Break hotkey, Ctrl+Alt+B by
-#     default) to end just that break, and typing carries on right away. Later
-#     breaks are not changed, and pressing it when no break is running does
-#     nothing, so it can never skip a break ahead of time.
-#   - Added: One new setting (hotkey_skip_break), shown on the Hotkeys tab, saved
-#     and restored on launch, and part of the Hotkeys reset.
-#   - Notes: A skipped break still counts as a break afterward (fatigue partly
-#     recovers, the mood resets, and the next break is planned as usual). The
-#     time really spent in the break is what is left out of WPM and ETA, and the
-#     run simply finishes sooner. The log records only research_break_skipped
-#     and the seconds. Like the other hotkeys, it belongs to this computer, so
-#     an auto-picked or starter profile never changes it. No new packages.
 #
 # ============================================
 
@@ -2706,6 +2705,45 @@ def open_log_viewer():
 # typing thread) instead of sending real keystrokes.
 preview_text_widget = None  # the active Preview Run Text widget, or None when no preview is open
 
+# PREVIEW SPEED (Update #53): how fast the Preview Run box plays. 1x is the real
+# pace. Only the waiting is shortened, so the same text, mistakes, and pauses
+# happen in the same order, just sooner. Real runs always use real time.
+PREVIEW_SPEED_CHOICES = (1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 5.0, 10.0, 20.0)
+PREVIEW_SPEED_DEFAULT = 1.0
+preview_speed_now = PREVIEW_SPEED_DEFAULT  # read by the typing thread, changed in the Preview Run window
+
+
+def preview_speed_label(speed):
+    """Text for a speed choice, such as '1x' or '1.25x'."""
+    return f"{speed:g}x"
+
+
+def clamp_preview_speed(value):
+    """Returns the allowed preview speed closest to value. A number between two
+    choices snaps to the nearest one. Anything that is not a usable number
+    (including text like 'fast') gives the default, 1x."""
+    try:
+        number = float(str(value).strip().lower().rstrip("x"))
+    except (ValueError, TypeError):
+        return PREVIEW_SPEED_DEFAULT
+    if not math.isfinite(number):
+        return PREVIEW_SPEED_DEFAULT
+    return min(PREVIEW_SPEED_CHOICES, key=lambda choice: abs(choice - number))
+
+
+def _current_preview_speed():
+    """The speed the typing thread should use right now. Always 1.0 (real time)
+    unless the run is a preview."""
+    if state.settings.get("preview_mode"):
+        return preview_speed_now
+    return 1.0
+
+
+def paced_sleep(seconds):
+    """time.sleep() for the typing loop. In a preview it waits `seconds` divided
+    by the preview speed, and in a real run it waits the full time."""
+    time.sleep(seconds / _current_preview_speed())
+
 
 def _preview_write(text):
     """Runs on the main thread via run_on_main_thread. Appends text
@@ -2784,7 +2822,7 @@ def _erase_typed_text(settings, count):
     pressed, so a half-deleted sentence is never left on screen."""
     for _ in range(count):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.02, 0.06))
+        paced_sleep(random.uniform(0.02, 0.06))
 
 
 _REWORK_WORD_PATTERN = re.compile(r"[^ ]+")
@@ -2818,7 +2856,7 @@ def _press_format_toggles(settings, kinds, active_formats):
     for kind in kinds:
         if stop_event.is_set():
             return False
-        time.sleep(random.uniform(0.15, 0.35))  # reaching for the shortcut
+        paced_sleep(random.uniform(0.15, 0.35))  # reaching for the shortcut
         _send_format_toggle(settings, kind)
         if kind in active_formats:
             active_formats.discard(kind)
@@ -2826,7 +2864,7 @@ def _press_format_toggles(settings, kinds, active_formats):
         else:
             active_formats.add(kind)
             log_event("format_on", kind)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
     return not stop_event.is_set()
 
 
@@ -4592,9 +4630,9 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
 
     if not use_extra_typos:
         _send_char(settings, wrong_char)
-        time.sleep(random.uniform(0.08, 0.25))
+        paced_sleep(random.uniform(0.08, 0.25))
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.15))
+        paced_sleep(random.uniform(0.05, 0.15))
         if capital_slip:
             log_event("typo", f"capital slip: typed '{wrong_char}' instead of '{char}'")
         else:
@@ -4614,21 +4652,21 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
     lookahead_str = "".join(lookahead[:k])
 
     _send_char(settings, wrong_char)
-    time.sleep(random.uniform(0.06, 0.15))
+    paced_sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
         _send_char(settings, lc)
-        time.sleep(random.uniform(0.06, 0.15))
+        paced_sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
-    time.sleep(random.uniform(0.25, 0.55))
+    paced_sleep(random.uniform(0.25, 0.55))
 
     # Backspace lookahead + wrong_char (always finishes, even if Stop is pressed,
     # so no wrong letters are ever left on screen)
     for _ in range(len(lookahead_str) + 1):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
 
-    time.sleep(random.uniform(0.08, 0.18))
+    paced_sleep(random.uniform(0.08, 0.18))
     log_event("typo", f"{slip_name}: typed '{wrong_char}{lookahead_str}', backspaced to retype '{char}'")
 
 
@@ -4651,23 +4689,23 @@ def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
     lookahead_str = "".join(lookahead[:k])
 
     _send_char(settings, c2)
-    time.sleep(random.uniform(0.06, 0.15))
+    paced_sleep(random.uniform(0.06, 0.15))
     _send_char(settings, c1)
-    time.sleep(random.uniform(0.06, 0.15))
+    paced_sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
         _send_char(settings, lc)
-        time.sleep(random.uniform(0.06, 0.15))
+        paced_sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
-    time.sleep(random.uniform(0.25, 0.55))
+    paced_sleep(random.uniform(0.25, 0.55))
 
     # Backspace lookahead + both swapped letters (always finishes, even if Stop
     # is pressed, so no wrong letters are ever left on screen)
     for _ in range(len(lookahead_str) + 2):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
 
-    time.sleep(random.uniform(0.08, 0.18))
+    paced_sleep(random.uniform(0.08, 0.18))
     log_event("typo", f"swapped letters: typed '{c2}{c1}{lookahead_str}', backspaced to retype '{c1}{c2}'")
 
 
@@ -4691,23 +4729,23 @@ def _simulate_doubled_letter_typo(settings, text, idx, protection_mask):
     lookahead_str = "".join(lookahead[:k])
 
     _send_char(settings, char)
-    time.sleep(random.uniform(0.04, 0.10))
+    paced_sleep(random.uniform(0.04, 0.10))
     _send_char(settings, char)
-    time.sleep(random.uniform(0.06, 0.15))
+    paced_sleep(random.uniform(0.06, 0.15))
     for lc in lookahead_str:
         _send_char(settings, lc)
-        time.sleep(random.uniform(0.06, 0.15))
+        paced_sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
-    time.sleep(random.uniform(0.20, 0.50))
+    paced_sleep(random.uniform(0.20, 0.50))
 
     # Backspace lookahead + single extra duplicate letter (always finishes, even
     # if Stop is pressed, so no extra letters are ever left on screen)
     for _ in range(len(lookahead_str) + 1):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
 
-    time.sleep(random.uniform(0.08, 0.18))
+    paced_sleep(random.uniform(0.08, 0.18))
     log_event("typo", f"doubled letter: typed '{char}{char}{lookahead_str}', backspaced duplicate")
     return True
 
@@ -4732,18 +4770,18 @@ def _simulate_missed_space_typo(settings, text, idx, protection_mask):
 
     for lc in lookahead_str:
         _send_char(settings, lc)
-        time.sleep(random.uniform(0.06, 0.15))
+        paced_sleep(random.uniform(0.06, 0.15))
 
     # Delayed notice hesitation
-    time.sleep(random.uniform(0.25, 0.55))
+    paced_sleep(random.uniform(0.25, 0.55))
 
     # Backspace all run-together characters (always finishes, even if Stop is
     # pressed, so no run-together letters are ever left on screen)
     for _ in range(len(lookahead_str)):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
 
-    time.sleep(random.uniform(0.08, 0.18))
+    paced_sleep(random.uniform(0.08, 0.18))
     log_event("typo", f"missed space: ran together into '{lookahead_str}', backspaced to insert space")
 
 
@@ -4762,17 +4800,17 @@ def _act_out_smart_fix(settings, kind, wrong_text):
             break
         _send_char(settings, slip_char)
         typed_count += 1
-        time.sleep(random.uniform(0.06, 0.15))
+        paced_sleep(random.uniform(0.06, 0.15))
 
     if typed_count and not stop_event.is_set():
-        time.sleep(random.uniform(0.25, 0.55))  # the "wait, that's wrong" moment
+        paced_sleep(random.uniform(0.25, 0.55))  # the "wait, that's wrong" moment
 
     for _ in range(typed_count):
         _send_backspace(settings)
-        time.sleep(random.uniform(0.05, 0.12))
+        paced_sleep(random.uniform(0.05, 0.12))
 
     if typed_count and not stop_event.is_set():
-        time.sleep(random.uniform(0.08, 0.18))
+        paced_sleep(random.uniform(0.08, 0.18))
         log_event("smart_fix_noticed", kind)
     return not stop_event.is_set()
 
@@ -4785,7 +4823,7 @@ def _type_left_mistake(settings, entry, input_path):
     for typed_char in typed:
         _send_char(settings, typed_char)
         if len(typed) > 1:
-            time.sleep(random.uniform(0.04, 0.10))
+            paced_sleep(random.uniform(0.04, 0.10))
 
     record = dict(entry)
     record["file"] = os.path.basename(input_path)
@@ -4890,7 +4928,7 @@ def _wait_for_pause_marker(seconds):
         now = time.time()
         elapsed = now - last_tick
         last_tick = now
-        remaining -= elapsed
+        remaining -= elapsed * _current_preview_speed()  # a preview plays faster (Update #53)
         state.paused_duration += elapsed
     return True
 
@@ -4941,7 +4979,7 @@ def _lookback_sleep(settings, seconds):
     for _ in range(int(seconds * 10)):
         if not _lookback_gate(settings, False):
             return False
-        time.sleep(0.1)
+        paced_sleep(0.1)
     return True
 
 
@@ -4956,7 +4994,7 @@ def _press_arrow_key(settings, key, count):
             return False
         chunk = min(LOOKBACK_KEY_CHUNK, remaining)
         if settings.get("preview_mode"):
-            time.sleep(chunk * random.uniform(0.01, 0.03))
+            paced_sleep(chunk * random.uniform(0.01, 0.03))
         else:
             pyautogui.press(key, presses=chunk, interval=random.uniform(0.015, 0.04))
         remaining -= chunk
@@ -4998,13 +5036,13 @@ def _run_lookback_fix(settings, edit, min_delay, max_delay):
         run_on_main_thread(
             lambda d=distance, n=len(draft), o=original: _preview_replace_near_end(d, n, o)
         )
-        time.sleep(random.uniform(0.6, 1.2))
+        paced_sleep(random.uniform(0.6, 1.2))
     else:
         for _ in range(len(draft)):
             if not _lookback_gate(settings, False):
                 return False
             _send_backspace(settings)
-            time.sleep(random.uniform(0.08, 0.2))
+            paced_sleep(random.uniform(0.08, 0.2))
         if not _lookback_sleep(settings, random.uniform(0.3, 0.7)):
             return False
         if not _lookback_gate(settings, True):
@@ -5016,7 +5054,7 @@ def _run_lookback_fix(settings, edit, min_delay, max_delay):
             char_delay = random.uniform(min_delay, max_delay)
             if char.isalpha():
                 char_delay += random.uniform(0.01, 0.03)
-            time.sleep(char_delay)
+            paced_sleep(char_delay)
     if pending is not None:
         pending["stage"] = "cursor"  # the text is right now, the cursor is still back there
     if not _lookback_sleep(settings, random.uniform(0.3, 0.8)):
@@ -5051,7 +5089,7 @@ def _press_shift_left(settings, count):
             return False
         chunk = min(LOOKBACK_KEY_CHUNK, remaining)
         if settings.get("preview_mode"):
-            time.sleep(chunk * random.uniform(0.02, 0.05))
+            paced_sleep(chunk * random.uniform(0.02, 0.05))
         else:
             pyautogui.keyDown("shift")
             try:
@@ -5094,7 +5132,7 @@ def _run_select_retype(settings, edit, min_delay, max_delay):
         return False
     if preview:
         run_on_main_thread(lambda n=len(draft), o=original: _preview_replace_near_end(0, n, o))
-        time.sleep(random.uniform(0.4, 0.9))
+        paced_sleep(random.uniform(0.4, 0.9))
     else:
         for char in original:
             if not _lookback_gate(settings, False):
@@ -5103,7 +5141,7 @@ def _run_select_retype(settings, edit, min_delay, max_delay):
             char_delay = random.uniform(min_delay, max_delay)
             if char.isalpha():
                 char_delay += random.uniform(0.01, 0.03)
-            time.sleep(char_delay)
+            paced_sleep(char_delay)
 
     state.select_retype_pending = None
     log_event("select_retype_end", "")
@@ -5119,13 +5157,13 @@ def _run_overshoot(settings, previous_letter):
     missing. Returns False if Stop was requested (the caller should return
     right away). The log records no letters."""
     state.status = "Went back one letter too far..."
-    time.sleep(random.uniform(0.04, 0.12))  # same quick burst as the last Backspace
+    paced_sleep(random.uniform(0.04, 0.12))  # same quick burst as the last Backspace
     if stop_event.is_set():
         return False
     _send_backspace(settings)
-    time.sleep(random.uniform(0.25, 0.6))  # the "oops" moment
+    paced_sleep(random.uniform(0.25, 0.6))  # the "oops" moment
     _send_char(settings, previous_letter)
-    time.sleep(random.uniform(0.1, 0.25))
+    paced_sleep(random.uniform(0.1, 0.25))
     log_event("overshoot", "pressed Backspace one time too many and typed the letter again")
     state.status = "Typing..."
     return not stop_event.is_set()
@@ -5628,7 +5666,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 for _ in range(int(think_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
                 if stop_event.is_set():
                     return
                 if not pause_event.is_set():
@@ -5659,7 +5697,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 for _ in range(int(decision_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
                 if stop_event.is_set():
                     return
                 if not pause_event.is_set():
@@ -5682,7 +5720,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 for _ in range(int(burst_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
                 if stop_event.is_set():
                     return
                 if not pause_event.is_set():
@@ -5708,7 +5746,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 for _ in range(int(habit_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
                 if stop_event.is_set():
                     return
                 if not pause_event.is_set():
@@ -5731,7 +5769,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 for _ in range(int(essay_seconds * 10)):
                     if stop_event.is_set() or pause_event.is_set():
                         break
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
                 if stop_event.is_set():
                     return
                 if not pause_event.is_set():
@@ -5809,7 +5847,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if enable_fatigue:
                         p_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
                         fatigue_chars += 1
-                    time.sleep(p_delay)
+                    paced_sleep(p_delay)
 
                 state.status = "Reconsidering phrasing..."
                 reconsider_pause = random.uniform(0.8, 1.8)
@@ -5817,7 +5855,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if stop_event.is_set():
                         _erase_typed_text(settings, typed_paraphrase_chars)
                         return
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
 
                 state.status = "Deleting and rewriting..."
                 # One Backspace per typed character (Update #52), not Ctrl+Backspace.
@@ -5825,7 +5863,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 if stop_event.is_set():
                     return
 
-                time.sleep(random.uniform(0.3, 0.6))
+                paced_sleep(random.uniform(0.3, 0.6))
                 word_count = 0  # avoid immediately firing mistake rework
                 state.status = "Typing..."
 
@@ -5856,16 +5894,16 @@ def type_text(settings, is_batch=False, is_last=True):
                     state.status = "Reworking last words..."
                     log_event("sentence_rework", f"redid: '{redo_text}'")
 
-                    time.sleep(random.uniform(0.6, 1.5))
+                    paced_sleep(random.uniform(0.6, 1.5))
                     if stop_event.is_set():
                         return
                     # One Backspace per character, then the same text again. Once
                     # the first Backspace is pressed this always finishes, even if
                     # Stop is pressed, so no words are ever left deleted.
                     _erase_typed_text(settings, len(redo_text))
-                    time.sleep(random.uniform(0.3, 0.8))
+                    paced_sleep(random.uniform(0.3, 0.8))
                     _send_char(settings, redo_text)
-                    time.sleep(random.uniform(0.2, 0.5))
+                    paced_sleep(random.uniform(0.2, 0.5))
 
                     state.status = "Typing..."
 
@@ -5898,7 +5936,7 @@ def type_text(settings, is_batch=False, is_last=True):
             for _ in range(int(thinking_pause * 10)):
                 if stop_event.is_set() or pause_event.is_set():
                     break
-                time.sleep(0.1)
+                paced_sleep(0.1)
             if stop_event.is_set():
                 return
             if not pause_event.is_set():
@@ -5933,7 +5971,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if tick % 10 == 0:
                         remaining = max(0, int(break_duration) - (tick // 10))
                         state.status = f"Research Break ({remaining}s left)..."
-                    time.sleep(0.1)
+                    paced_sleep(0.1)
 
                 state.in_research_break = False
                 skip_break_event.clear()
@@ -6000,7 +6038,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 if enable_fatigue:
                     draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
                     fatigue_chars += 1
-                time.sleep(draft_delay)
+                paced_sleep(draft_delay)
             lookback_edit["swapped"] = True
             left_skip_until = lookback_edit["end"]
             state.chars_typed += lookback_edit["end"] - idx
@@ -6033,7 +6071,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 if enable_fatigue:
                     draft_delay *= get_fatigue_multiplier(fatigue_chars, fatigue_strength)
                     fatigue_chars += 1
-                time.sleep(draft_delay)
+                paced_sleep(draft_delay)
             if not _run_select_retype(settings, select_edit, min_delay, max_delay):
                 return
             left_skip_until = select_edit["end"]
@@ -6224,21 +6262,21 @@ def type_text(settings, is_batch=False, is_last=True):
             last_autosave_time = time.time()
 
         prev_char = char
-        time.sleep(delay)
+        paced_sleep(delay)
 
         if char == ",":
             # A writing habit (Update #41) may make this writer quicker or
             # slower on commas. The scale is 1.0 when habits are off.
-            time.sleep(random.uniform(0.5, 1.5) * comma_pace_scale)
+            paced_sleep(random.uniform(0.5, 1.5) * comma_pace_scale)
         elif char in [";", ":"]:
-            time.sleep(random.uniform(0.5, 1.5))
+            paced_sleep(random.uniform(0.5, 1.5))
         elif char in [".", "!", "?"]:
             sentence_pause = random.uniform(sentence_pause_min, sentence_pause_max)
             state.status = "Pausing after sentence..."
             for _ in range(int(sentence_pause * 10)):
                 if stop_event.is_set() or pause_event.is_set():
                     break
-                time.sleep(0.1)
+                paced_sleep(0.1)
             if stop_event.is_set():
                 return
             if not pause_event.is_set():
@@ -6844,6 +6882,12 @@ def validate_settings():
     if text_size_percent_var.get() != f"{text_size_percent}%":
         text_size_percent_var.set(f"{text_size_percent}%")
 
+    # Preview speed (Update #53): only the allowed choices. A box that cannot be
+    # read goes back to 1x, and a number between choices snaps to the nearest.
+    preview_speed = clamp_preview_speed(preview_speed_var.get())
+    if preview_speed_var.get() != preview_speed_label(preview_speed):
+        preview_speed_var.set(preview_speed_label(preview_speed))
+
     return {
         "input_path": input_path if not queue_files else queue_files[0],
         "file_queue": queue_files,
@@ -6923,6 +6967,7 @@ def validate_settings():
         "theme": theme,
         "text_size_percent": text_size_percent,
         "check_typed_text": check_typed_text,
+        "preview_speed": preview_speed,
     }
 
 
@@ -7537,7 +7582,7 @@ def open_preview_window():
     and process just that one file -- never resume checkpoints, batch
     queues, or the session log, since none of that applies to a run
     that never touches another window (see stop_typing())."""
-    global preview_text_widget
+    global preview_text_widget, preview_speed_now
 
     if state.is_running:
         messagebox.showinfo("Already Running", "Stop the current session before starting a preview.")
@@ -7546,6 +7591,7 @@ def open_preview_window():
     settings = validate_settings()
     if settings is None:
         return
+    preview_speed_now = settings["preview_speed"]
     settings["preview_mode"] = True
     settings["resume_from"] = 0
     settings["locked_window"] = ""
@@ -7563,6 +7609,28 @@ def open_preview_window():
         "Preview only \u2014 nothing is typed into any other window.",
         kind="muted",
     ).pack(anchor="w", padx=12, pady=(10, 4))
+
+    def _on_preview_speed_chosen(choice=None):
+        """Runs when a playback speed is picked. Takes effect right away, even in
+        the middle of the preview, and is saved for next time."""
+        global preview_speed_now
+        chosen = clamp_preview_speed(choice if choice is not None else preview_speed_var.get())
+        preview_speed_now = chosen
+        preview_speed_var.set(preview_speed_label(chosen))
+        save_last_settings()
+
+    speed_row = modern_frame(preview_win)
+    speed_row.pack(anchor="w", padx=12, pady=(0, 6))
+    modern_label(speed_row, "Playback speed:").pack(side="left", padx=(0, 8))
+    speed_combo = modern_combobox(speed_row, preview_speed_var, width=8)
+    speed_combo.configure(
+        values=[preview_speed_label(choice) for choice in PREVIEW_SPEED_CHOICES],
+        command=_on_preview_speed_chosen,
+    )
+    speed_combo.pack(side="left")
+    modern_label(speed_row, "Preview only. Real typing is never sped up.", kind="muted").pack(
+        side="left", padx=(10, 0)
+    )
 
     preview_box = modern_textbox(preview_win)
     preview_box.configure(state=tk.DISABLED)
@@ -8683,6 +8751,7 @@ def get_current_settings_snapshot():
         "theme": theme_var.get(),
         "text_size_percent": clamp_text_size_percent(text_size_percent_var.get()),
         "check_typed_text": check_typed_text_var.get(),
+        "preview_speed": preview_speed_label(clamp_preview_speed(preview_speed_var.get())),
     }
 
 
@@ -8790,6 +8859,11 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
         # Reading the text back uses this computer's clipboard, so it is never
         # saved in shared profiles either (Update #51). Older files load as off.
         check_typed_text_var.set(bool(data.get("check_typed_text", False)))
+        # The preview speed is a choice for this computer, so shared profiles
+        # never carry it, and loading one leaves the speed as it is (Update #53).
+        # Older settings files without it keep the 1x default.
+        if "preview_speed" in data:
+            preview_speed_var.set(preview_speed_label(clamp_preview_speed(data["preview_speed"])))
         enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
         set_auto_profile_rules(data.get("auto_profile_rules", []))
         # A scheduled start belongs to this computer and this moment, so shared
@@ -8825,6 +8899,7 @@ def save_profile():
         profile_data.pop("scheduled_start_time", None)
         profile_data.pop("text_size_percent", None)
         profile_data.pop("check_typed_text", None)
+        profile_data.pop("preview_speed", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -8882,6 +8957,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "scheduled_start_time",
     "text_size_percent",
     "check_typed_text",
+    "preview_speed",
 )
 
 
@@ -10345,6 +10421,7 @@ log_enabled_var = tk.BooleanVar(value=False)
 enable_notify_var = tk.BooleanVar(value=True)
 enable_sound_var = tk.BooleanVar(value=True)
 check_typed_text_var = tk.BooleanVar(value=False)
+preview_speed_var = tk.StringVar(value=preview_speed_label(PREVIEW_SPEED_DEFAULT))
 enable_update_check_var = tk.BooleanVar(value=True)
 skipped_update_version_var = tk.StringVar(value="")
 update_status_var = tk.StringVar(value="Not checked yet this session.")
@@ -10976,6 +11053,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.26.0",
+        "date": "2026-10-23",
+        "title": "Preview playback speed",
+        "changes": [
+            "Added: a Playback speed list in the Preview Run window. Choose 1x, 1.25x, 1.5x, 1.75x, 2x, 3x, 5x, 10x, or 20x. The speed changes right away, even in the middle of a preview, so you can watch a long file in less time.",
+            "Modified: only the waiting is shortened. The same text, typos, reworks, and pauses happen in the same order, just sooner. Real typing is never sped up.",
+            "Added: one new setting (preview speed), saved and restored on launch.",
+            "Notes: the speed belongs to this computer, so shared profiles never carry it, loading a profile, an Auto Profile, or a starter profile never changes it, and Reset All Settings leaves it alone. Older settings load as 1x, and a value that is not one of the choices snaps to the nearest one. Pause markers count down faster in a preview. No new packages.",
+        ],
+    },
     {
         "version": "5.25.1",
         "date": "2026-10-22",
