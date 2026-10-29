@@ -1,6 +1,6 @@
 [project]
 name = "amanuensis"
-version = "5.27.0"
+version = "5.28.0"
 requires-python = ">=3.14"
 license = "MIT"
 dependencies = [

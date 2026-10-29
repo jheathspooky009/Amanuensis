@@ -9,6 +9,23 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.28.0 (2026-10-28) -- Markdown and Word input
+#   - Added: Input files can now be Markdown (.md or .markdown) or Word (.docx),
+#     as well as .txt. In a Markdown file, **bold** and *italic* (also __bold__,
+#     _italic_, and ***both***) turn into the [[b]] and [[i]] formatting markers,
+#     so the text is bolded and italicized with Ctrl+B and Ctrl+I as it is typed.
+#     Headings, lists, links, and code are typed exactly as written. A Word file
+#     is read as plain text only (paragraphs, line breaks, and tabs).
+#   - Modified: Browse and Add Files now show the new types first, with .txt,
+#     Markdown, Word, and All files choices. The batch queue can mix all three.
+#   - Notes: One new function, read_input_file_text(), now opens every input file
+#     (typing, time estimate, preview, resume checks, marker checks, Smart Text
+#     Fixes review), so they all see the same text. The Word reader uses only
+#     the standard library (zipfile and re), caps file size, and reads just the
+#     text part, so no new package is added. Marks with no partner, spaced math
+#     like 2 * 3 * 4, snake_case words, and [[protected text]] are left alone.
+#     No new settings.
+#
 # v5.27.0 (2026-10-28) -- Auto-pause alert
 #   - Added: A beep when typing pauses by itself. When the target window loses
 #     focus (Target Window Lock), when mouse movement triggers Auto-pause on
@@ -39,24 +56,6 @@
 #     focus checks still use real time. Pause markers count down faster in a
 #     preview. Older settings load as 1x. No new packages.
 #
-# v5.25.1 (2026-10-22) -- Fix mistakes left behind
-#   - Fixed: Sentence reworks and paraphrase drafts deleted words with
-#     Ctrl+Backspace, which editors disagree about (commas, apostrophes, and
-#     hyphens can count as word breaks), so text could be left behind or too
-#     much deleted. They now press Backspace exactly once for each character
-#     that was typed, using the exact text on screen (new helpers
-#     _erase_typed_text and get_rework_text).
-#   - Fixed: Double spaces, or a word cut off at the start of the 120-character
-#     rework buffer, were changed by a rework. The exact text is now deleted
-#     and typed again, so nothing changes.
-#   - Fixed: Pressing Stop in the middle of a typo, a sentence rework, or a
-#     paraphrase draft could leave a wrong letter or a deleted sentence on
-#     screen. Each one now finishes putting things back before stopping, and a
-#     doubled-letter typo is counted so Resume does not type that letter twice.
-#   - Notes: The Preview Run box now uses the same Backspace steps as a real run,
-#     so the preview check (v5.25.0) matches what a real editor does. The unused
-#     Ctrl+Backspace helpers were removed. No settings changed. No new packages.
-#
 # ============================================
 
 import pyautogui
@@ -72,12 +71,15 @@ import os
 import sys
 import difflib
 import hashlib
+import html
 import math
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
+import zlib
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -542,6 +544,151 @@ def parse_input_markers(raw_text, enable_pause_markers=True):
             format_map.setdefault(clean_position, []).extend(kinds)
 
     return clean_text, protected_ranges, pause_map, normalize_format_map(format_map), invalid_markers, clamped_markers
+
+
+# --------------------------------------------
+# READING INPUT FILES: .txt, .md, AND .docx (Update #55)
+# --------------------------------------------
+# Every place that opens an input file goes through read_input_file_text(), so
+# the time estimate, the preview, the typing run, and resume checks always see
+# the exact same text.
+#   .txt (and any other extension)  read as plain UTF-8 text, like always.
+#   .md / .markdown                 **bold** and *italic* become the [[b]] and
+#                                   [[i]] formatting markers. Nothing else in
+#                                   the file changes: headings, lists, links,
+#                                   and code are typed exactly as written.
+#   .docx                           plain text only. Paragraphs, line breaks,
+#                                   and tabs are kept. Fonts, bold, italic,
+#                                   pictures, list numbers, headers, and
+#                                   footnotes are left out.
+# The .docx reader uses only the standard library (zipfile and re), so no new
+# package is needed. A .docx is untrusted input: its size is capped, and only
+# the one text part is read.
+MARKDOWN_EXTENSIONS = (".md", ".markdown")
+DOCX_EXTENSION = ".docx"
+DOCX_MAX_FILE_BYTES = 25 * 1024 * 1024
+DOCX_MAX_XML_BYTES = 50 * 1024 * 1024
+DOCX_BODY_PART = "word/document.xml"
+# What the Browse and Add Files pickers show first.
+INPUT_FILE_TYPES = [
+    ("Text, Markdown, and Word files", ("*.txt", "*.md", "*.markdown", "*.docx")),
+    ("Text files", "*.txt"),
+    ("Markdown files", ("*.md", "*.markdown")),
+    ("Word files", "*.docx"),
+    ("All files", "*.*"),
+]
+
+# The text, tab, line break, and paragraph end tags inside a Word document.
+# <w:t> holds typed text. <w:delText> (deleted text) is a different tag, so
+# tracked deletions are left out on their own.
+DOCX_TOKEN_PATTERN = re.compile(
+    r"<w:t(?:\s[^>]*)?>(?P<text>.*?)</w:t>"
+    r"|(?P<tab><w:tab\s*/>)"
+    r"|(?P<break><w:(?:br|cr)(?:\s[^>]*)?/>)"
+    r"|(?P<end></w:p>|<w:p(?:\s[^>]*)?/>)",
+    re.DOTALL,
+)
+# Word can store a text box twice (a real copy and a plain fallback copy).
+DOCX_FALLBACK_PATTERN = re.compile(r"<mc:Fallback>.*?</mc:Fallback>", re.DOTALL)
+
+# Markdown emphasis. Each pattern stays on one line, wants a non-space letter
+# just inside each mark, and wants a non-word character just outside it, so
+# "2 * 3 * 4", "snake_case_name", "a*b*c", and "* bullet" are left alone. A
+# mark with a backslash before it (\*) is a plain character.
+MARKDOWN_BOLD_ITALIC_PATTERN = re.compile(
+    r"(?<![\w\\*])\*\*\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*\*\*(?![\w*])"
+)
+MARKDOWN_BOLD_PATTERNS = (
+    re.compile(r"(?<![\w\\*])\*\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*\*(?![\w*])"),
+    re.compile(r"(?<![\w\\_])__(?=[^\s_])(.+?)(?<=[^\s_\\])__(?![\w_])"),
+)
+MARKDOWN_ITALIC_PATTERNS = (
+    re.compile(r"(?<![\w\\*])\*(?=[^\s*])(.+?)(?<=[^\s*\\])\*(?![\w*])"),
+    re.compile(r"(?<![\w\\_])_(?=[^\s_])(.+?)(?<=[^\s_\\])_(?![\w_])"),
+)
+MARKDOWN_ESCAPED_MARK_PATTERN = re.compile(r"\\([*_])")
+MARKDOWN_HOLD_PATTERN = re.compile("\x00(\\d+)\x00")
+
+
+def convert_markdown_emphasis(raw_text):
+    """Turns **bold** and *italic* (also __bold__ and _italic_) in Markdown
+    text into the [[b]]...[[/b]] and [[i]]...[[/i]] formatting markers.
+    ***both*** gives both styles. Every other character stays as it is.
+
+    Any [[...]] span (protected text or a marker the person already wrote) is
+    set aside first and put back untouched, so protected text never changes.
+    A mark with no partner on its line is left as a plain character."""
+    held_spans = []
+
+    def hold_span(match):
+        held_spans.append(match.group(0))
+        return f"\x00{len(held_spans) - 1}\x00"
+
+    # A stray null character cannot be told apart from a held span, so it is
+    # dropped (a real text file never has one).
+    text = raw_text.replace("\x00", "")
+    text = PROTECTED_MARKER_PATTERN.sub(hold_span, text)
+
+    text = MARKDOWN_BOLD_ITALIC_PATTERN.sub(r"[[b]][[i]]\1[[/i]][[/b]]", text)
+    for pattern in MARKDOWN_BOLD_PATTERNS:
+        text = pattern.sub(r"[[b]]\1[[/b]]", text)
+    for pattern in MARKDOWN_ITALIC_PATTERNS:
+        text = pattern.sub(r"[[i]]\1[[/i]]", text)
+
+    text = MARKDOWN_ESCAPED_MARK_PATTERN.sub(r"\1", text)
+    return MARKDOWN_HOLD_PATTERN.sub(lambda m: held_spans[int(m.group(1))], text)
+
+
+def extract_docx_paragraph_text(body_xml):
+    """Pulls the plain text out of the text part of a Word file. Each paragraph
+    becomes one line, <w:br/> becomes a line break, and <w:tab/> becomes a tab.
+    Blank lines at the very end are dropped."""
+    body_xml = DOCX_FALLBACK_PATTERN.sub("", body_xml)
+    pieces = []
+    for match in DOCX_TOKEN_PATTERN.finditer(body_xml):
+        if match.group("text") is not None:
+            pieces.append(html.unescape(match.group("text")))
+        elif match.group("tab"):
+            pieces.append("\t")
+        else:
+            # A line break, or the end of a paragraph (also an empty <w:p/>).
+            pieces.append("\n")
+    return "".join(pieces).rstrip("\n")
+
+
+def read_docx_text(path):
+    """Reads a Word (.docx) file as plain text. Raises OSError with a plain
+    message when the file is missing, too big, or not a real .docx, so every
+    caller's existing `except OSError` handles it."""
+    if os.path.getsize(path) > DOCX_MAX_FILE_BYTES:
+        raise OSError("This Word file is too big (over 25 MB).")
+    try:
+        with zipfile.ZipFile(path) as docx_zip:
+            part_info = docx_zip.getinfo(DOCX_BODY_PART)
+            if part_info.file_size > DOCX_MAX_XML_BYTES:
+                raise OSError("The text inside this Word file is too big to read.")
+            with docx_zip.open(part_info) as part_file:
+                body_bytes = part_file.read(DOCX_MAX_XML_BYTES + 1)
+    except (zipfile.BadZipFile, KeyError, RuntimeError, NotImplementedError, EOFError, zlib.error):
+        raise OSError("This is not a Word (.docx) file that can be read. "
+                      "A password-protected or damaged file cannot be opened.") from None
+    if len(body_bytes) > DOCX_MAX_XML_BYTES:
+        raise OSError("The text inside this Word file is too big to read.")
+    return extract_docx_paragraph_text(body_bytes.decode("utf-8", errors="replace"))
+
+
+def read_input_file_text(path):
+    """Reads an input file and returns the text to type. The ONE function that
+    opens input files: .docx gives plain text, .md/.markdown has its bold and
+    italic turned into formatting markers, and anything else is plain UTF-8."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == DOCX_EXTENSION:
+        return read_docx_text(path)
+    with open(path, "r", encoding="utf-8") as input_file:
+        raw_text = input_file.read()
+    if extension in MARKDOWN_EXTENSIONS:
+        return convert_markdown_emphasis(raw_text)
+    return raw_text
 
 
 # --------------------------------------------
@@ -5255,11 +5402,10 @@ def type_text(settings, is_batch=False, is_last=True):
     revision_style = settings.get("revision_style", CLUSTER_STYLE_MIXED)
 
     try:
-        with open(input_path, "r", encoding="utf-8") as file:
-            text = file.read()
+        text = read_input_file_text(input_path)
     except FileNotFoundError:
         run_on_main_thread(lambda: _fail_and_stop(
-            "Error", f"Could not find:\n{input_path}\n\nUse Browse to pick a valid text file."
+            "Error", f"Could not find:\n{input_path}\n\nUse Browse to pick a valid text, Markdown, or Word file."
         ))
         return
     except OSError as e:
@@ -7035,8 +7181,7 @@ def estimate_total_active_seconds(files, settings):
     total_seconds = 0.0
     for fpath in files:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw_text = f.read()
+            raw_text = read_input_file_text(fpath)
         except OSError:
             return None
         if not raw_text:
@@ -7094,8 +7239,7 @@ def preview_estimate():
         total_fixes = 0
         for fpath in queue_files:
             try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    text = f.read()
+                text = read_input_file_text(fpath)
             except OSError as e:
                 error_msg = str(e)
                 messagebox.showerror("Error", f"Could not read input file:\n{fpath}\n\n{error_msg}")
@@ -7137,8 +7281,7 @@ def preview_estimate():
         return
 
     try:
-        with open(settings["input_path"], "r", encoding="utf-8") as f:
-            text = f.read()
+        text = read_input_file_text(settings["input_path"])
     except OSError as e:
         error_msg = str(e)
         messagebox.showerror("Error", f"Could not read input file:\n{error_msg}")
@@ -7384,8 +7527,7 @@ def confirm_pause_marker_warnings(files, settings):
     problems = []
     for fpath in files:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw_text = f.read()
+            raw_text = read_input_file_text(fpath)
         except OSError:
             continue  # type_text() already reports unreadable files
         _stripped, _pauses, invalid_markers, clamped_markers = strip_pause_markers(raw_text)
@@ -7425,8 +7567,7 @@ def confirm_format_marker_warnings(files, settings):
     problems = []
     for fpath in files:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw_text = f.read()
+            raw_text = read_input_file_text(fpath)
         except OSError:
             continue  # type_text() already reports unreadable files
         _stripped, _positions, _spans, file_problems = strip_format_markers(raw_text)
@@ -7734,8 +7875,7 @@ def open_smart_fix_review():
         return
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            raw_text = f.read()
+        raw_text = read_input_file_text(file_path)
     except OSError as e:
         error_msg = str(e)
         messagebox.showerror("Error", f"Could not read input file:\n{error_msg}")
@@ -9600,8 +9740,7 @@ def get_clean_text_for_file(path, settings):
     removed, smart fixes applied when on), and return the final text that
     gets typed. Resume checks need this to match exactly. Returns None on OSError."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read()
+        raw = read_input_file_text(path)
     except OSError:
         return None
     return prepare_input_text(raw, settings).clean_text
@@ -9763,8 +9902,8 @@ def browse_input_file():
     if state.is_running:
         return
     path = filedialog.askopenfilename(
-        title="Select Input Text File",
-        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        title="Select Input File",
+        filetypes=INPUT_FILE_TYPES,
     )
     if path:
         input_path_var.set(path)
@@ -9805,12 +9944,12 @@ def get_queue_files():
 
 
 def add_queue_files():
-    """Open multi-select file dialog and append chosen .txt files to the queue."""
+    """Open multi-select file dialog and append chosen .txt, .md, and .docx files to the queue."""
     if state.is_running:
         return
     paths = filedialog.askopenfilenames(
-        title="Add Text Files to Queue",
-        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        title="Add Files to Queue",
+        filetypes=INPUT_FILE_TYPES,
     )
     if paths:
         for p in paths:
@@ -11092,6 +11231,18 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.28.0",
+        "date": "2026-10-28",
+        "title": "Markdown and Word input",
+        "changes": [
+            "Added: you can now pick Markdown (.md) and Word (.docx) files as well as .txt files, for a single file or in the batch queue. The queue can mix all three types.",
+            "Added: in a Markdown file, **bold** and *italic* (also __bold__, _italic_, and ***both***) are turned into the bold and italic markers, so the text is bolded and italicized with Ctrl+B and Ctrl+I as it is typed. Headings, lists, links, and code are typed exactly as written.",
+            "Added: a Word file is read as plain text only. Paragraphs, line breaks, and tabs are kept. Fonts, bold, italic, pictures, list numbers, headers, and footnotes are left out.",
+            "Modified: the Browse and Add Files windows now show Text, Markdown, and Word files first, with separate choices for each type and All files.",
+            "Notes: a mark with no partner, spaced math like 2 * 3 * 4, snake_case words, and [[protected text]] are never changed by the Markdown step. A password-protected or damaged Word file shows a plain error instead of crashing. No new settings and no new packages.",
+        ],
+    },
     {
         "version": "5.27.0",
         "date": "2026-10-28",
