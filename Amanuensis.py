@@ -9,6 +9,27 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.30.0 (2026-10-29) -- Automatic tests
+#   - Added: A tests/ folder with 89 automatic checks (Python's built-in unittest,
+#     so no new package). They cover protected text, the [[b]] and [[i]] markers,
+#     {{pause}} markers, Markdown input, every Smart Text Fixes rule, settings
+#     checking and the settings save and load round trip, the typed text check,
+#     and the Learn My Speed measuring. Run them with:
+#     uv run python -m unittest discover -s tests -v
+#   - Added: A Tests job in the CI workflow, so every pull request runs them
+#     together with the other checks. The tests also run in the CI py_compile
+#     and pyflakes steps.
+#   - Fixed: Typing nan, inf, or -inf into a number box (delays, pauses, break
+#     lengths, chances, strengths) was accepted. Those words pass every "less
+#     than" check and could freeze or crash a run. A new function,
+#     parse_finite_float(), now refuses them in validate_settings(): the boxes
+#     that show an error still show it, and strength and chance boxes reset to
+#     a safe number, like they already did for other bad text.
+#   - Notes: Amanuensis.py builds its window as soon as it loads, so the tests
+#     use tests/app_loader.py, which reads the file as text and runs only its
+#     functions, plain settings, and tk variables (as stand-ins). The app code
+#     was not restructured for this. No new settings and no new packages.
+#
 # v5.29.0 (2026-10-29) -- Learn my speed
 #   - Added: A Learn My Speed button in the Typing Speed card (Speed tab). It opens
 #     a window where the person types a short paragraph. The time between key
@@ -38,22 +59,6 @@
 #     text part, so no new package is added. Marks with no partner, spaced math
 #     like 2 * 3 * 4, snake_case words, and [[protected text]] are left alone.
 #     No new settings.
-#
-# v5.27.0 (2026-10-28) -- Auto-pause alert
-#   - Added: A beep when typing pauses by itself. When the target window loses
-#     focus (Target Window Lock), when mouse movement triggers Auto-pause on
-#     mouse/keyboard activity, or when focus is lost in the middle of a second
-#     revision pass fix, a short warning beep plays once, so hands-free users
-#     know without watching the screen. It uses a different sound from the
-#     finished sound. Pausing yourself never beeps.
-#   - Added: One new setting (alert_on_auto_pause), off by default, with its own
-#     checkbox in the Alerts card on the Hotkeys tab (the old On Completion card,
-#     renamed because it now holds both kinds of alert). It is saved and restored
-#     on launch and is part of the card's Reset This Section button.
-#   - Notes: Preview runs never beep. The beep is independent of the Play sound
-#     when finished checkbox and needs Windows sound (winsound). It is played
-#     through run_on_main_thread(). Like the completion alerts, a starter profile
-#     never changes the setting. Older settings load as off. No new packages.
 #
 # ============================================
 
@@ -6641,13 +6646,23 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     return word_count, char_count, total_seconds
 
 
+def parse_finite_float(text):
+    """Like float(), but refuses nan, inf, and -inf (it raises ValueError, which
+    every caller already turns into a plain "must be numbers" message). Those
+    values pass every "less than" check, and they would reach the typing delays."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("not a finite number")
+    return number
+
+
 def validate_settings():
     """Validate all numeric GUI inputs before a run starts. Returns
     a populated settings dict on success, or None (after showing an
     error) on failure."""
     try:
-        min_delay = float(min_delay_var.get())
-        max_delay = float(max_delay_var.get())
+        min_delay = parse_finite_float(min_delay_var.get())
+        max_delay = parse_finite_float(max_delay_var.get())
     except ValueError:
         messagebox.showerror("Invalid Input", "Min/Max delay must be numbers.")
         return None
@@ -6659,8 +6674,8 @@ def validate_settings():
         return None
 
     try:
-        paragraph_pause_min = float(paragraph_pause_min_var.get())
-        paragraph_pause_max = float(paragraph_pause_max_var.get())
+        paragraph_pause_min = parse_finite_float(paragraph_pause_min_var.get())
+        paragraph_pause_max = parse_finite_float(paragraph_pause_max_var.get())
     except ValueError:
         messagebox.showerror("Invalid Input", "Paragraph pause (seconds) must be numbers.")
         return None
@@ -6672,8 +6687,8 @@ def validate_settings():
         return None
 
     try:
-        sentence_pause_min = float(sentence_pause_min_var.get())
-        sentence_pause_max = float(sentence_pause_max_var.get())
+        sentence_pause_min = parse_finite_float(sentence_pause_min_var.get())
+        sentence_pause_max = parse_finite_float(sentence_pause_max_var.get())
     except ValueError:
         messagebox.showerror("Invalid Input", "Sentence-end pause (seconds) must be numbers.")
         return None
@@ -6718,8 +6733,8 @@ def validate_settings():
             return None
 
         try:
-            break_duration_min = float(break_duration_min_var.get())
-            break_duration_max = float(break_duration_max_var.get())
+            break_duration_min = parse_finite_float(break_duration_min_var.get())
+            break_duration_max = parse_finite_float(break_duration_max_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Break duration (seconds) must be numbers.")
             return None
@@ -6742,7 +6757,7 @@ def validate_settings():
     typo_chance = 0.0
     if enable_typos:
         try:
-            typo_chance = float(typo_chance_var.get())
+            typo_chance = parse_finite_float(typo_chance_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Typo chance must be a number.")
             return None
@@ -6754,7 +6769,7 @@ def validate_settings():
     paraphrase_chance = 0.0
     if enable_paraphrase:
         try:
-            paraphrase_chance = float(paraphrase_chance_var.get())
+            paraphrase_chance = parse_finite_float(paraphrase_chance_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Paraphrase chance must be a number.")
             return None
@@ -6766,7 +6781,7 @@ def validate_settings():
     lookback_edit_chance = 0.0
     if enable_lookback_edit:
         try:
-            lookback_edit_chance = float(lookback_edit_chance_var.get())
+            lookback_edit_chance = parse_finite_float(lookback_edit_chance_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Second revision chance must be a number.")
             return None
@@ -6778,7 +6793,7 @@ def validate_settings():
     select_retype_chance = 0.0
     if enable_select_retype:
         try:
-            select_retype_chance = float(select_retype_chance_var.get())
+            select_retype_chance = parse_finite_float(select_retype_chance_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Select and retype chance must be a number.")
             return None
@@ -6790,7 +6805,7 @@ def validate_settings():
     overshoot_chance = 0.0
     if enable_overshoot:
         try:
-            overshoot_chance = float(overshoot_chance_var.get())
+            overshoot_chance = parse_finite_float(overshoot_chance_var.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Overshoot chance must be a number.")
             return None
@@ -6809,7 +6824,7 @@ def validate_settings():
     # Auto-pause alert (Update #54): on or off.
     alert_on_auto_pause = bool(alert_on_auto_pause_var.get())
     try:
-        activity_sensitivity = float(activity_sensitivity_var.get())
+        activity_sensitivity = parse_finite_float(activity_sensitivity_var.get())
         if activity_sensitivity < 5 or activity_sensitivity > 500:
             activity_sensitivity = 20.0
             activity_sensitivity_var.set("20")
@@ -6819,7 +6834,7 @@ def validate_settings():
 
     enable_fatigue = enable_fatigue_var.get()
     try:
-        fatigue_strength = float(fatigue_strength_var.get())
+        fatigue_strength = parse_finite_float(fatigue_strength_var.get())
         if fatigue_strength < 0:
             fatigue_strength = 0.0
             fatigue_strength_var.set("0")
@@ -6833,7 +6848,7 @@ def validate_settings():
     enable_finger_timing = bool(enable_finger_timing_var.get())
     enable_typing_moods = bool(enable_typing_moods_var.get())
     try:
-        typing_mood_strength = float(typing_mood_strength_var.get())
+        typing_mood_strength = parse_finite_float(typing_mood_strength_var.get())
         if typing_mood_strength < 0:
             typing_mood_strength = 0.0
             typing_mood_strength_var.set("0")
@@ -6845,7 +6860,7 @@ def validate_settings():
         typing_mood_strength_var.set("100")
     enable_difficulty_pauses = bool(enable_difficulty_pauses_var.get())
     try:
-        difficulty_pause_strength = float(difficulty_pause_strength_var.get())
+        difficulty_pause_strength = parse_finite_float(difficulty_pause_strength_var.get())
         if difficulty_pause_strength < 0:
             difficulty_pause_strength = 0.0
             difficulty_pause_strength_var.set("0")
@@ -6857,7 +6872,7 @@ def validate_settings():
         difficulty_pause_strength_var.set("100")
     enable_typing_bursts = bool(enable_typing_bursts_var.get())
     try:
-        burst_pause_strength = float(burst_pause_strength_var.get())
+        burst_pause_strength = parse_finite_float(burst_pause_strength_var.get())
         if burst_pause_strength < 0:
             burst_pause_strength = 0.0
             burst_pause_strength_var.set("0")
@@ -6869,7 +6884,7 @@ def validate_settings():
         burst_pause_strength_var.set("100")
     enable_decision_pauses = bool(enable_decision_pauses_var.get())
     try:
-        decision_pause_strength = float(decision_pause_strength_var.get())
+        decision_pause_strength = parse_finite_float(decision_pause_strength_var.get())
         if decision_pause_strength < 0:
             decision_pause_strength = 0.0
             decision_pause_strength_var.set("0")
@@ -6881,7 +6896,7 @@ def validate_settings():
         decision_pause_strength_var.set("100")
     enable_uneven_rhythm = bool(enable_uneven_rhythm_var.get())
     try:
-        rhythm_strength = float(rhythm_strength_var.get())
+        rhythm_strength = parse_finite_float(rhythm_strength_var.get())
         if rhythm_strength < 0:
             rhythm_strength = 0.0
             rhythm_strength_var.set("0")
@@ -6893,7 +6908,7 @@ def validate_settings():
         rhythm_strength_var.set("100")
     enable_writing_habits = bool(enable_writing_habits_var.get())
     try:
-        writing_habit_strength = float(writing_habit_strength_var.get())
+        writing_habit_strength = parse_finite_float(writing_habit_strength_var.get())
         if not (writing_habit_strength >= 0):  # also catches NaN
             writing_habit_strength = 0.0
             writing_habit_strength_var.set("0")
@@ -6905,7 +6920,7 @@ def validate_settings():
         writing_habit_strength_var.set("100")
     enable_essay_pace = bool(enable_essay_pace_var.get())
     try:
-        essay_pace_strength = float(essay_pace_strength_var.get())
+        essay_pace_strength = parse_finite_float(essay_pace_strength_var.get())
         if not (essay_pace_strength >= 0):  # also catches NaN
             essay_pace_strength = 0.0
             essay_pace_strength_var.set("0")
@@ -6917,7 +6932,7 @@ def validate_settings():
         essay_pace_strength_var.set("100")
     enable_warmup = bool(enable_warmup_var.get())
     try:
-        warmup_strength = float(warmup_strength_var.get())
+        warmup_strength = parse_finite_float(warmup_strength_var.get())
         if not (warmup_strength >= 0):  # also catches NaN
             warmup_strength = 0.0
             warmup_strength_var.set("0")
@@ -6953,7 +6968,7 @@ def validate_settings():
         scheduled_start_time_var.set(scheduled_start_time)
     enable_revision_clusters = bool(enable_revision_clusters_var.get())
     try:
-        cluster_strength = float(cluster_strength_var.get())
+        cluster_strength = parse_finite_float(cluster_strength_var.get())
         if not math.isfinite(cluster_strength):
             raise ValueError("not a finite number")
         if cluster_strength < 0:
@@ -6977,7 +6992,7 @@ def validate_settings():
     smart_fix_capitalization = bool(smart_fix_capitalization_var.get())
     smart_fix_repeated_words = bool(smart_fix_repeated_words_var.get())
     try:
-        smart_fix_visible_chance = float(smart_fix_visible_chance_var.get())
+        smart_fix_visible_chance = parse_finite_float(smart_fix_visible_chance_var.get())
         if not (smart_fix_visible_chance >= 0):  # also catches NaN
             smart_fix_visible_chance = 0.0
             smart_fix_visible_chance_var.set("0")
@@ -11401,6 +11416,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.30.0",
+        "date": "2026-10-29",
+        "title": "Automatic tests",
+        "changes": [
+            "Added: a tests folder with 89 automatic checks for the parts of Amanuensis that must never break: protected text, bold and italic markers, pause markers, Markdown input, every Smart Text Fixes rule, settings checking, saving and loading settings, the typed text check, and Learn My Speed. They use Python's built-in unittest, so nothing new needs to be installed.",
+            "Added: a Tests job in the project's online checks, so every pull request runs the tests before it can be merged.",
+            "Fixed: typing nan, inf, or -inf into a number box (delays, pauses, break lengths, chances, strengths) was accepted, and could freeze or crash a typing run. Those words are now refused with the usual message, and strength and chance boxes go back to a safe number.",
+            "Notes: the app itself was not restructured to make it testable. No new settings and no new packages.",
+        ],
+    },
     {
         "version": "5.29.0",
         "date": "2026-10-29",

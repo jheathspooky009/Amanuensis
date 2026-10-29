@@ -37,16 +37,36 @@ jobs:
         run: uv sync --locked --group dev
 
       - name: Syntax check (py_compile)
-        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py
+        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py tests/app_loader.py tests/test_protected_text.py tests/test_format_markers.py tests/test_smart_fixes.py tests/test_settings.py tests/test_typed_text_check.py tests/test_speed_and_loading.py
 
       - name: Lint check (pyflakes)
-        run: uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py
+        run: uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py tests
 
       # Medium and high severity findings fail the build. The low findings
       # (random numbers used for typing delays, best-effort try/except) are
       # expected in this app and are not security problems.
       - name: Code security scan (bandit)
         run: uvx bandit@1.9.4 -q -ll -r Amanuensis.py scripts
+
+  tests:
+    name: Automatic tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # The tests use only Python's built-in unittest and read Amanuensis.py as
+      # text, so no packages are installed and no window is opened.
+      - name: Run the automatic tests
+        run: python -m unittest discover -s tests -v
 
   repo-hygiene:
     name: Personal data and secrets check

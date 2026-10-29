@@ -20,10 +20,11 @@ uv run python Amanuensis.py
 Run all of these. A pull request that fails them will not be merged.
 
 ```
-uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py
-uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py
+uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py tests/app_loader.py tests/test_protected_text.py tests/test_format_markers.py tests/test_smart_fixes.py tests/test_settings.py tests/test_typed_text_check.py tests/test_speed_and_loading.py
+uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py tests
 uvx bandit@1.9.4 -q -ll -r Amanuensis.py scripts
 uv run python scripts/security_check.py
+uv run python -m unittest discover -s tests -v
 uv export --locked --no-emit-project -o requirements-audit.txt
 uvx pip-audit@2.10.1 -r requirements-audit.txt --no-deps --disable-pip
 ```
@@ -47,6 +48,7 @@ Never write those words into any file in the repository. The same checks run aut
 7. **Never publish a locally built `.exe`.** Releases are built only by the Release workflow from a pushed tag.
 8. **Follow the existing code patterns** (CustomTkinter `modern_*` helpers, `run_on_main_thread()` for background threads, new settings need a variable, validation, the settings dict, and both snapshot functions).
 9. **Update the version history** in `Amanuensis.py` (the comment block and `VERSION_HISTORY`) and keep `pyproject.toml` on the same version.
+10. **Add a test when you fix a bug or add logic that does not need a window.** Tests live in `tests/` and use Python's built-in `unittest`. Because `Amanuensis.py` builds its window when it loads, the tests read it through `tests/app_loader.py`, which runs only its functions and plain settings. Use `from app_loader import get_app` and call the function with `APP["function_name"]`.
 
 ## For maintainers: making a release
 
