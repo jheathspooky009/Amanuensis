@@ -9,6 +9,19 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.29.0 (2026-10-29) -- Learn my speed
+#   - Added: A Learn My Speed button in the Typing Speed card (Speed tab). It opens
+#     a window where the person types a short paragraph. The time between key
+#     presses is measured and shown as words per minute while they type.
+#   - Added: Use This Speed fills in Target WPM, Min Delay, and Max Delay, the same
+#     way Apply WPM does. It turns on after 40 key presses are measured.
+#   - Modified: Apply WPM and Learn My Speed share one function,
+#     set_delays_from_wpm(), so the same speed always gives the same delays.
+#   - Notes: Gaps over 2 seconds, and gaps around Backspace, Delete, arrow keys,
+#     and shortcuts, are left out, and pasting is blocked in the window. The typed
+#     text is never saved. measure_typing_speed() is a plain function that takes a
+#     list of gaps, so it is easy to test. No new settings and no new packages.
+#
 # v5.28.0 (2026-10-28) -- Markdown and Word input
 #   - Added: Input files can now be Markdown (.md or .markdown) or Word (.docx),
 #     as well as .txt. In a Markdown file, **bold** and *italic* (also __bold__,
@@ -41,20 +54,6 @@
 #     when finished checkbox and needs Windows sound (winsound). It is played
 #     through run_on_main_thread(). Like the completion alerts, a starter profile
 #     never changes the setting. Older settings load as off. No new packages.
-#
-# v5.26.0 (2026-10-23) -- Preview playback speed
-#   - Added: Playback speed in the Preview Run window. Pick 1x, 1.25x, 1.5x,
-#     1.75x, 2x, 3x, 5x, 10x, or 20x, and it changes right away, even in the
-#     middle of a preview. Only the waiting is shortened, so the same text,
-#     typos, reworks, and pauses happen in the same order, just sooner. Real
-#     runs always use real time.
-#   - Added: One new setting (preview_speed), saved and restored on launch. It
-#     belongs to this computer, so shared profiles, Auto Profiles, and starter
-#     profiles never carry or change it, and Reset All Settings leaves it alone.
-#   - Notes: Typing delays now go through a new helper, paced_sleep(), which
-#     waits the full time unless the run is a preview. Waits for Stop, Pause, and
-#     focus checks still use real time. Pause markers count down faster in a
-#     preview. Older settings load as 1x. No new packages.
 #
 # ============================================
 
@@ -9995,9 +9994,180 @@ def apply_target_wpm(event=None):
         messagebox.showerror("Invalid Input", "Target WPM must be between 1 and 400.")
         return
 
+    set_delays_from_wpm(wpm)
+
+
+def set_delays_from_wpm(wpm):
+    """Write the Min Delay and Max Delay fields for a words-per-minute speed
+    (5 characters per word). The average delay matches the speed, with Min at
+    half of it and Max at one and a half times it. Used by Apply WPM and by
+    Learn My Speed, so both always give the same delays for the same speed."""
     avg_delay = 12.0 / wpm  # seconds/char: 60s / (wpm * 5 chars-per-word)
     min_delay_var.set(f"{avg_delay * 0.5:.3f}")
     max_delay_var.set(f"{avg_delay * 1.5:.3f}")
+
+
+# --------------------------------------------
+# LEARN MY SPEED (Update #56)
+# --------------------------------------------
+# A small window where the person types a short paragraph. The gaps between
+# their key presses are measured, and the result fills in Target WPM and the
+# Min/Max Delay fields. Nothing is saved except those existing fields, and the
+# text typed in the window is never stored or sent anywhere.
+LEARN_SPEED_SAMPLE = (
+    "The library on the corner stays open late on Thursdays, so I usually stop by "
+    "after work. I pick a quiet table near the window, spread out my notes, and "
+    "read until the lights flicker to say it is almost closing time."
+)
+LEARN_SPEED_MIN_KEYS = 40      # measured key gaps needed before a speed is shown
+LEARN_SPEED_MIN_GAP = 0.02     # seconds; anything quicker is a keyboard glitch
+LEARN_SPEED_PAUSE_LIMIT = 2.0  # seconds; a longer gap is thinking, not typing speed
+LEARN_SPEED_MODIFIER_KEYS = (
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    "Caps_Lock", "Num_Lock", "Scroll_Lock", "Win_L", "Win_R",
+)
+learn_speed_window = None  # the open Learn My Speed window, or None
+
+
+def usable_learn_speed_gaps(gaps):
+    """Keep only the gaps (in seconds) that show real typing speed: not a
+    keyboard glitch, and not a pause to think."""
+    return [g for g in gaps if LEARN_SPEED_MIN_GAP <= g <= LEARN_SPEED_PAUSE_LIMIT]
+
+
+def measure_typing_speed(gaps):
+    """Turn the gaps between key presses (in seconds) into a words-per-minute
+    speed, using the same 5-characters-per-word rule as Target WPM. Long
+    pauses are left out because the app adds its own pauses separately, so
+    this is the raw per-character speed. Returns None until there are enough
+    measured gaps to be steady, otherwise a whole number from 1 to 400."""
+    usable = usable_learn_speed_gaps(gaps)
+    if len(usable) < LEARN_SPEED_MIN_KEYS:
+        return None
+    average_gap = sum(usable) / len(usable)
+    wpm = round(12.0 / average_gap)
+    return int(min(max(wpm, 1), 400))
+
+
+def open_learn_speed_window():
+    """Opens the Learn My Speed window (Typing Speed card, Speed tab)."""
+    global learn_speed_window
+
+    if state.is_running:
+        messagebox.showinfo(
+            "Already Running", "Stop the current session before measuring your typing speed."
+        )
+        return
+    if learn_speed_window is not None and learn_speed_window.winfo_exists():
+        learn_speed_window.lift()
+        learn_speed_window.focus_force()
+        return
+
+    learn_win = modern_toplevel(window, "Learn My Speed", "640x540", (480, 460))
+    learn_speed_window = learn_win
+    session = {"gaps": [], "last_time": None}
+    status_var = tk.StringVar(value="")
+
+    modern_label(
+        learn_win,
+        "Type the paragraph below, or any short paragraph you like, at your normal "
+        "speed. Fix mistakes the way you usually do. Amanuensis measures the time "
+        "between your key presses. The text you type here is not saved.",
+        wraplength=580,
+    ).pack(anchor="w", padx=12, pady=(10, 6))
+
+    sample_box = modern_frame(learn_win, bordered=True)
+    sample_box.pack(fill="x", padx=12, pady=(0, 8))
+    modern_label(sample_box, LEARN_SPEED_SAMPLE, kind="muted", wraplength=560).pack(
+        anchor="w", padx=10, pady=8
+    )
+
+    typing_box = modern_textbox(learn_win, height=140)
+    typing_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+    modern_label(learn_win, textvariable=status_var, kind="muted", wraplength=580).pack(
+        anchor="w", padx=12, pady=(0, 8)
+    )
+
+    button_row = modern_frame(learn_win)
+    button_row.pack(anchor="w", padx=12, pady=(0, 12))
+    use_button = modern_button(button_row, "Use This Speed", lambda: use_speed(), state="disabled")
+    use_button.pack(side="left")
+    modern_button(button_row, "Start Over", lambda: start_over(), kind="neutral").pack(
+        side="left", padx=(8, 0)
+    )
+    modern_button(button_row, "Cancel", lambda: close_window(), kind="neutral").pack(
+        side="left", padx=(8, 0)
+    )
+
+    def refresh_status():
+        """Shows how far along the measuring is, and turns the Use button on
+        once there are enough key presses to be steady."""
+        measured = len(usable_learn_speed_gaps(session["gaps"]))
+        speed = measure_typing_speed(session["gaps"])
+        if speed is None:
+            status_var.set(
+                f"Keep typing. {measured} of {LEARN_SPEED_MIN_KEYS} key presses measured so far."
+            )
+            use_button.configure(state="disabled")
+        else:
+            status_var.set(
+                f"Your typing speed is about {speed} WPM. Press Use This Speed, "
+                "or keep typing for a steadier result."
+            )
+            use_button.configure(state="normal")
+
+    def on_key(event):
+        """Records the time of each key that types a character. Backspace,
+        Delete, arrows, and shortcuts break the chain, so a gap around a
+        correction or a cursor move is never counted as typing speed."""
+        if event.keysym in LEARN_SPEED_MODIFIER_KEYS:
+            return
+        character = event.char
+        if not character or not (character.isprintable() or character in ("\r", "\n")):
+            session["last_time"] = None
+            return
+        now = time.perf_counter()
+        if session["last_time"] is not None:
+            session["gaps"].append(now - session["last_time"])
+        session["last_time"] = now
+        refresh_status()
+
+    def block_paste(_event=None):
+        """Pasted text has no typing speed, so pasting is switched off here."""
+        return "break"
+
+    def start_over():
+        typing_box.delete("1.0", "end")
+        session["gaps"] = []
+        session["last_time"] = None
+        refresh_status()
+        typing_box.focus_set()
+
+    def use_speed():
+        speed = measure_typing_speed(session["gaps"])
+        if speed is None:
+            return
+        target_wpm_var.set(str(speed))
+        set_delays_from_wpm(speed)
+        close_window()
+        messagebox.showinfo(
+            "Typing Speed Measured",
+            f"Your typing speed is about {speed} WPM.\n\n"
+            "Target WPM, Min Delay, and Max Delay are filled in. Pauses, breaks, and "
+            "mistakes are separate, so your overall session speed will be a little lower.",
+        )
+
+    def close_window():
+        global learn_speed_window
+        learn_speed_window = None
+        learn_win.destroy()
+
+    typing_box.bind("<KeyPress>", on_key)
+    typing_box.bind("<<Paste>>", block_paste)
+    learn_win.protocol("WM_DELETE_WINDOW", close_window)
+    refresh_status()
+    learn_win.after(200, typing_box.focus_set)
 
 
 # --------------------------------------------
@@ -11232,6 +11402,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.29.0",
+        "date": "2026-10-29",
+        "title": "Learn my speed",
+        "changes": [
+            "Added: a Learn My Speed button in the Typing Speed card on the Speed tab. It opens a small window where you type a short paragraph (a sample is shown, or type any paragraph you like). Amanuensis measures the time between your key presses and shows your typing speed in words per minute as you go.",
+            "Added: Use This Speed fills in Target WPM, Min Delay, and Max Delay for you, the same way Apply WPM does. It turns on after 40 key presses have been measured, and you can keep typing for a steadier result or press Start Over.",
+            "Modified: Apply WPM and Learn My Speed now share one function for turning a speed into Min and Max Delay, so the same speed always gives the same delays.",
+            "Notes: gaps longer than 2 seconds (thinking) and gaps around Backspace, Delete, arrow keys, and shortcuts are not counted, and pasting is blocked in the window, so only real typing is measured. The text typed in the window is never saved. No new settings and no new packages.",
+        ],
+    },
+    {
         "version": "5.28.0",
         "date": "2026-10-28",
         "title": "Markdown and Word input",
@@ -12231,6 +12412,16 @@ modern_label(
     "and will bring your overall session average below this number.",
     kind="muted",
 ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_button(frame_settings, "Learn My Speed", open_learn_speed_window, kind="neutral").grid(
+    row=6, column=0, sticky="w", pady=(10, 0)
+)
+modern_label(
+    frame_settings,
+    "Type a short paragraph and Amanuensis measures your real speed, then\n"
+    "fills in Target WPM, Min Delay, and Max Delay for you.",
+    kind="muted",
+).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Target time (Update #27) ---
 modern_checkbox(
