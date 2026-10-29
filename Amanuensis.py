@@ -9,6 +9,22 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.27.0 (2026-10-28) -- Auto-pause alert
+#   - Added: A beep when typing pauses by itself. When the target window loses
+#     focus (Target Window Lock), when mouse movement triggers Auto-pause on
+#     mouse/keyboard activity, or when focus is lost in the middle of a second
+#     revision pass fix, a short warning beep plays once, so hands-free users
+#     know without watching the screen. It uses a different sound from the
+#     finished sound. Pausing yourself never beeps.
+#   - Added: One new setting (alert_on_auto_pause), off by default, with its own
+#     checkbox in the Alerts card on the Hotkeys tab (the old On Completion card,
+#     renamed because it now holds both kinds of alert). It is saved and restored
+#     on launch and is part of the card's Reset This Section button.
+#   - Notes: Preview runs never beep. The beep is independent of the Play sound
+#     when finished checkbox and needs Windows sound (winsound). It is played
+#     through run_on_main_thread(). Like the completion alerts, a starter profile
+#     never changes the setting. Older settings load as off. No new packages.
+#
 # v5.26.0 (2026-10-23) -- Preview playback speed
 #   - Added: Playback speed in the Preview Run window. Pick 1x, 1.25x, 1.5x,
 #     1.75x, 2x, 3x, 5x, 10x, or 20x, and it changes right away, even in the
@@ -40,27 +56,6 @@
 #   - Notes: The Preview Run box now uses the same Backspace steps as a real run,
 #     so the preview check (v5.25.0) matches what a real editor does. The unused
 #     Ctrl+Backspace helpers were removed. No settings changed. No new packages.
-#
-# v5.25.0 (2026-10-22) -- Check typed text
-#   - Added: Typed text check. When a run finishes, Amanuensis compares the text
-#     that is really on screen with the text it meant to type, and opens a Typed
-#     Text Check report if anything differs (line number, what is on screen, and
-#     what it should be). A preview run is always checked by reading the Preview
-#     Run box, with no keys and no clipboard. For a real run, the new Check Typed
-#     Text card on the Hotkeys tab (off by default) copies everything before the
-#     cursor in the target window (Ctrl+Shift+Home, then Ctrl+C), compares it,
-#     collapses the selection with Right, and puts the earlier clipboard text back.
-#   - Added: One new setting (check_typed_text), saved and restored on launch, with
-#     its own Reset This Section button, and a View Last Text Check button.
-#   - Notes: Purposely left mistakes (Leave Mistakes For Me) are expected, so they
-#     are not counted as differences. Text already in the document before the
-#     cursor is ignored. Curly quotes, non-breaking spaces, and spaces at the very
-#     end count as the same text. The check is skipped with a message if the target
-#     window is not in front or copying is blocked, and it never changes the typed
-#     text. The log records only counts and line numbers, never the text. The
-#     setting belongs to this computer, so shared profiles, Auto Profiles, and
-#     starter profiles never carry or change it. No new packages (difflib is
-#     part of Python).
 #
 # ============================================
 
@@ -2890,10 +2885,40 @@ def _info_and_stop(title, message):
 # If physical mouse movement exceeding the configured pixel sensitivity
 # is detected, it triggers pause_event and notifies the user via the
 # status bar. Resuming typing uses the normal resume control (button/hotkey).
-def _activity_watcher(sensitivity):
+
+
+# --------------------------------------------
+# AUTO-PAUSE ALERT (Update #54)
+# --------------------------------------------
+# A short beep when typing pauses BY ITSELF (the locked window lost focus, or
+# mouse movement triggered Auto-pause on activity). It is for hands-free users
+# who are not watching the screen. A pause the person asks for (button or
+# hotkey) never beeps. It is a different sound from the finished sound, and it
+# does not depend on the Play sound when finished checkbox.
+def play_auto_pause_alert():
+    """Plays the auto-pause beep. Does nothing where winsound is missing."""
+    if not HAS_WINSOUND:
+        return
+    try:
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except Exception:
+        pass
+
+
+def alert_auto_pause(settings):
+    """Called from the typing thread the moment a run auto-pauses. Beeps once if
+    the person turned the alert on. Preview runs never beep. The beep goes
+    through run_on_main_thread() like every other action from a background thread."""
+    if not settings.get("alert_on_auto_pause", False) or settings.get("preview_mode"):
+        return
+    run_on_main_thread(play_auto_pause_alert)
+
+
+def _activity_watcher(sensitivity, alert=False):
     """Monitors mouse cursor position while typing is active.
     If the cursor moves more than `sensitivity` pixels from its resting position,
-    triggers an automatic pause via the existing pause mechanism.
+    triggers an automatic pause via the existing pause mechanism. When `alert`
+    is True, the pause also plays the auto-pause beep (Update #54).
     All GUI calls are safely routed through run_on_main_thread()."""
     try:
         last_pos = pyautogui.position()
@@ -2940,6 +2965,8 @@ def _activity_watcher(sensitivity):
             state.status = "Activity detected \u2014 paused"
             log_event("activity_pause", f"mouse moved {dist:.1f}px")
             run_on_main_thread(lambda: btn_pause.configure(text="Resume Typing"))
+            if alert:
+                run_on_main_thread(play_auto_pause_alert)
             last_pos = curr_pos
 
 
@@ -4957,6 +4984,7 @@ def _lookback_gate(settings, check_focus):
         return True
     previous_status = state.status
     block_start = time.time()
+    focus_alert_given = False
     while True:
         if stop_event.is_set():
             return False
@@ -4965,6 +4993,9 @@ def _lookback_gate(settings, check_focus):
                 state.status = "Paused"
         elif check_focus and not _lookback_focus_ok(settings):
             state.status = "Focus lost \u2014 paused"
+            if not focus_alert_given:
+                focus_alert_given = True
+                alert_auto_pause(settings)
         else:
             break
         time.sleep(0.2)
@@ -5789,6 +5820,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if not focus_lost_event.is_set():
                         focus_lost_event.set()
                         log_event("focus_lost", f"active window now '{active_title}'")
+                        alert_auto_pause(settings)
                 else:
                     if focus_lost_event.is_set():
                         focus_lost_event.clear()
@@ -6629,6 +6661,8 @@ def validate_settings():
     auto_profile_rules = get_auto_profile_rules()
 
     auto_pause_activity = auto_pause_activity_var.get()
+    # Auto-pause alert (Update #54): on or off.
+    alert_on_auto_pause = bool(alert_on_auto_pause_var.get())
     try:
         activity_sensitivity = float(activity_sensitivity_var.get())
         if activity_sensitivity < 5 or activity_sensitivity > 500:
@@ -6905,6 +6939,7 @@ def validate_settings():
         "enable_auto_profile": enable_auto_profile,
         "auto_profile_rules": auto_profile_rules,
         "auto_pause_activity": auto_pause_activity,
+        "alert_on_auto_pause": alert_on_auto_pause,
         "activity_sensitivity": activity_sensitivity,
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
@@ -7562,7 +7597,7 @@ def start_typing():
     if settings.get("auto_pause_activity") and not settings.get("preview_mode"):
         watcher_thread = threading.Thread(
             target=_activity_watcher,
-            args=(settings.get("activity_sensitivity", 20.0),),
+            args=(settings.get("activity_sensitivity", 20.0), settings.get("alert_on_auto_pause", False)),
             daemon=True,
         )
         watcher_thread.start()
@@ -8703,6 +8738,7 @@ def get_current_settings_snapshot():
         "auto_profile_rules": get_auto_profile_rules(),
         "enable_notify": enable_notify_var.get(),
         "enable_sound": enable_sound_var.get(),
+        "alert_on_auto_pause": alert_on_auto_pause_var.get(),
         "auto_pause_activity": auto_pause_activity_var.get(),
         "activity_sensitivity": activity_sensitivity_var.get(),
         "enable_fatigue": enable_fatigue_var.get(),
@@ -8798,6 +8834,7 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     sentence_pause_max_var.set(data.get("sentence_pause_max", "7"))
     enable_notify_var.set(data.get("enable_notify", True))
     enable_sound_var.set(data.get("enable_sound", True))
+    alert_on_auto_pause_var.set(bool(data.get("alert_on_auto_pause", False)))
     auto_pause_activity_var.set(data.get("auto_pause_activity", False))
     activity_sensitivity_var.set(str(data.get("activity_sensitivity", "20")))
     enable_fatigue_var.set(data.get("enable_fatigue", False))
@@ -9306,6 +9343,7 @@ STARTER_PROFILE_KEEP_KEYS = AUTO_PROFILE_KEEP_KEYS + (
     "log_enabled",
     "enable_notify",
     "enable_sound",
+    "alert_on_auto_pause",
     "auto_pause_activity",
     "activity_sensitivity",
     "start_countdown_seconds",
@@ -10420,6 +10458,7 @@ hotkey_warning_var = tk.StringVar(value="")
 log_enabled_var = tk.BooleanVar(value=False)
 enable_notify_var = tk.BooleanVar(value=True)
 enable_sound_var = tk.BooleanVar(value=True)
+alert_on_auto_pause_var = tk.BooleanVar(value=False)
 check_typed_text_var = tk.BooleanVar(value=False)
 preview_speed_var = tk.StringVar(value=preview_speed_label(PREVIEW_SPEED_DEFAULT))
 enable_update_check_var = tk.BooleanVar(value=True)
@@ -10512,7 +10551,7 @@ SECTION_RESET_VARS = {
     ],
     "Hotkeys": [hotkey_start_var, hotkey_pause_var, hotkey_stop_var, hotkey_skip_break_var],
     "Session Log": [log_enabled_var],
-    "On Completion": [enable_notify_var, enable_sound_var],
+    "Alerts": [enable_notify_var, enable_sound_var, alert_on_auto_pause_var],
     "Check Typed Text": [check_typed_text_var],
     "Updates": [enable_update_check_var, skipped_update_version_var],
 }
@@ -11053,6 +11092,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.27.0",
+        "date": "2026-10-28",
+        "title": "Auto-pause alert",
+        "changes": [
+            "Added: a beep when typing pauses by itself. If the locked window loses focus, or mouse movement triggers Auto-pause on activity, a short warning beep plays once, so you know without watching the screen. It also plays if focus is lost in the middle of a second revision pass fix. It is a different sound from the finished sound, and pausing yourself never beeps.",
+            "Added: one new setting (beep when typing pauses by itself), off by default, shown as a checkbox in the Alerts card on the Hotkeys tab. It is saved and restored on launch and is part of that card's Reset This Section button.",
+            "Modified: the On Completion card on the Hotkeys tab is now called Alerts, because it holds both kinds of alert.",
+            "Notes: a preview never beeps. The beep works on its own, even if the finished sound is off, and needs Windows sound. Like the finished alerts, a starter profile never changes it. Older settings load as off. No new packages.",
+        ],
+    },
     {
         "version": "5.26.0",
         "date": "2026-10-23",
@@ -11719,7 +11769,7 @@ frame_leave_mistakes = make_modern_card(tab_mistakes, "Leave Mistakes For Me")
 
 # --- Tab: Hotkeys (controls and what happens when a run ends) ---
 frame_hotkeys = make_modern_card(tab_hotkeys, "Hotkeys")
-frame_completion = make_modern_card(tab_hotkeys, "On Completion")
+frame_completion = make_modern_card(tab_hotkeys, "Alerts")
 frame_check_text = make_modern_card(tab_hotkeys, "Check Typed Text")
 
 # --- Tab: Data (saved settings and logs) ---
@@ -12706,7 +12756,7 @@ modern_button(frame_logging, "View Last Session Log", open_log_viewer, kind="neu
     row=1, column=1, sticky="w", pady=(10, 0)
 )
 
-# --- On Completion ---
+# --- Alerts (finished and auto-pause) ---
 modern_checkbox(
     frame_completion, "Show notification when finished", enable_notify_var
 ).grid(row=0, column=0, sticky="w")
@@ -12724,6 +12774,17 @@ modern_label(
     "Both only trigger when a run finishes naturally, not on a manual Stop.",
     kind="muted",
 ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+modern_checkbox(
+    frame_completion, "Beep when typing pauses by itself", alert_on_auto_pause_var
+).grid(row=4, column=0, sticky="w", pady=(14, 0))
+modern_label(
+    frame_completion,
+    "Plays a short warning beep when a run auto-pauses: the locked window lost focus,\n"
+    "or mouse movement triggered Auto-pause on activity. It never beeps when you pause\n"
+    "yourself, and not in a preview. It works on its own, even if the finished sound\n"
+    "is off, and needs Windows sound.",
+    kind="muted",
+).grid(row=5, column=0, sticky="w", pady=(6, 0))
 
 # --- Check Typed Text (Update #51) ---
 modern_checkbox(
@@ -12849,7 +12910,7 @@ SECTION_CARDS = {
     "Leave Mistakes For Me": frame_leave_mistakes,
     "Hotkeys": frame_hotkeys,
     "Session Log": frame_logging,
-    "On Completion": frame_completion,
+    "Alerts": frame_completion,
     "Check Typed Text": frame_check_text,
     "Updates": frame_updates,
 }
