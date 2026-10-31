@@ -9,6 +9,32 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.31.0 (2026-10-30) -- Editor type
+#   - Added: An Editor Type card on the Window tab with one new setting,
+#     editor_mode (Plain text, Google Docs or Word, or Code editor), saved with
+#     profiles and restored on launch. Plain text is the default and types
+#     exactly as before. The card has its own Reset This Section button.
+#   - Added: Google Docs or Word mode types a line that starts with a list
+#     marker (1. or a) or - or * or + or a round bullet, with up to 12 leading
+#     spaces) as space, Left, marker, Right, so the editor does not turn the
+#     line into a list. The text on screen ends up the same as the file.
+#   - Added: Code editor mode clears the editor's own indent at the start of
+#     every line after the first (Shift+Home, a space, Backspace), so the
+#     line's own spaces are not added on top of it. Blank lines are cleared too.
+#   - Modified: Starter profiles leave the editor type as it is, and the load
+#     message lists it. Auto Profile can pick it, because a saved profile
+#     carries it.
+#   - Notes: New plain functions: normalize_editor_mode(), find_editor_list_marker(),
+#     plan_editor_line_start(), editor_marker_span_is_clear(). The two key
+#     sequences are _run_editor_clear_indent() and _run_editor_list_marker(),
+#     called from one spot in the typing loop. A list marker is typed as one
+#     unit, so it is only used when no format shortcut, pause marker, or left
+#     mistake is planned inside it; otherwise it is typed the normal way. Both
+#     sequences never delete real text and always finish once started. Preview
+#     runs skip them. Not handled: auto-closing brackets, suggestion pop-ups,
+#     and other autocorrect (smart quotes, symbols). Older settings and profile
+#     files without this setting load as Plain text. No new packages.
+#
 # v5.30.0 (2026-10-29) -- Automatic tests
 #   - Added: A tests/ folder with 89 automatic checks (Python's built-in unittest,
 #     so no new package). They cover protected text, the [[b]] and [[i]] markers,
@@ -42,23 +68,6 @@
 #     and shortcuts, are left out, and pasting is blocked in the window. The typed
 #     text is never saved. measure_typing_speed() is a plain function that takes a
 #     list of gaps, so it is easy to test. No new settings and no new packages.
-#
-# v5.28.0 (2026-10-28) -- Markdown and Word input
-#   - Added: Input files can now be Markdown (.md or .markdown) or Word (.docx),
-#     as well as .txt. In a Markdown file, **bold** and *italic* (also __bold__,
-#     _italic_, and ***both***) turn into the [[b]] and [[i]] formatting markers,
-#     so the text is bolded and italicized with Ctrl+B and Ctrl+I as it is typed.
-#     Headings, lists, links, and code are typed exactly as written. A Word file
-#     is read as plain text only (paragraphs, line breaks, and tabs).
-#   - Modified: Browse and Add Files now show the new types first, with .txt,
-#     Markdown, Word, and All files choices. The batch queue can mix all three.
-#   - Notes: One new function, read_input_file_text(), now opens every input file
-#     (typing, time estimate, preview, resume checks, marker checks, Smart Text
-#     Fixes review), so they all see the same text. The Word reader uses only
-#     the standard library (zipfile and re), caps file size, and reads just the
-#     text part, so no new package is added. Marks with no partner, spaced math
-#     like 2 * 3 * 4, snake_case words, and [[protected text]] are left alone.
-#     No new settings.
 #
 # ============================================
 
@@ -3014,6 +3023,121 @@ def _press_format_toggles(settings, kinds, active_formats):
     return not stop_event.is_set()
 
 
+# --------------------------------------------
+# EDITOR TYPE (Update #58)
+# --------------------------------------------
+# Editors change what is typed into them. Google Docs and Word turn "1. " or
+# "- " at the start of a line into a real list, and code editors add their own
+# indentation after Enter. The Editor Type setting adds a few extra keys at the
+# start of a line so the text on screen still matches the file. Plain text
+# adds nothing. Every extra key was chosen so that if the editor does not
+# behave as expected, nothing is deleted: the worst case is the same text a
+# plain run would type. Preview runs never press these keys.
+EDITOR_MODE_PLAIN = "Plain text"
+EDITOR_MODE_DOCS = "Google Docs or Word"
+EDITOR_MODE_CODE = "Code editor"
+EDITOR_MODES = (EDITOR_MODE_PLAIN, EDITOR_MODE_DOCS, EDITOR_MODE_CODE)
+EDITOR_ACTION_CLEAR_INDENT = "clear_indent"
+EDITOR_ACTION_LIST_MARKER = "list_marker"
+# A list marker at the start of a line: up to 12 spaces or tabs, then 1 to 3
+# digits or one letter followed by . or ), or a bullet (- * + or a round
+# bullet), then one space.
+EDITOR_LIST_MARKER_PATTERN = re.compile(r"([ \t]{0,12})((?:[0-9]{1,3}|[A-Za-z])[.)]|[-*+\u2022]) ")
+
+
+def normalize_editor_mode(value):
+    """Returns a known editor type, or Plain text for anything else (settings
+    and profile files are untrusted input)."""
+    return value if value in EDITOR_MODES else EDITOR_MODE_PLAIN
+
+
+def find_editor_list_marker(text, idx):
+    """If the line that starts at text[idx] begins with a list marker, returns
+    (leading_spaces, marker), like ("", "1.") for "1. First" or ("  ", "-") for
+    "  - Item". Returns None when idx is not the start of a line or there is no
+    marker."""
+    if not 0 <= idx < len(text) or not (idx == 0 or text[idx - 1] == "\n"):
+        return None
+    found = EDITOR_LIST_MARKER_PATTERN.match(text, idx)
+    if found is None:
+        return None
+    return found.group(1), found.group(2)
+
+
+def plan_editor_line_start(mode, text, idx):
+    """Decides what extra keys the editor type needs before the character at
+    text[idx] is typed. Returns None, or (kind, leading_spaces, marker).
+      Code editor: clear the editor's own indent on every line after the first.
+      Google Docs or Word: type a list marker in a different key order."""
+    mode = normalize_editor_mode(mode)
+    if mode == EDITOR_MODE_CODE:
+        if 0 < idx <= len(text) and text[idx - 1] == "\n":
+            return (EDITOR_ACTION_CLEAR_INDENT, "", "")
+        return None
+    if mode == EDITOR_MODE_DOCS:
+        found = find_editor_list_marker(text, idx)
+        if found is not None:
+            return (EDITOR_ACTION_LIST_MARKER, found[0], found[1])
+    return None
+
+
+def editor_marker_span_is_clear(start, length, blockers):
+    """True when none of the text positions from start up to start + length is
+    in any of the `blockers` (dictionaries or sets keyed by text position). The
+    list marker is typed as one unit, so it is only used when nothing else is
+    planned for those positions (a formatting shortcut, a pause marker, or a
+    purposely left mistake)."""
+    for position in range(start, start + length):
+        for blocker in blockers:
+            if position in blocker:
+                return False
+    return True
+
+
+def _run_editor_clear_indent(settings):
+    """Code editor: empties the line the cursor is on. Shift+Home selects the
+    editor's automatic indent, one space replaces the selection, and Backspace
+    removes that space. This works the same whether or not the editor added an
+    indent, and it never deletes the line above (an empty selection plus a
+    space plus Backspace changes nothing). Typing a space, not the line's own
+    first character, replaces the selection, because some editors wrap a
+    selection in brackets or quotes when one of those is typed. Does nothing in
+    a preview."""
+    if settings.get("preview_mode"):
+        return
+    paced_sleep(random.uniform(0.05, 0.12))
+    pyautogui.hotkey("shift", "home")
+    paced_sleep(random.uniform(0.04, 0.09))
+    _send_char(settings, " ")
+    paced_sleep(random.uniform(0.04, 0.09))
+    _send_backspace(settings)
+    paced_sleep(random.uniform(0.04, 0.09))
+
+
+def _run_editor_list_marker(settings, lead, marker, min_delay, max_delay):
+    """Google Docs or Word: types "1. " (or "- ") at the start of a line without
+    letting the editor turn it into a list. The editor makes the list when the
+    space is typed after the marker, so the space goes in first: leading
+    spaces, a space, Left, the marker, then Right to move past the space. The
+    text on screen ends up exactly the same, and nothing is ever deleted. It
+    always finishes once started (it is under 20 keys), so a Stop never leaves
+    the line half typed. Does nothing in a preview."""
+    if settings.get("preview_mode"):
+        return
+    for lead_char in lead:
+        _send_char(settings, lead_char)
+        paced_sleep(random.uniform(min_delay, max_delay))
+    _send_char(settings, " ")
+    paced_sleep(random.uniform(min_delay, max_delay))
+    pyautogui.press("left")
+    paced_sleep(random.uniform(0.04, 0.10))
+    for marker_char in marker:
+        _send_char(settings, marker_char)
+        paced_sleep(random.uniform(min_delay, max_delay))
+    pyautogui.press("right")
+    paced_sleep(random.uniform(0.04, 0.10))
+
+
 def _fail_and_stop(title, message):
     """Runs on the main thread (via run_on_main_thread). Shows an
     error dialog, then stops the session -- kept separate from
@@ -5404,6 +5528,7 @@ def type_text(settings, is_batch=False, is_last=True):
     enable_revision_clusters = settings.get("enable_revision_clusters", True)
     cluster_strength = settings.get("cluster_strength", 100.0)
     revision_style = settings.get("revision_style", CLUSTER_STYLE_MIXED)
+    editor_mode = normalize_editor_mode(settings.get("editor_mode", EDITOR_MODE_PLAIN))
 
     try:
         text = read_input_file_text(input_path)
@@ -6000,6 +6125,41 @@ def type_text(settings, is_batch=False, is_last=True):
             _note_blocked_time(time.time() - block_start)
             note_warm_up(time.time() - block_start, "a long pause", idx)
             state.status = "Typing..."
+
+        # --------------------------------
+        # EDITOR TYPE (Update #58)
+        # Runs at the start of every line, after any wait and the focus check,
+        # so the keys go to the right window.
+        #   Code editor: the editor's own indent after Enter is cleared, so the
+        #   line's own spaces are not added on top of it.
+        #   Google Docs or Word: a list marker such as "1. " or "- " is typed
+        #   in a different key order, so the editor does not make a list. The
+        #   marker and its space are typed as one unit, so it is only used when
+        #   nothing else is planned for those positions.
+        # Plain text and Preview runs skip all of this.
+        # --------------------------------
+        if editor_mode != EDITOR_MODE_PLAIN and not settings.get("preview_mode"):
+            editor_action = plan_editor_line_start(editor_mode, text, idx)
+            if editor_action is not None:
+                editor_kind, editor_lead, editor_marker = editor_action
+                if editor_kind == EDITOR_ACTION_CLEAR_INDENT:
+                    _run_editor_clear_indent(settings)
+                    if stop_event.is_set():
+                        return
+                else:
+                    marker_span = len(editor_lead) + len(editor_marker) + 1
+                    if (editor_marker_span_is_clear(
+                            idx, marker_span,
+                            (format_map, left_mistake_map, lookback_swaps, select_retype_plan, fix_actions))
+                            and editor_marker_span_is_clear(idx + 1, marker_span - 1, (pause_map,))):
+                        _run_editor_list_marker(settings, editor_lead, editor_marker, min_delay, max_delay)
+                        left_skip_until = idx + marker_span
+                        state.chars_typed += marker_span
+                        prev_char = " "
+                        recent_typed_buffer = ""
+                        if stop_event.is_set():
+                            return
+                        continue
 
         # --------------------------------
         # PARAGRAPH-ENDING PARAPHRASE-THEN-CORRECT (Idea #10)
@@ -6983,6 +7143,9 @@ def validate_settings():
     revision_style = normalize_cluster_style(revision_style_var.get())
     if revision_style_var.get() != revision_style:
         revision_style_var.set(revision_style)
+    editor_mode = normalize_editor_mode(editor_mode_var.get())
+    if editor_mode_var.get() != editor_mode:
+        editor_mode_var.set(editor_mode)
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
 
@@ -7126,6 +7289,7 @@ def validate_settings():
         "enable_revision_clusters": enable_revision_clusters,
         "cluster_strength": cluster_strength,
         "revision_style": revision_style,
+        "editor_mode": editor_mode,
         "enable_target_time": enable_target_time,
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
@@ -8920,6 +9084,7 @@ def get_current_settings_snapshot():
         "enable_revision_clusters": enable_revision_clusters_var.get(),
         "cluster_strength": cluster_strength_var.get(),
         "revision_style": revision_style_var.get(),
+        "editor_mode": editor_mode_var.get(),
         "enable_target_time": enable_target_time_var.get(),
         "target_time_hours": target_hours_var.get(),
         "target_time_minutes": target_minutes_var.get(),
@@ -9016,6 +9181,7 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     enable_revision_clusters_var.set(bool(data.get("enable_revision_clusters", True)))
     cluster_strength_var.set(str(data.get("cluster_strength", "100")))
     revision_style_var.set(normalize_cluster_style(data.get("revision_style", CLUSTER_STYLE_MIXED)))
+    editor_mode_var.set(normalize_editor_mode(data.get("editor_mode", EDITOR_MODE_PLAIN)))
     enable_target_time_var.set(bool(data.get("enable_target_time", False)))
     target_hours_var.set(str(data.get("target_time_hours", "2")))
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
@@ -9501,6 +9667,7 @@ STARTER_PROFILE_KEEP_KEYS = AUTO_PROFILE_KEEP_KEYS + (
     "auto_pause_activity",
     "activity_sensitivity",
     "start_countdown_seconds",
+    "editor_mode",
     "enable_target_time",
     "target_time_hours",
     "target_time_minutes",
@@ -9539,7 +9706,7 @@ def load_starter_profile():
         f"Load the '{name}' starter profile?\n\n"
         "This replaces your current typing settings (speed, mistakes, breaks, pauses, "
         "and the realism cards).\n"
-        "Your hotkeys, theme, text size, input file, file queue, target time, start countdown, "
+        "Your hotkeys, theme, text size, editor type, input file, file queue, target time, start countdown, "
         "scheduled start, Auto Profile rules, and update settings will not change.",
     ):
         return
@@ -10759,6 +10926,7 @@ overshoot_chance_var = tk.StringVar(value="30")
 enable_revision_clusters_var = tk.BooleanVar(value=True)
 cluster_strength_var = tk.StringVar(value="100")
 revision_style_var = tk.StringVar(value=CLUSTER_STYLE_MIXED)
+editor_mode_var = tk.StringVar(value=EDITOR_MODE_PLAIN)
 
 enable_smart_fixes_var = tk.BooleanVar(value=False)
 smart_fix_spacing_var = tk.BooleanVar(value=True)
@@ -10809,6 +10977,7 @@ resume_status_var = tk.StringVar(value="")
 # setting, add its variable to the matching card's list below.
 SECTION_RESET_VARS = {
     "Auto Profile": [enable_auto_profile_var, auto_profile_rules_var],
+    "Editor Type": [editor_mode_var],
     "Start Countdown": [start_countdown_seconds_var],
     "Scheduled Start": [enable_scheduled_start_var, scheduled_start_time_var],
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
@@ -11416,6 +11585,18 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.31.0",
+        "date": "2026-10-30",
+        "title": "Editor type",
+        "changes": [
+            "Added: an Editor Type card on the Window tab with one new setting (Plain text, Google Docs or Word, or Code editor), saved with your profiles and restored on launch. Plain text is the default and types exactly as before. The card has its own Reset This Section button.",
+            "Added: Google Docs or Word mode. Google Docs and Word turn a line that starts with 1. or - into a real list as soon as you type the space. In this mode, Amanuensis types the space first, steps back, types the marker, and steps forward again, so the editor does not make a list and the text matches your file.",
+            "Added: Code editor mode. Code editors add their own indent after Enter, so the spaces in your file were added on top of it. In this mode, Amanuensis clears that indent at the start of each line before typing the line's own spaces.",
+            "Modified: starter profiles do not change your editor type, and the Auto Profile feature can pick it, because a saved profile carries it.",
+            "Notes: neither mode ever deletes real text, and Preview skips the extra keys. A list marker is typed the normal way when a bold or italic shortcut, a pause marker, or a left-on-purpose mistake falls inside it. Amanuensis cannot undo auto-closing brackets, suggestion pop-ups, or other autocorrect such as smart quotes, so turn those off in your editor if they cause trouble. The Typed Text Check still reports any difference. Older settings and profile files without this setting load as Plain text. No new packages.",
+        ],
+    },
     {
         "version": "5.30.0",
         "date": "2026-10-29",
@@ -12094,6 +12275,7 @@ frame_file = make_modern_card(tab_input, "Input File")
 
 # --- Tab: Window (keeps typing going to the right place) ---
 frame_window = make_modern_card(tab_window, "Target Window Lock")
+frame_editor_type = make_modern_card(tab_window, "Editor Type")
 frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
 frame_scheduled_start = make_modern_card(tab_window, "Scheduled Start")
 frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
@@ -12330,6 +12512,25 @@ frame_auto_profile.columnconfigure(0, weight=1)
 refresh_auto_profile_choices()
 refresh_auto_profile_listbox()
 auto_profile_rules_var.trace_add("write", refresh_auto_profile_listbox)
+
+# --- Editor type (Update #58) ---
+modern_label(frame_editor_type, "Typing into:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+editor_mode_combo = modern_combobox(frame_editor_type, editor_mode_var, width=22)
+editor_mode_combo.configure(values=list(EDITOR_MODES))
+editor_mode_combo.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_editor_type,
+    "Tell Amanuensis what kind of program it is typing into, so the text on screen "
+    "matches your file. Plain text (the default) adds nothing. Google Docs or Word "
+    "types a line that starts with 1. or - in a different key order, so the editor "
+    "does not turn it into a list. Code editor clears the editor's own indent after "
+    "each Enter, so your file's indentation is not doubled. For a code editor, it "
+    "also helps to turn off auto-closing brackets and suggestion pop-ups, because "
+    "Amanuensis cannot undo those. Preview skips these extra keys.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Start countdown (Update #43) ---
 modern_label(frame_start_countdown, "Countdown Before Typing (seconds):").grid(
@@ -13252,6 +13453,7 @@ for _release_index, _release in enumerate(_past_releases):
 # after the card has been fully built above.
 SECTION_CARDS = {
     "Auto Profile": frame_auto_profile,
+    "Editor Type": frame_editor_type,
     "Start Countdown": frame_start_countdown,
     "Scheduled Start": frame_scheduled_start,
     "Activity Auto-Pause": frame_activity,
