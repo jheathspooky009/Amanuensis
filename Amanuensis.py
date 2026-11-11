@@ -9,6 +9,33 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.32.0 (2026-11-09) -- Real key press timing
+#   - Added: A Key Press Timing card on the Speed tab. When it is on, every
+#     letter and space is pressed down, held for a short random time (40 to 110
+#     milliseconds by default), and then released, instead of being pressed and
+#     released in one instant. The hold time range is set in the card.
+#   - Added: Shift is held for capital letters. Shift goes down just before the
+#     letter and comes up just after it, like a real hand does. It has its own
+#     checkbox and is on by default once Key Press Timing is on.
+#   - Added: Optional overlap, off by default. On a quick pair of letters typed
+#     by opposite hands, the next key goes down just before the first one comes
+#     up, like a fast typist. A chance box sets how often.
+#   - Added: Six new settings (enable_key_hold, key_hold_min_ms, key_hold_max_ms,
+#     enable_shift_hold, enable_key_overlap, key_overlap_chance), each wired into
+#     validate_settings(), the settings dict, both snapshot functions, and a new
+#     Reset This Section list (Key Press Timing). They are saved in profiles.
+#   - Modified: The hold time is taken out of the gap before the next key, so
+#     the typing speed (Target WPM) and the time estimate stay the same.
+#   - Notes: Key Press Timing is off by default. Only plain letters and the
+#     space bar use it. Numbers, punctuation, and other characters are typed the
+#     old way (instant), because pressing them by key name can type a different
+#     character on a non-US keyboard layout. If a key cannot be pressed by name
+#     (for example a non-Latin layout), that character is typed the old way.
+#     Every held key is released on Stop and when the run ends, and a short
+#     safety timer (0.2 seconds) releases a key that an overlap left down, so
+#     a key can never get stuck and auto-repeat. Preview runs press no keys.
+#     Backspace and shortcuts are still instant. No new packages.
+#
 # v5.31.0 (2026-10-30) -- Editor type
 #   - Added: An Editor Type card on the Window tab with one new setting,
 #     editor_mode (Plain text, Google Docs or Word, or Code editor), saved with
@@ -55,19 +82,6 @@
 #     use tests/app_loader.py, which reads the file as text and runs only its
 #     functions, plain settings, and tk variables (as stand-ins). The app code
 #     was not restructured for this. No new settings and no new packages.
-#
-# v5.29.0 (2026-10-29) -- Learn my speed
-#   - Added: A Learn My Speed button in the Typing Speed card (Speed tab). It opens
-#     a window where the person types a short paragraph. The time between key
-#     presses is measured and shown as words per minute while they type.
-#   - Added: Use This Speed fills in Target WPM, Min Delay, and Max Delay, the same
-#     way Apply WPM does. It turns on after 40 key presses are measured.
-#   - Modified: Apply WPM and Learn My Speed share one function,
-#     set_delays_from_wpm(), so the same speed always gives the same delays.
-#   - Notes: Gaps over 2 seconds, and gaps around Backspace, Delete, arrow keys,
-#     and shortcuts, are left out, and pasting is blocked in the window. The typed
-#     text is never saved. measure_typing_speed() is a plain function that takes a
-#     list of gaps, so it is easy to test. No new settings and no new packages.
 #
 # ============================================
 
@@ -2946,16 +2960,295 @@ def _preview_replace_near_end(distance, remove_count, new_text):
         pass
 
 
-def _send_char(settings, text):
+# --------------------------------------------
+# REAL KEY PRESS TIMING (hold time, held Shift, overlap)
+# --------------------------------------------
+# By default every character is sent with keyboard.write(), which presses and
+# releases the key in one instant. With Key Press Timing on, a plain letter or
+# the space bar is pressed down, held for a short random time, and then
+# released. Capital letters hold Shift around the letter, and an optional
+# overlap lets the next key go down just before the last one comes up.
+#
+# Only a-z, A-Z, and space use this. Pressing a digit or punctuation key by
+# name can type a different character on a non-US keyboard layout (on an
+# AZERTY keyboard, the 1 key types an ampersand), so those characters keep
+# using keyboard.write(). The same fallback is used when a key cannot be
+# pressed by name at all.
+KEY_HOLD_MIN_MS_DEFAULT = 40.0
+KEY_HOLD_MAX_MS_DEFAULT = 110.0
+KEY_HOLD_LIMIT_MIN_MS = 10.0
+KEY_HOLD_LIMIT_MAX_MS = 500.0
+KEY_OVERLAP_CHANCE_DEFAULT = 30.0
+KEY_OVERLAP_CHANCE_MAX = 100.0
+# Overlap only happens when the gap before the next key is this short or less.
+KEY_OVERLAP_MAX_GAP_SECONDS = 0.14
+KEY_OVERLAP_SECONDS = (0.012, 0.045)
+KEY_SHIFT_LEAD_SECONDS = (0.015, 0.045)
+KEY_SHIFT_TRAIL_SECONDS = (0.010, 0.035)
+KEY_MULTI_CHAR_GAP_SECONDS = (0.02, 0.05)
+# A key an overlap left down is released by this safety timer if nothing else
+# released it first. It is shorter than the shortest Windows key repeat delay
+# (about 0.25 seconds), so a held key can never start auto-repeating.
+KEY_WATCHDOG_SECONDS = 0.2
+
+# The names of the keys this run has pressed down and not released yet.
+# Both threads can reach this list (the typing thread and the Stop button), so
+# every change to it happens while holding the lock.
+_held_keys = []
+_held_keys_lock = threading.Lock()
+_held_key_timer = [None]
+
+
+def clean_key_hold_ms(value, fallback):
+    """Returns `value` as a hold time in milliseconds, limited to the allowed
+    range. Anything unreadable, NaN, or infinite gives `fallback`."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(number):
+        return fallback
+    return min(max(number, KEY_HOLD_LIMIT_MIN_MS), KEY_HOLD_LIMIT_MAX_MS)
+
+
+def draw_key_hold_seconds(min_ms, max_ms, rng=None):
+    """Draws how long one key stays down, in seconds, from the range given in
+    milliseconds. A swapped or unreadable range is cleaned first."""
+    low = clean_key_hold_ms(min_ms, KEY_HOLD_MIN_MS_DEFAULT)
+    high = clean_key_hold_ms(max_ms, KEY_HOLD_MAX_MS_DEFAULT)
+    if low > high:
+        low, high = high, low
+    source = rng if rng is not None else random
+    return source.uniform(low, high) / 1000.0
+
+
+def plan_key_press(char, shift_hold=True):
+    """Says how to press `char` with a held key, as (key name, needs Shift), or
+    returns None when the character must be typed the old way (keyboard.write).
+    Only plain ASCII letters and the space bar qualify. A capital letter needs
+    Shift held, and is left to the old way when `shift_hold` is off."""
+    if not isinstance(char, str) or len(char) != 1:
+        return None
+    if "a" <= char <= "z":
+        return (char, False)
+    if "A" <= char <= "Z":
+        if not shift_hold:
+            return None
+        return (char.lower(), True)
+    if char == " ":
+        return ("space", False)
+    return None
+
+
+def are_opposite_hand_letters(first, second):
+    """True when both are plain lowercase letters and a different hand types
+    each one (the QWERTY map in FINGER_FOR_LETTER)."""
+    if not isinstance(first, str) or not isinstance(second, str):
+        return False
+    first_finger = FINGER_FOR_LETTER.get(first)
+    second_finger = FINGER_FOR_LETTER.get(second)
+    if first_finger is None or second_finger is None:
+        return False
+    return first_finger[0] != second_finger[0]
+
+
+def should_overlap_keys(char, next_char, gap_seconds, chance_percent, rng=None):
+    """Decides whether `char` stays down until `next_char` goes down. Only for a
+    quick pair of lowercase letters typed by opposite hands, and only with the
+    chance given (0 to 100). A slow gap never overlaps."""
+    if not are_opposite_hand_letters(char, next_char):
+        return False
+    try:
+        gap = float(gap_seconds)
+        chance = float(chance_percent)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(gap) and math.isfinite(chance)):
+        return False
+    if gap > KEY_OVERLAP_MAX_GAP_SECONDS or chance <= 0:
+        return False
+    source = rng if rng is not None else random
+    return source.uniform(0, 100) < chance
+
+
+def _cancel_key_watchdog():
+    """Stops the safety timer, if one is waiting."""
+    with _held_keys_lock:
+        timer = _held_key_timer[0]
+        _held_key_timer[0] = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _start_key_watchdog():
+    """Starts the safety timer that releases every held key shortly after."""
+    _cancel_key_watchdog()
+    timer = threading.Timer(KEY_WATCHDOG_SECONDS, release_all_held_keys)
+    timer.daemon = True
+    with _held_keys_lock:
+        _held_key_timer[0] = timer
+    timer.start()
+
+
+def _release_key_quietly(name):
+    """Sends a key-up for `name`. A failure is ignored on purpose: this is only
+    ever called to put a key back, and there is nothing safer to do than try."""
+    try:
+        keyboard.release(name)
+    except Exception:
+        pass
+
+
+def release_all_held_keys():
+    """Releases every key this app is holding down. Safe to call from any
+    thread, at any time, and as often as needed: with nothing held it does
+    nothing. Called when Stop is pressed, when a run ends, and by the safety
+    timer, so a key can never be left stuck down."""
+    with _held_keys_lock:
+        timer = _held_key_timer[0]
+        _held_key_timer[0] = None
+        names = list(reversed(_held_keys))
+        del _held_keys[:]
+    if timer is not None:
+        timer.cancel()
+    for name in names:
+        _release_key_quietly(name)
+
+
+def _hold_key_down(name):
+    """Presses `name` down and remembers it so it can always be released."""
+    keyboard.press(name)
+    with _held_keys_lock:
+        _held_keys.append(name)
+
+
+def _release_held_key(name):
+    """Releases one key that _hold_key_down() pressed."""
+    with _held_keys_lock:
+        if name in _held_keys:
+            _held_keys.remove(name)
+    _release_key_quietly(name)
+
+
+def _press_key_with_timing(settings, char, allow_overlap=False, keep_down=False):
+    """Types one character as a real key press with a hold time. Returns the
+    seconds spent holding and waiting, so the typing loop can shorten its own
+    gap by that much and keep the chosen speed.
+
+    allow_overlap: a key left down by the last character (see keep_down) may
+    be released after this key goes down. Without it, any key still down is
+    released first.
+    keep_down: leave this key down for the next character to release. Only
+    used for a lowercase letter (never with Shift), and the safety timer will
+    release it if the next character does not."""
+    plan = plan_key_press(char, settings.get("enable_shift_hold", True))
+    if plan is None:
+        release_all_held_keys()
+        keyboard.write(char)
+        return 0.0
+
+    key_name, needs_shift = plan
+    hold_seconds = draw_key_hold_seconds(
+        settings.get("key_hold_min_ms", KEY_HOLD_MIN_MS_DEFAULT),
+        settings.get("key_hold_max_ms", KEY_HOLD_MAX_MS_DEFAULT),
+    )
+    with _held_keys_lock:
+        earlier_keys = list(_held_keys)
+    if earlier_keys and (not allow_overlap or needs_shift):
+        release_all_held_keys()
+        earlier_keys = []
+
+    spent = 0.0
+    key_is_down = False
+    shift_is_down = False
+    leave_down = False
+    typed = False
+    failed = False
+    try:
+        if needs_shift:
+            _hold_key_down("shift")
+            shift_is_down = True
+            lead = random.uniform(*KEY_SHIFT_LEAD_SECONDS)
+            time.sleep(lead)
+            spent += lead
+        _hold_key_down(key_name)
+        key_is_down = True
+        typed = True
+        if earlier_keys:
+            _cancel_key_watchdog()
+            overlap = random.uniform(*KEY_OVERLAP_SECONDS)
+            time.sleep(overlap)
+            spent += overlap
+            for earlier in earlier_keys:
+                _release_held_key(earlier)
+            hold_seconds = max(0.0, hold_seconds - overlap)
+        if keep_down and not needs_shift:
+            leave_down = True
+            _start_key_watchdog()
+        else:
+            time.sleep(hold_seconds)
+            spent += hold_seconds
+            _release_held_key(key_name)
+            key_is_down = False
+            if needs_shift:
+                trail = random.uniform(*KEY_SHIFT_TRAIL_SECONDS)
+                time.sleep(trail)
+                spent += trail
+                _release_held_key("shift")
+                shift_is_down = False
+    except (ValueError, KeyError, OSError):
+        # The key could not be pressed by name (for example a non-Latin layout).
+        failed = True
+    finally:
+        # Whatever happened, never leave this character's keys down. The one
+        # exception is a key an overlap purposely left down for the next
+        # character, which the safety timer and Stop always release.
+        if not leave_down:
+            if key_is_down:
+                _release_held_key(key_name)
+            if shift_is_down:
+                _release_held_key("shift")
+    if failed and not typed:
+        keyboard.write(char)
+    return spent
+
+
+def _send_text_with_key_timing(settings, text, allow_overlap=False, keep_down=False):
+    """Types `text` one key at a time with hold times. A run of several
+    characters (a sentence-rework redo) gets a short human gap between its keys.
+    Returns the seconds spent holding and waiting."""
+    spent = 0.0
+    last_position = len(text) - 1
+    for position, char in enumerate(text):
+        if position > 0:
+            time.sleep(random.uniform(*KEY_MULTI_CHAR_GAP_SECONDS))
+        spent += _press_key_with_timing(
+            settings,
+            char,
+            allow_overlap=(allow_overlap and position == 0),
+            keep_down=(keep_down and position == last_position),
+        )
+    return spent
+
+
+def _send_char(settings, text, allow_overlap=False, keep_down=False):
     """Types `text` (a single character, or a short run of characters
     for a sentence-rework redo) as real keystrokes via keyboard.write(),
     or -- when settings['preview_mode'] is True -- into the Preview Run
     Text box instead. Always called from the background typing
-    thread, so the preview write is routed through run_on_main_thread()."""
+    thread, so the preview write is routed through run_on_main_thread().
+
+    With settings['enable_key_hold'] on (Update #59), each key is pressed and
+    held for a short time instead (see _press_key_with_timing()). Returns the
+    seconds spent holding, which is 0.0 in every other case. allow_overlap and
+    keep_down are only used by the main typing loop."""
     if settings.get("preview_mode"):
         run_on_main_thread(lambda t=text: _preview_write(t))
-    else:
-        keyboard.write(text)
+        return 0.0
+    if settings.get("enable_key_hold"):
+        return _send_text_with_key_timing(settings, text, allow_overlap, keep_down)
+    keyboard.write(text)
+    return 0.0
 
 
 def _send_backspace(settings):
@@ -2964,6 +3257,8 @@ def _send_backspace(settings):
     if settings.get("preview_mode"):
         run_on_main_thread(lambda: _preview_backspace(1))
     else:
+        # A key an overlap left down must come up before another key is sent.
+        release_all_held_keys()
         pyautogui.press("backspace")
 
 
@@ -5525,6 +5820,10 @@ def type_text(settings, is_batch=False, is_last=True):
     smart_fix_visible_chance = settings.get("smart_fix_visible_chance", 50.0)
     enable_overshoot = settings.get("enable_overshoot", True)
     overshoot_chance = settings.get("overshoot_chance", 30.0)
+    # Real key press timing (Update #59). A preview presses no keys, so it never uses it.
+    key_hold_on = bool(settings.get("enable_key_hold", False)) and not settings.get("preview_mode")
+    key_overlap_on = key_hold_on and bool(settings.get("enable_key_overlap", False))
+    key_overlap_chance = settings.get("key_overlap_chance", KEY_OVERLAP_CHANCE_DEFAULT)
     enable_revision_clusters = settings.get("enable_revision_clusters", True)
     cluster_strength = settings.get("cluster_strength", 100.0)
     revision_style = settings.get("revision_style", CLUSTER_STYLE_MIXED)
@@ -6560,6 +6859,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 return
             recent_typed_buffer = ""
 
+        held_seconds = 0.0
         if left_entry is not None:
             # Purposely left mistake: type the wrong text instead of this
             # character (and skip any extra character it replaces).
@@ -6569,7 +6869,17 @@ def type_text(settings, is_batch=False, is_last=True):
             rework_hold = True
             recent_typed_buffer = ""
         elif not char_already_typed:
-            _send_char(settings, char)
+            # Update #59: with overlap on, a quick pair of letters typed by
+            # opposite hands may leave this key down until the next one goes
+            # down. Spots with a shortcut, pause marker, or left mistake next
+            # never overlap, so nothing sits between the two keys.
+            keep_key_down = False
+            if (key_overlap_on and idx + 1 < len(text)
+                    and (idx + 1) not in format_map
+                    and (idx + 1) not in pause_map
+                    and (idx + 1) not in left_mistake_map):
+                keep_key_down = should_overlap_keys(char, text[idx + 1], delay, key_overlap_chance)
+            held_seconds = _send_char(settings, char, allow_overlap=key_overlap_on, keep_down=keep_key_down)
         state.chars_typed += 1
         if left_entry is not None:
             pass  # the rework buffer was already cleared above
@@ -6604,7 +6914,9 @@ def type_text(settings, is_batch=False, is_last=True):
             last_autosave_time = time.time()
 
         prev_char = char
-        paced_sleep(delay)
+        # Update #59: the time a key was held counts as part of the gap, so
+        # the typing speed stays the same with Key Press Timing on.
+        paced_sleep(max(0.0, delay - held_seconds))
 
         if char == ",":
             # A writing habit (Update #41) may make this writer quicker or
@@ -6973,6 +7285,40 @@ def validate_settings():
             messagebox.showerror("Invalid Input", "Overshoot chance must be between 0 and 100.")
             return None
 
+    # Real key press timing (Update #59). The hold times and the overlap chance
+    # are only checked when their feature is on, like the other boxes.
+    enable_key_hold = bool(enable_key_hold_var.get())
+    enable_shift_hold = bool(enable_shift_hold_var.get())
+    enable_key_overlap = enable_key_hold and bool(enable_key_overlap_var.get())
+    key_hold_min_ms = KEY_HOLD_MIN_MS_DEFAULT
+    key_hold_max_ms = KEY_HOLD_MAX_MS_DEFAULT
+    key_overlap_chance = 0.0
+    if enable_key_hold:
+        try:
+            key_hold_min_ms = parse_finite_float(key_hold_min_ms_var.get())
+            key_hold_max_ms = parse_finite_float(key_hold_max_ms_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Key hold times must be numbers (in milliseconds).")
+            return None
+        if key_hold_min_ms < KEY_HOLD_LIMIT_MIN_MS or key_hold_max_ms > KEY_HOLD_LIMIT_MAX_MS:
+            messagebox.showerror(
+                "Invalid Input",
+                f"Key hold times must be between {KEY_HOLD_LIMIT_MIN_MS:g} and {KEY_HOLD_LIMIT_MAX_MS:g} milliseconds.",
+            )
+            return None
+        if key_hold_min_ms > key_hold_max_ms:
+            messagebox.showerror("Invalid Input", "The shortest key hold time cannot be longer than the longest.")
+            return None
+        if enable_key_overlap:
+            try:
+                key_overlap_chance = parse_finite_float(key_overlap_chance_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Key overlap chance must be a number.")
+                return None
+            if key_overlap_chance < 0 or key_overlap_chance > KEY_OVERLAP_CHANCE_MAX:
+                messagebox.showerror("Invalid Input", "Key overlap chance must be between 0 and 100.")
+                return None
+
     locked_window = window_var.get().strip() if lock_window_var.get() else ""
 
     # Auto Profile by Window (Update #30). The rules are cleaned on the way in,
@@ -7319,6 +7665,12 @@ def validate_settings():
         "select_retype_chance": select_retype_chance,
         "enable_overshoot": enable_overshoot,
         "overshoot_chance": overshoot_chance,
+        "enable_key_hold": enable_key_hold,
+        "key_hold_min_ms": key_hold_min_ms,
+        "key_hold_max_ms": key_hold_max_ms,
+        "enable_shift_hold": enable_shift_hold,
+        "enable_key_overlap": enable_key_overlap,
+        "key_overlap_chance": key_overlap_chance,
         "paragraph_pause_min": paragraph_pause_min,
         "paragraph_pause_max": paragraph_pause_max,
         "sentence_pause_min": sentence_pause_min,
@@ -7692,6 +8044,16 @@ def run_typing_worker(settings, files, resume_dict):
         type_text(file_settings, is_batch=(total_files > 1), is_last=is_last)
 
 
+def run_typing_worker_safely(settings, files, resume_dict):
+    """Runs run_typing_worker() and, however it ends (finished, stopped, or an
+    error), releases every key Key Press Timing may still be holding down
+    (Update #59), so a key can never be left stuck after a run."""
+    try:
+        run_typing_worker(settings, files, resume_dict)
+    finally:
+        release_all_held_keys()
+
+
 def confirm_pause_marker_warnings(files, settings):
     """Checks every file about to be typed for inline pause markers that
     have a problem, BEFORE typing starts: a bad value such as
@@ -7907,7 +8269,7 @@ def start_typing():
     btn_stop.configure(state=tk.NORMAL)
 
     thread = threading.Thread(
-        target=run_typing_worker,
+        target=run_typing_worker_safely,
         args=(settings, files_to_run, resume_dict),
     )
     thread.daemon = True
@@ -8901,6 +9263,8 @@ def stop_typing():
     state.is_running = False
     stop_event.set()
     pause_event.clear()
+    # Put back any key Key Press Timing is holding down (Update #59).
+    release_all_held_keys()
     focus_lost_event.clear()
     skip_break_event.clear()
     refresh_skip_break_button()
@@ -9046,6 +9410,12 @@ def get_current_settings_snapshot():
         "select_retype_chance": select_retype_chance_var.get(),
         "enable_overshoot": enable_overshoot_var.get(),
         "overshoot_chance": overshoot_chance_var.get(),
+        "enable_key_hold": enable_key_hold_var.get(),
+        "key_hold_min_ms": key_hold_min_ms_var.get(),
+        "key_hold_max_ms": key_hold_max_ms_var.get(),
+        "enable_shift_hold": enable_shift_hold_var.get(),
+        "enable_key_overlap": enable_key_overlap_var.get(),
+        "key_overlap_chance": key_overlap_chance_var.get(),
         "paragraph_pause_min": paragraph_pause_min_var.get(),
         "paragraph_pause_max": paragraph_pause_max_var.get(),
         "sentence_pause_min": sentence_pause_min_var.get(),
@@ -9147,6 +9517,12 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     select_retype_chance_var.set(str(data.get("select_retype_chance", "20")))
     enable_overshoot_var.set(bool(data.get("enable_overshoot", True)))
     overshoot_chance_var.set(str(data.get("overshoot_chance", "30")))
+    enable_key_hold_var.set(bool(data.get("enable_key_hold", False)))
+    key_hold_min_ms_var.set(str(data.get("key_hold_min_ms", "40")))
+    key_hold_max_ms_var.set(str(data.get("key_hold_max_ms", "110")))
+    enable_shift_hold_var.set(bool(data.get("enable_shift_hold", True)))
+    enable_key_overlap_var.set(bool(data.get("enable_key_overlap", False)))
+    key_overlap_chance_var.set(str(data.get("key_overlap_chance", "30")))
     paragraph_pause_min_var.set(data.get("paragraph_pause_min", "10"))
     paragraph_pause_max_var.set(data.get("paragraph_pause_max", "20"))
     sentence_pause_min_var.set(data.get("sentence_pause_min", "5"))
@@ -10923,6 +11299,12 @@ enable_select_retype_var = tk.BooleanVar(value=False)
 select_retype_chance_var = tk.StringVar(value="20")
 enable_overshoot_var = tk.BooleanVar(value=True)
 overshoot_chance_var = tk.StringVar(value="30")
+enable_key_hold_var = tk.BooleanVar(value=False)
+key_hold_min_ms_var = tk.StringVar(value="40")
+key_hold_max_ms_var = tk.StringVar(value="110")
+enable_shift_hold_var = tk.BooleanVar(value=True)
+enable_key_overlap_var = tk.BooleanVar(value=False)
+key_overlap_chance_var = tk.StringVar(value="30")
 enable_revision_clusters_var = tk.BooleanVar(value=True)
 cluster_strength_var = tk.StringVar(value="100")
 revision_style_var = tk.StringVar(value=CLUSTER_STYLE_MIXED)
@@ -10985,6 +11367,14 @@ SECTION_RESET_VARS = {
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
     "Finger & Hand Timing": [enable_finger_timing_var],
+    "Key Press Timing": [
+        enable_key_hold_var,
+        key_hold_min_ms_var,
+        key_hold_max_ms_var,
+        enable_shift_hold_var,
+        enable_key_overlap_var,
+        key_overlap_chance_var,
+    ],
     "Flow & Hesitation": [enable_typing_moods_var, typing_mood_strength_var],
     "Uneven Rhythm": [enable_uneven_rhythm_var, rhythm_strength_var],
     "Natural Pauses": [
@@ -11585,6 +11975,19 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.32.0",
+        "date": "2026-11-09",
+        "title": "Real key press timing",
+        "changes": [
+            "Added: a Key Press Timing card on the Speed tab. When it is on, every letter and the space bar is pressed down, held for a short random time (40 to 110 milliseconds by default), and then released, instead of being pressed and released in one instant. This helps testers whose pages react to the key being released, and it looks more like a real hand. It is off by default.",
+            "Added: Shift is held for capital letters. Shift goes down just before the letter and comes up just after it. It has its own checkbox.",
+            "Added: optional overlap, off by default. When two quick letters are typed by opposite hands, the next key can go down just before the last one comes up. A chance box sets how often.",
+            "Added: six new settings, saved with your profiles and restored on launch. The card has its own Reset This Section button.",
+            "Modified: the time a key is held counts as part of the gap before the next key, so your typing speed and the time estimate stay the same.",
+            "Notes: only plain letters and the space bar use this. Numbers, punctuation, and other characters are still typed in one instant, because pressing them by key name can type the wrong character on some keyboard layouts. Every held key is let go when you press Stop and when a run ends, and a short safety timer lets go of a key an overlap left down, so a key can never get stuck. Backspace and shortcuts are still instant, and the Preview Run presses no keys. Older settings and profile files load with Key Press Timing off. No new packages.",
+        ],
+    },
     {
         "version": "5.31.0",
         "date": "2026-10-30",
@@ -12287,6 +12690,7 @@ frame_settings = make_modern_card(tab_speed, "Typing Speed")
 frame_target_time = make_modern_card(tab_speed, "Target Time")
 frame_fatigue = make_modern_card(tab_speed, "Fatigue Drift")
 frame_finger_timing = make_modern_card(tab_speed, "Finger & Hand Timing")
+frame_key_timing = make_modern_card(tab_speed, "Key Press Timing")
 frame_typing_moods = make_modern_card(tab_speed, "Flow & Hesitation")
 frame_uneven_rhythm = make_modern_card(tab_speed, "Uneven Rhythm")
 frame_pauses = make_modern_card(tab_speed, "Natural Pauses")
@@ -12711,6 +13115,50 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+# --- Key press timing (Update #59) ---
+modern_checkbox(
+    frame_key_timing, "Enable real key press timing (hold each key down)", enable_key_hold_var
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+modern_label(frame_key_timing, "Shortest hold (milliseconds):").grid(row=1, column=0, sticky="w", padx=(0, 8))
+entry_key_hold_min = modern_entry(frame_key_timing, key_hold_min_ms_var, width=8)
+entry_key_hold_min.grid(row=1, column=1, sticky="w")
+
+modern_label(frame_key_timing, "Longest hold (milliseconds):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+entry_key_hold_max = modern_entry(frame_key_timing, key_hold_max_ms_var, width=8)
+entry_key_hold_max.grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+modern_checkbox(
+    frame_key_timing, "Hold Shift for capital letters", enable_shift_hold_var
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_checkbox(
+    frame_key_timing, "Overlap quick pairs typed by opposite hands (off by default)", enable_key_overlap_var
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+modern_label(frame_key_timing, "Overlap chance (%):").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+entry_key_overlap_chance = modern_entry(frame_key_timing, key_overlap_chance_var, width=8)
+entry_key_overlap_chance.grid(row=5, column=1, sticky="w", pady=(6, 0))
+
+modern_label(
+    frame_key_timing,
+    "Normally every key is pressed and let go in one instant. With this on, each "
+    "letter and the space bar is pressed down, held for a short random time, and "
+    "then released, which helps when a page reacts to the key being released and "
+    "looks more like a real hand. A capital letter holds Shift down just before "
+    "the letter and lets it go just after. With overlap on, the next key can go "
+    "down just before the last one comes up when two quick letters are typed by "
+    "opposite hands (like the \"ti\" in \"time\").\n\n"
+    "The hold time counts as part of the gap before the next key, so your typing "
+    "speed stays the same. Numbers, punctuation, and other characters are still "
+    "typed in one instant, because pressing them by key name can type the wrong "
+    "character on some keyboard layouts. Backspace and shortcuts are instant too. "
+    "Every held key is let go when you press Stop, and the Preview Run presses "
+    "no keys.",
+    kind="muted",
+    wraplength=420,
+).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
 # --- Flow and hesitation states (Update #31) ---
 modern_checkbox(
@@ -13461,6 +13909,7 @@ SECTION_CARDS = {
     "Target Time": frame_target_time,
     "Fatigue Drift": frame_fatigue,
     "Finger & Hand Timing": frame_finger_timing,
+    "Key Press Timing": frame_key_timing,
     "Flow & Hesitation": frame_typing_moods,
     "Uneven Rhythm": frame_uneven_rhythm,
     "Natural Pauses": frame_pauses,
