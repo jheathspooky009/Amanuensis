@@ -8,6 +8,7 @@ from app_loader import get_app
 from test_settings import SettingsTestCase
 
 APP = get_app()
+_MISSING = object()
 
 
 class FakeKeyboard:
@@ -94,9 +95,9 @@ class PressSequenceTests(unittest.TestCase):
 
     def setUp(self):
         self.fake = FakeKeyboard()
-        # The loader does not import the real keyboard package, so the name may
-        # not exist yet (and test_editor_mode removes it again when it finishes).
-        self.saved = {name: APP.get(name) for name in ("keyboard", "time")}
+        # The AST-based app loader intentionally omits imported modules such as
+        # keyboard. Preserve missing globals too, then remove our test doubles.
+        self.saved = {name: APP.get(name, _MISSING) for name in ("keyboard", "time")}
         APP["keyboard"] = self.fake
 
         class NoSleep:
@@ -111,7 +112,7 @@ class PressSequenceTests(unittest.TestCase):
     def tearDown(self):
         APP["release_all_held_keys"]()
         for name, value in self.saved.items():
-            if value is None:
+            if value is _MISSING:
                 APP.pop(name, None)
             else:
                 APP[name] = value
