@@ -10,7 +10,8 @@ MESSAGES = APP["__messagebox__"]
 
 # Every box that holds a number the typing loop uses.
 NUMBER_BOXES = (
-    "min_delay_var", "max_delay_var", "paragraph_pause_min_var", "paragraph_pause_max_var",
+    "min_delay_var", "max_delay_var", "pair_delay_min_var", "pair_delay_max_var",
+    "paragraph_pause_min_var", "paragraph_pause_max_var",
     "sentence_pause_min_var", "sentence_pause_max_var", "break_duration_min_var",
     "break_duration_max_var", "typo_chance_var", "paraphrase_chance_var",
     "lookback_edit_chance_var", "select_retype_chance_var", "overshoot_chance_var",

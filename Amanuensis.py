@@ -9,6 +9,33 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.33.0 (2026-11-11) -- Learn my real typing
+#   - Added: Learn My Speed now also learns how fast you type common letter
+#     pairs (th, he, in, er...), how long you usually wait after a sentence, and
+#     which typos you fix with Backspace. The sample is four short sentences, and
+#     you can still type any paragraph you like.
+#   - Added: A Save as Profile button in the Learn My Speed window. It saves a
+#     profile with what was learned (speed, pair delays, sentence pauses, typo
+#     chance, extra typos, capital slips) and then asks if you want to use it now.
+#     Anything the sample could not teach is left as it is.
+#   - Added: Two new settings (pair_delay_min, pair_delay_max), shown under the
+#     Learn My Speed button on the Speed tab, wired into validate_settings(), the
+#     settings dict, both snapshot functions, and the Typing Speed reset list.
+#   - Modified: Common letter pairs used a fixed 0.02 to 0.05 second delay. That
+#     is now the default of the new settings, so typing is unchanged until a
+#     profile or the boxes change it. Learn My Speed's sample has four sentences
+#     so there are enough sentence endings to measure.
+#   - Modified: Profile data for saving now comes from one function,
+#     get_shareable_profile_data(), used by Save Profile and the new button.
+#     delays_for_wpm() is now shared by set_delays_from_wpm().
+#   - Notes: The letters you type in the window are only kept in memory to sort
+#     typos into kinds (next-door key, swapped, doubled, capital, space). They are
+#     never saved: a profile gets numbers and checkboxes only. Typo kinds are a
+#     best guess. A pause is only learned from 2 or more sentence endings, pair
+#     speed from 6 or more pair gaps, and typos from 100 or more letters; anything
+#     less is left alone. Sentence pauses while copying a sample are usually
+#     shorter than while writing your own thoughts. No new packages.
+#
 # v5.32.0 (2026-11-09) -- Real key press timing
 #   - Added: A Key Press Timing card on the Speed tab. When it is on, every
 #     letter and space is pressed down, held for a short random time (40 to 110
@@ -61,27 +88,6 @@
 #     runs skip them. Not handled: auto-closing brackets, suggestion pop-ups,
 #     and other autocorrect (smart quotes, symbols). Older settings and profile
 #     files without this setting load as Plain text. No new packages.
-#
-# v5.30.0 (2026-10-29) -- Automatic tests
-#   - Added: A tests/ folder with 89 automatic checks (Python's built-in unittest,
-#     so no new package). They cover protected text, the [[b]] and [[i]] markers,
-#     {{pause}} markers, Markdown input, every Smart Text Fixes rule, settings
-#     checking and the settings save and load round trip, the typed text check,
-#     and the Learn My Speed measuring. Run them with:
-#     uv run python -m unittest discover -s tests -v
-#   - Added: A Tests job in the CI workflow, so every pull request runs them
-#     together with the other checks. The tests also run in the CI py_compile
-#     and pyflakes steps.
-#   - Fixed: Typing nan, inf, or -inf into a number box (delays, pauses, break
-#     lengths, chances, strengths) was accepted. Those words pass every "less
-#     than" check and could freeze or crash a run. A new function,
-#     parse_finite_float(), now refuses them in validate_settings(): the boxes
-#     that show an error still show it, and strength and chance boxes reset to
-#     a safe number, like they already did for other bad text.
-#   - Notes: Amanuensis.py builds its window as soon as it loads, so the tests
-#     use tests/app_loader.py, which reads the file as text and runs only its
-#     functions, plain settings, and tk variables (as stand-ins). The app code
-#     was not restructured for this. No new settings and no new packages.
 #
 # ============================================
 
@@ -5779,6 +5785,8 @@ def type_text(settings, is_batch=False, is_last=True):
     input_path = settings["input_path"]
     min_delay = settings["min_delay"]
     max_delay = settings["max_delay"]
+    pair_delay_min = settings.get("pair_delay_min", 0.02)
+    pair_delay_max = settings.get("pair_delay_max", 0.05)
     mistake_min = settings["mistake_min"]
     mistake_max = settings["mistake_max"]
     break_min = settings["break_min"]
@@ -6805,7 +6813,7 @@ def type_text(settings, is_batch=False, is_last=True):
         # --------------------------------
         current_pair = (prev_char + char).lower()
         if current_pair in COMMON_PAIRS:
-            delay = random.uniform(0.02, 0.05)
+            delay = random.uniform(pair_delay_min, pair_delay_max)
         else:
             delay = random.uniform(min_delay, max_delay)
             if char.isalpha():
@@ -7169,6 +7177,19 @@ def validate_settings():
         return None
     if sentence_pause_min > sentence_pause_max:
         messagebox.showerror("Invalid Input", "Min sentence-end pause cannot exceed max sentence-end pause.")
+        return None
+
+    try:
+        pair_delay_min = parse_finite_float(pair_delay_min_var.get())
+        pair_delay_max = parse_finite_float(pair_delay_max_var.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Common letter pair delays must be numbers.")
+        return None
+    if pair_delay_min < 0 or pair_delay_max < 0:
+        messagebox.showerror("Invalid Input", "Common letter pair delays cannot be negative.")
+        return None
+    if pair_delay_min > pair_delay_max:
+        messagebox.showerror("Invalid Input", "Min common pair delay cannot be greater than Max common pair delay.")
         return None
 
     enable_mistakes = enable_mistakes_var.get()
@@ -7596,6 +7617,8 @@ def validate_settings():
         "file_queue": queue_files,
         "min_delay": min_delay,
         "max_delay": max_delay,
+        "pair_delay_min": pair_delay_min,
+        "pair_delay_max": pair_delay_max,
         "mistake_min": mistake_min,
         "mistake_max": mistake_max,
         "break_min": break_min,
@@ -9385,6 +9408,8 @@ def get_current_settings_snapshot():
     return {
         "min_delay": min_delay_var.get(),
         "max_delay": max_delay_var.get(),
+        "pair_delay_min": pair_delay_min_var.get(),
+        "pair_delay_max": pair_delay_max_var.get(),
         "hotkey_start": hotkey_start_var.get(),
         "hotkey_pause": hotkey_pause_var.get(),
         "hotkey_stop": hotkey_stop_var.get(),
@@ -9492,6 +9517,8 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
 
     min_delay_var.set(data.get("min_delay", "0.05"))
     max_delay_var.set(data.get("max_delay", "0.15"))
+    pair_delay_min_var.set(str(data.get("pair_delay_min", "0.02")))
+    pair_delay_max_var.set(str(data.get("pair_delay_max", "0.05")))
     hotkey_start_var.set(data.get("hotkey_start", "f8"))
     hotkey_pause_var.set(data.get("hotkey_pause", "f9"))
     hotkey_stop_var.set(data.get("hotkey_stop", "esc"))
@@ -9610,6 +9637,31 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
         apply_hotkeys()
 
 
+# Settings that belong to this computer or this moment, so a saved or shared
+# profile never carries them.
+PROFILE_LOCAL_ONLY_KEYS = (
+    "input_path",
+    "file_queue",
+    "enable_auto_profile",
+    "auto_profile_rules",
+    "enable_scheduled_start",
+    "scheduled_start_time",
+    "text_size_percent",
+    "check_typed_text",
+    "preview_speed",
+)
+
+
+def get_shareable_profile_data():
+    """The current settings without the personal parts. Profiles are made to be
+    shared, so they never carry folder paths or the Auto Profile rules (which
+    hold window title words), or the settings that stay on this computer."""
+    profile_data = get_current_settings_snapshot()
+    for key in PROFILE_LOCAL_ONLY_KEYS:
+        profile_data.pop(key, None)
+    return profile_data
+
+
 def save_profile():
     os.makedirs(PROFILE_DIR, exist_ok=True)
     path = filedialog.asksaveasfilename(
@@ -9621,18 +9673,7 @@ def save_profile():
     if not path:
         return
     try:
-        # Profiles are made to be shared, so they never carry folder paths or
-        # the Auto Profile rules (which hold window title words).
-        profile_data = get_current_settings_snapshot()
-        profile_data.pop("input_path", None)
-        profile_data.pop("file_queue", None)
-        profile_data.pop("enable_auto_profile", None)
-        profile_data.pop("auto_profile_rules", None)
-        profile_data.pop("enable_scheduled_start", None)
-        profile_data.pop("scheduled_start_time", None)
-        profile_data.pop("text_size_percent", None)
-        profile_data.pop("check_typed_text", None)
-        profile_data.pop("preview_speed", None)
+        profile_data = get_shareable_profile_data()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=2)
         messagebox.showinfo("Profile Saved", f"Profile saved to:\n{path}")
@@ -10555,14 +10596,22 @@ def apply_target_wpm(event=None):
     set_delays_from_wpm(wpm)
 
 
+def delays_for_wpm(wpm):
+    """Turn a words-per-minute speed (5 characters per word) into the Min Delay
+    and Max Delay texts. The average delay matches the speed, with Min at half
+    of it and Max at one and a half times it. Returns (min_text, max_text)."""
+    avg_delay = 12.0 / wpm  # seconds/char: 60s / (wpm * 5 chars-per-word)
+    return f"{avg_delay * 0.5:.3f}", f"{avg_delay * 1.5:.3f}"
+
+
 def set_delays_from_wpm(wpm):
     """Write the Min Delay and Max Delay fields for a words-per-minute speed
     (5 characters per word). The average delay matches the speed, with Min at
     half of it and Max at one and a half times it. Used by Apply WPM and by
     Learn My Speed, so both always give the same delays for the same speed."""
-    avg_delay = 12.0 / wpm  # seconds/char: 60s / (wpm * 5 chars-per-word)
-    min_delay_var.set(f"{avg_delay * 0.5:.3f}")
-    max_delay_var.set(f"{avg_delay * 1.5:.3f}")
+    min_text, max_text = delays_for_wpm(wpm)
+    min_delay_var.set(min_text)
+    max_delay_var.set(max_text)
 
 
 # --------------------------------------------
@@ -10573,9 +10622,9 @@ def set_delays_from_wpm(wpm):
 # Min/Max Delay fields. Nothing is saved except those existing fields, and the
 # text typed in the window is never stored or sent anywhere.
 LEARN_SPEED_SAMPLE = (
-    "The library on the corner stays open late on Thursdays, so I usually stop by "
-    "after work. I pick a quiet table near the window, spread out my notes, and "
-    "read until the lights flicker to say it is almost closing time."
+    "The library on the corner stays open late on Thursdays. I usually stop by after "
+    "work. I pick a quiet table near the window and spread out my notes. Then I read "
+    "until the lights flicker to say it is almost closing time."
 )
 LEARN_SPEED_MIN_KEYS = 40      # measured key gaps needed before a speed is shown
 LEARN_SPEED_MIN_GAP = 0.02     # seconds; anything quicker is a keyboard glitch
@@ -10607,6 +10656,315 @@ def measure_typing_speed(gaps):
     return int(min(max(wpm, 1), 400))
 
 
+# --------------------------------------------
+# LEARN MY REAL TYPING (Update #60)
+# --------------------------------------------
+# Learn My Speed measures one overall speed. The same short sample also shows
+# how fast the person types common letter pairs, how long they usually wait
+# after a sentence, and which typos they fix, and the result can be saved as a
+# profile. These are plain functions that take a list of key events, so they
+# can be tested without a window. An event is (kind, character, seconds):
+# kind is "char" (a key that typed a character), "back" (one Backspace), or
+# "break" (anything that moves the cursor or breaks the chain). The letters
+# are only used in memory to sort typos into kinds and are never saved: the
+# result holds numbers and checkboxes only.
+LEARN_TYPING_MAX_EVENTS = 3000         # stop recording after this many key events
+LEARN_TYPING_PAIR_MIN_GAPS = 6         # pair gaps needed before pair speed is learned
+LEARN_TYPING_PAUSE_MIN_COUNT = 2       # sentence waits needed before pauses are learned
+LEARN_TYPING_PAUSE_FLOOR = 0.3         # seconds above normal typing that count as a pause
+LEARN_TYPING_PAUSE_CEILING = 30.0      # a longer wait is a break, not a sentence pause
+LEARN_TYPING_MIN_LETTERS = 100         # letters typed before typos are learned
+LEARN_TYPING_MAX_TYPO_KEYS = 3         # a fix with more Backspaces is a rewrite, not a typo
+LEARN_TYPING_MAX_TYPO_CHANCE = 20.0    # percent; the highest typo chance that is learned
+LEARN_TYPING_PAIR_LIMITS = (0.01, 1.0)  # seconds; learned pair delays stay inside this
+LEARN_TYPING_SENTENCE_ENDS = ".!?"
+LEARN_TYPING_SENTENCE_CLOSERS = "\"')]\u201d\u2019"
+
+
+def gaps_from_events(events, skip_sentence_waits=False):
+    """The gaps (in seconds) between key presses that typed characters. A
+    Backspace or any other key breaks the chain, so a gap around a correction
+    or a cursor move is never counted. With skip_sentence_waits, the gaps
+    right after a sentence ending (up to the first letter of the next sentence)
+    are left out too, because that wait is a pause, not typing speed."""
+    gaps = []
+    last_time = None
+    skipping = False
+    for kind, character, when in events:
+        if kind != "char":
+            last_time = None
+            skipping = False
+            continue
+        if last_time is not None and not (skip_sentence_waits and skipping):
+            gaps.append(when - last_time)
+        if character in LEARN_TYPING_SENTENCE_ENDS:
+            skipping = True
+        elif skipping and not (character.isspace() or character in LEARN_TYPING_SENTENCE_CLOSERS):
+            skipping = False
+        last_time = when
+    return gaps
+
+
+def find_common_pair_gaps(events):
+    """The usable gaps (in seconds) before the second letter of each common
+    letter pair (th, he, in...) typed in an unbroken chain."""
+    found = []
+    previous = None
+    last_time = None
+    for kind, character, when in events:
+        if kind != "char":
+            previous = None
+            last_time = None
+            continue
+        if previous is not None and last_time is not None:
+            gap = when - last_time
+            if (LEARN_SPEED_MIN_GAP <= gap <= LEARN_SPEED_PAUSE_LIMIT
+                    and (previous + character).lower() in COMMON_PAIRS):
+                found.append(gap)
+        previous = character
+        last_time = when
+    return found
+
+
+def find_sentence_pauses(events, typical_gap):
+    """The extra waiting (in seconds) after each sentence ending, before the
+    next sentence starts. The normal typing time for the keys in between (the
+    spaces and the first letter) is taken out, so what is left is the pause.
+    Only waits between the floor and the ceiling count."""
+    pauses = []
+    end_time = None
+    keys_since = 0
+    for kind, character, when in events:
+        if kind != "char":
+            end_time = None
+            continue
+        if character in LEARN_TYPING_SENTENCE_ENDS:
+            end_time = when
+            keys_since = 0
+            continue
+        if end_time is None:
+            continue
+        if character in "\r\n":
+            end_time = None
+            continue
+        if character.isspace() or character in LEARN_TYPING_SENTENCE_CLOSERS:
+            keys_since += 1
+            continue
+        wait = (when - end_time) - (keys_since + 1) * typical_gap
+        if LEARN_TYPING_PAUSE_FLOOR <= wait <= LEARN_TYPING_PAUSE_CEILING:
+            pauses.append(wait)
+        end_time = None
+    return pauses
+
+
+def classify_typo_fix(erased, retyped, before):
+    """Sorts one fixed typo into a kind, as a best guess. erased and retyped
+    are lists of characters (same length), before is what stood before them.
+    Kinds: case, space, double, adjacent, swap, other."""
+    if len(erased) == 1:
+        wrong = erased[0]
+        right = retyped[0]
+        if wrong == right:
+            return "other"
+        if wrong.lower() == right.lower():
+            return "case"
+        if wrong == " " or right == " ":
+            return "space"
+        if before and before[-1].lower() == wrong.lower() and wrong.isalpha():
+            return "double"
+        if (right.lower() in QWERTY_ADJACENCY.get(wrong.lower(), "")
+                or wrong.lower() in QWERTY_ADJACENCY.get(right.lower(), "")):
+            return "adjacent"
+        return "other"
+    if (len(erased) == 2 and erased[0].lower() != erased[1].lower()
+            and [c.lower() for c in reversed(erased)] == [c.lower() for c in retyped]):
+        return "swap"
+    return "other"
+
+
+def find_typo_corrections(events):
+    """Looks for typos the person fixed with Backspace. A fix of 1 to 3
+    Backspaces followed by the same number of retyped characters counts as a
+    typo, and longer deletions are treated as a rewrite and ignored. Returns
+    (letters_typed, fixes, kinds), where kinds counts each kind of fix."""
+    kinds = {"case": 0, "space": 0, "double": 0, "adjacent": 0, "swap": 0, "other": 0}
+    on_screen = []
+    letters = 0
+    fixes = 0
+    index = 0
+    total = len(events)
+    while index < total:
+        kind, character, _when = events[index]
+        if kind == "break":
+            on_screen = []
+            index += 1
+            continue
+        if kind == "char":
+            on_screen.append(character)
+            if character.isalpha():
+                letters += 1
+            index += 1
+            continue
+        end = index
+        while end < total and events[end][0] == "back":
+            end += 1
+        count = end - index
+        erased = on_screen[-count:] if count <= len(on_screen) else None
+        if erased is None:
+            on_screen = []
+        else:
+            del on_screen[len(on_screen) - count:]
+        retyped = []
+        look = end
+        while look < total and events[look][0] == "char" and len(retyped) < count:
+            retyped.append(events[look][1])
+            look += 1
+        if (erased is not None and count <= LEARN_TYPING_MAX_TYPO_KEYS
+                and len(retyped) == count):
+            fixes += 1
+            kinds[classify_typo_fix(erased, retyped, on_screen)] += 1
+        index = end
+    return letters, fixes, kinds
+
+
+def learned_pair_delays(pair_gaps):
+    """The (low, high) delay in seconds for common pairs, from the middle 80
+    percent of the measured gaps, or None if there are too few."""
+    if len(pair_gaps) < LEARN_TYPING_PAIR_MIN_GAPS:
+        return None
+    ordered = sorted(pair_gaps)
+    count = len(ordered)
+    floor, ceiling = LEARN_TYPING_PAIR_LIMITS
+    low = min(max(ordered[int(count * 0.1)], floor), ceiling)
+    high = min(max(ordered[min(count - 1, int(count * 0.9))], floor), ceiling)
+    if high - low < 0.01:
+        high = min(ceiling, low + max(0.01, low * 0.25))
+        if high - low < 0.01:
+            low = max(floor, high - 0.01)
+    return round(low, 3), round(high, 3)
+
+
+def learned_sentence_pauses(pauses):
+    """The (low, high) pause in seconds after a sentence, or None if there
+    are too few waits. A narrow spread is widened a little."""
+    if len(pauses) < LEARN_TYPING_PAUSE_MIN_COUNT:
+        return None
+    low = min(pauses)
+    high = max(pauses)
+    if high - low < 0.2:
+        low = max(0.0, low * 0.85)
+        high = high * 1.15 + 0.1
+    low = round(min(low, 60.0), 1)
+    high = round(min(max(high, low), 60.0), 1)
+    return low, high
+
+
+def learn_real_typing(events):
+    """Works out everything the sample can teach. Returns a dict with the
+    speed (None until there are enough key presses), the learned settings in
+    the same form get_current_settings_snapshot() uses (empty until a speed
+    is known), and the counts behind each part for the window to show. A
+    part with too little data is left out, so it is never guessed."""
+    gaps = gaps_from_events(events, skip_sentence_waits=True)
+    speed = measure_typing_speed(gaps)
+    pair_gaps = find_common_pair_gaps(events)
+    pair_delays = learned_pair_delays(pair_gaps)
+    usable = usable_learn_speed_gaps(gaps)
+    pauses = []
+    if usable:
+        pauses = find_sentence_pauses(events, sum(usable) / len(usable))
+    pause_range = learned_sentence_pauses(pauses)
+    letters, fixes, kinds = find_typo_corrections(events)
+
+    typo_chance = None
+    if letters >= LEARN_TYPING_MIN_LETTERS and fixes >= 1:
+        typo_chance = round(min(100.0 * fixes / letters, LEARN_TYPING_MAX_TYPO_CHANCE), 1)
+
+    learned = {
+        "speed": speed,
+        "settings": {},
+        "pair_gap_count": len(pair_gaps),
+        "pair_delays": pair_delays,
+        "pause_count": len(pauses),
+        "pause_range": pause_range,
+        "letters": letters,
+        "fixes": fixes,
+        "typo_kinds": kinds,
+        "typo_chance": typo_chance,
+    }
+    if speed is None:
+        return learned
+
+    settings = learned["settings"]
+    settings["min_delay"], settings["max_delay"] = delays_for_wpm(speed)
+    if pair_delays is not None:
+        settings["pair_delay_min"] = f"{pair_delays[0]:.3f}"
+        settings["pair_delay_max"] = f"{pair_delays[1]:.3f}"
+    if pause_range is not None:
+        settings["sentence_pause_min"] = f"{pause_range[0]:.1f}"
+        settings["sentence_pause_max"] = f"{pause_range[1]:.1f}"
+    if typo_chance is not None:
+        settings["enable_typos"] = True
+        settings["typo_chance"] = f"{typo_chance:.1f}"
+        extra_kinds = kinds["swap"] + kinds["double"] + kinds["space"]
+        if extra_kinds > 0:
+            settings["use_extra_typos"] = True
+        elif fixes >= 3:
+            settings["use_extra_typos"] = False
+        if kinds["case"] > 0:
+            settings["enable_capital_slips"] = True
+        elif fixes >= 3:
+            settings["enable_capital_slips"] = False
+    return learned
+
+
+def describe_learned_typing(learned):
+    """Short lines for the Learn My Speed window: what was learned, and what
+    still needs more typing. Empty until a speed is known."""
+    if learned["speed"] is None:
+        return []
+    lines = [f"Speed: about {learned['speed']} WPM."]
+    pair = learned["pair_delays"]
+    if pair is not None:
+        lines.append(f"Common letter pairs (th, he, in...): {pair[0]:.3f} to {pair[1]:.3f} seconds.")
+    else:
+        lines.append(
+            "Common letter pairs: not enough yet "
+            f"({learned['pair_gap_count']} of {LEARN_TYPING_PAIR_MIN_GAPS} measured)."
+        )
+    pause = learned["pause_range"]
+    if pause is not None:
+        lines.append(f"Waits after a sentence: {pause[0]:.1f} to {pause[1]:.1f} seconds.")
+    else:
+        lines.append(
+            "Waits after a sentence: not enough yet "
+            f"({learned['pause_count']} of {LEARN_TYPING_PAUSE_MIN_COUNT} measured)."
+        )
+    if learned["typo_chance"] is not None:
+        lines.append(
+            f"Typos you fix: about {learned['typo_chance']:.1f}% of letters "
+            f"({learned['fixes']} fixes)."
+        )
+    elif learned["letters"] < LEARN_TYPING_MIN_LETTERS:
+        lines.append(
+            "Typos: keep typing. At least "
+            f"{LEARN_TYPING_MIN_LETTERS} letters are needed ({learned['letters']} so far)."
+        )
+    else:
+        lines.append("Typos: none fixed, so the typo settings stay as they are.")
+    return lines
+
+
+def apply_learned_typing_settings(learned):
+    """Puts what was learned into the settings boxes. Every setting the sample
+    did not teach stays as it is."""
+    merged = get_current_settings_snapshot()
+    merged.update(learned["settings"])
+    apply_settings_snapshot(merged, include_files=False, rebind_hotkeys=False)
+    if learned["speed"] is not None:
+        target_wpm_var.set(str(learned["speed"]))
+
+
 def open_learn_speed_window():
     """Opens the Learn My Speed window (Typing Speed card, Speed tab)."""
     global learn_speed_window
@@ -10621,16 +10979,17 @@ def open_learn_speed_window():
         learn_speed_window.focus_force()
         return
 
-    learn_win = modern_toplevel(window, "Learn My Speed", "640x540", (480, 460))
+    learn_win = modern_toplevel(window, "Learn My Speed", "640x700", (480, 620))
     learn_speed_window = learn_win
-    session = {"gaps": [], "last_time": None}
+    session = {"gaps": [], "last_time": None, "events": []}
     status_var = tk.StringVar(value="")
 
     modern_label(
         learn_win,
         "Type the paragraph below, or any short paragraph you like, at your normal "
-        "speed. Fix mistakes the way you usually do. Amanuensis measures the time "
-        "between your key presses. The text you type here is not saved.",
+        "speed. Fix mistakes with Backspace the way you usually do. Amanuensis "
+        "measures your speed, your common letter pairs, your waits after sentences, "
+        "and the typos you fix. The text you type here is not saved.",
         wraplength=580,
     ).pack(anchor="w", padx=12, pady=(10, 6))
 
@@ -10651,6 +11010,10 @@ def open_learn_speed_window():
     button_row.pack(anchor="w", padx=12, pady=(0, 12))
     use_button = modern_button(button_row, "Use This Speed", lambda: use_speed(), state="disabled")
     use_button.pack(side="left")
+    profile_button = modern_button(
+        button_row, "Save as Profile", lambda: save_learned_profile(), state="disabled"
+    )
+    profile_button.pack(side="left", padx=(8, 0))
     modern_button(button_row, "Start Over", lambda: start_over(), kind="neutral").pack(
         side="left", padx=(8, 0)
     )
@@ -10661,19 +11024,29 @@ def open_learn_speed_window():
     def refresh_status():
         """Shows how far along the measuring is, and turns the Use button on
         once there are enough key presses to be steady."""
-        measured = len(usable_learn_speed_gaps(session["gaps"]))
-        speed = measure_typing_speed(session["gaps"])
-        if speed is None:
+        measured = len(usable_learn_speed_gaps(gaps_from_events(session["events"], True)))
+        learned = learn_real_typing(session["events"])
+        if learned["speed"] is None:
             status_var.set(
                 f"Keep typing. {measured} of {LEARN_SPEED_MIN_KEYS} key presses measured so far."
             )
             use_button.configure(state="disabled")
+            profile_button.configure(state="disabled")
         else:
+            lines = describe_learned_typing(learned)
             status_var.set(
-                f"Your typing speed is about {speed} WPM. Press Use This Speed, "
-                "or keep typing for a steadier result."
+                "\n".join(lines)
+                + "\n\nUse This Speed fills in only your speed. Save as Profile keeps "
+                "everything above. Keep typing for a steadier result."
             )
             use_button.configure(state="normal")
+            profile_button.configure(state="normal")
+
+    def record_event(kind, character="", when=None):
+        """Keeps one key event in memory (never saved) for the typo and pair
+        measuring, up to a limit."""
+        if len(session["events"]) < LEARN_TYPING_MAX_EVENTS:
+            session["events"].append((kind, character, time.perf_counter() if when is None else when))
 
     def on_key(event):
         """Records the time of each key that types a character. Backspace,
@@ -10681,15 +11054,28 @@ def open_learn_speed_window():
         correction or a cursor move is never counted as typing speed."""
         if event.keysym in LEARN_SPEED_MODIFIER_KEYS:
             return
+        if event.keysym == "BackSpace" and not (event.state & 0x0004):
+            # One plain Backspace (Ctrl+Backspace deletes a whole word, so it
+            # is treated as a cursor jump instead).
+            record_event("back")
+            session["last_time"] = None
+            return
         character = event.char
         if not character or not (character.isprintable() or character in ("\r", "\n")):
+            record_event("break")
             session["last_time"] = None
             return
         now = time.perf_counter()
         if session["last_time"] is not None:
             session["gaps"].append(now - session["last_time"])
         session["last_time"] = now
+        record_event("char", character, now)
         refresh_status()
+
+    def on_mouse(_event=None):
+        """A mouse click can move the cursor, so it breaks the chain too."""
+        record_event("break")
+        session["last_time"] = None
 
     def block_paste(_event=None):
         """Pasted text has no typing speed, so pasting is switched off here."""
@@ -10699,11 +11085,49 @@ def open_learn_speed_window():
         typing_box.delete("1.0", "end")
         session["gaps"] = []
         session["last_time"] = None
+        session["events"] = []
         refresh_status()
         typing_box.focus_set()
 
+    def save_learned_profile():
+        """Saves a profile made from the current settings with everything the
+        sample taught laid over it, then offers to use it now. Only numbers and
+        checkboxes are saved, never the text typed here."""
+        learned = learn_real_typing(session["events"])
+        if not learned["settings"]:
+            return
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            parent=learn_win,
+            title="Save My Typing Profile",
+            initialdir=PROFILE_DIR,
+            initialfile="My Typing.json",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            profile_data = get_shareable_profile_data()
+            profile_data.update(learned["settings"])
+            with open(path, "w", encoding="utf-8") as profile_file:
+                json.dump(profile_data, profile_file, indent=2)
+        except OSError as problem:
+            messagebox.showerror("Save Failed", str(problem))
+            return
+        use_now = messagebox.askyesno(
+            "Profile Saved",
+            f"Your typing profile was saved to:\n{path}\n\n"
+            "Use these settings now? This changes your speed, common letter pair, "
+            "sentence pause, and typo settings to what was learned. Everything else "
+            "stays as it is.",
+        )
+        if use_now:
+            apply_learned_typing_settings(learned)
+        close_window()
+
     def use_speed():
-        speed = measure_typing_speed(session["gaps"])
+        speed = learn_real_typing(session["events"])["speed"]
         if speed is None:
             return
         target_wpm_var.set(str(speed))
@@ -10722,6 +11146,7 @@ def open_learn_speed_window():
         learn_win.destroy()
 
     typing_box.bind("<KeyPress>", on_key)
+    typing_box.bind("<ButtonRelease-1>", on_mouse)
     typing_box.bind("<<Paste>>", block_paste)
     learn_win.protocol("WM_DELETE_WINDOW", close_window)
     refresh_status()
@@ -11238,6 +11663,8 @@ activity_sensitivity_var = tk.StringVar(value="20")
 
 min_delay_var = tk.StringVar(value="0.05")
 max_delay_var = tk.StringVar(value="0.15")
+pair_delay_min_var = tk.StringVar(value="0.02")
+pair_delay_max_var = tk.StringVar(value="0.05")
 target_wpm_var = tk.StringVar(value="")
 enable_fatigue_var = tk.BooleanVar(value=False)
 fatigue_strength_var = tk.StringVar(value="15")
@@ -11363,7 +11790,7 @@ SECTION_RESET_VARS = {
     "Start Countdown": [start_countdown_seconds_var],
     "Scheduled Start": [enable_scheduled_start_var, scheduled_start_time_var],
     "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
-    "Typing Speed": [min_delay_var, max_delay_var, target_wpm_var],
+    "Typing Speed": [min_delay_var, max_delay_var, pair_delay_min_var, pair_delay_max_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
     "Finger & Hand Timing": [enable_finger_timing_var],
@@ -11975,6 +12402,19 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.33.0",
+        "date": "2026-11-11",
+        "title": "Learn my real typing",
+        "changes": [
+            "Added: Learn My Speed now also learns how fast you type common letter pairs (like th, he, in, and er), how long you usually wait after a sentence, and which typos you fix with Backspace. The sample is now four short sentences, and you can still type any paragraph you like. Keep it short: you only need about 100 letters.",
+            "Added: a Save as Profile button in the Learn My Speed window. It saves a profile with what was learned (speed, common pair delays, sentence pauses, typo chance, extra typos, and capital slips), then asks if you want to use it now. Anything the sample could not teach is left as it is.",
+            "Added: two new settings, Common Pair Min Delay and Max Delay, under the Learn My Speed button on the Speed tab. They are saved with profiles and are part of the Typing Speed Reset This Section button.",
+            "Modified: common letter pairs always used a fixed wait of 0.02 to 0.05 seconds. That is now the default of the new settings, so typing does not change until you or a profile change them.",
+            "Modified: the wait after a sentence ending is no longer counted as typing speed in Learn My Speed.",
+            "Notes: the letters you type in the window are only kept in memory to sort typos into kinds, and are never saved. A profile gets numbers and checkboxes only. Typo kinds are a best guess. A part is only learned when there is enough data (6 common pairs, 2 sentence endings, 100 letters), and anything less is left alone. Waits after a sentence while copying a sample are usually shorter than while writing your own thoughts. No new packages.",
+        ],
+    },
     {
         "version": "5.32.0",
         "date": "2026-11-09",
@@ -13053,6 +13493,24 @@ modern_label(
     "fills in Target WPM, Min Delay, and Max Delay for you.",
     kind="muted",
 ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_separator(frame_settings).grid(row=8, column=0, columnspan=2, sticky="we", pady=10)
+
+modern_label(frame_settings, "Common Pair Min Delay (s)").grid(row=9, column=0, sticky="w")
+entry_pair_delay_min = modern_entry(frame_settings, pair_delay_min_var)
+entry_pair_delay_min.grid(row=10, column=0, sticky="w", pady=(4, 0))
+
+modern_label(frame_settings, "Common Pair Max Delay (s)").grid(row=9, column=1, sticky="w", padx=(16, 0))
+entry_pair_delay_max = modern_entry(frame_settings, pair_delay_max_var)
+entry_pair_delay_max.grid(row=10, column=1, sticky="w", padx=(16, 0), pady=(4, 0))
+
+modern_label(
+    frame_settings,
+    "The wait before the second letter of a common pair like th, he, in, or er.\n"
+    "The defaults (0.02 and 0.05) are quick. Learn My Speed can fill these in\n"
+    "from your own typing.",
+    kind="muted",
+).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # --- Target time (Update #27) ---
 modern_checkbox(
