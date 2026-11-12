@@ -94,7 +94,9 @@ class PressSequenceTests(unittest.TestCase):
 
     def setUp(self):
         self.fake = FakeKeyboard()
-        self.saved = {name: APP[name] for name in ("keyboard", "time")}
+        # The loader does not import the real keyboard package, so the name may
+        # not exist yet (and test_editor_mode removes it again when it finishes).
+        self.saved = {name: APP.get(name) for name in ("keyboard", "time")}
         APP["keyboard"] = self.fake
 
         class NoSleep:
@@ -108,7 +110,11 @@ class PressSequenceTests(unittest.TestCase):
 
     def tearDown(self):
         APP["release_all_held_keys"]()
-        APP.update(self.saved)
+        for name, value in self.saved.items():
+            if value is None:
+                APP.pop(name, None)
+            else:
+                APP[name] = value
 
     def test_letter_goes_down_then_up(self):
         APP["_send_char"](self.settings, "a")
