@@ -159,6 +159,8 @@ def load_app_namespace():
         "HAS_WINSOUND": False,
         "startup_theme": "dark",
         "startup_text_size": 100,
+        "startup_view_mode": "Simple",
+        "startup_guide_done": False,
         "TEXT_SCALE": 1.0,
     }
 

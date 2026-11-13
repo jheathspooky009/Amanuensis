@@ -9,6 +9,33 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.34.0 (2026-11-12) -- Simple view and first-run guide
+#   - Added: A Simple view, the default for new installs. It is one page with five
+#     steps: pick the text file, pick the window (with the lock box), pick a
+#     starter profile, set the speed (Target WPM, Apply WPM, Learn My Speed), and
+#     press Start. Everything else is hidden until the person wants it.
+#   - Added: Advanced view, which is the full tabbed layout from before, now with a
+#     Search settings box above the tabs. It searches every card's title and the
+#     text inside it, shows up to 5 matches, and a click opens the tab, scrolls to
+#     the card, and flashes its outline.
+#   - Added: A View button in the header (Advanced View or Simple View) and a
+#     first-run guide, a short welcome window with the five steps. It opens once on
+#     a new install, and a Show Quick Guide button on the Simple page opens it again.
+#   - Added: Two new settings, view_mode and first_run_guide_done, wired into
+#     validate_settings(), the settings dict, and both snapshot functions. They stay
+#     on this computer: shared profiles, Auto Profiles, and starter profiles never
+#     carry or change them, and Reset All Settings leaves them alone.
+#   - Modified: make_tab_area() can hold pages with no tab button (hidden_titles) and
+#     exposes top_bar, search_holder, and body. make_modern_card() records each card
+#     in ALL_CARDS for the search. Nothing else about the tabs changed.
+#   - Notes: No settings file means a new install (Simple view, guide shown). An older
+#     settings file keeps the Advanced layout and counts the guide as seen, so nobody
+#     is surprised. The Simple page reuses the same variables as the Advanced tabs,
+#     so a change in one view shows in the other. New plain functions:
+#     normalize_view_mode(), choose_startup_view(), find_settings_matches(). Not yet
+#     tried on a real screen: open both views, use the search box, and send back
+#     what happens. No new packages.
+#
 # v5.33.0 (2026-11-11) -- Learn my real typing
 #   - Added: Learn My Speed now also learns how fast you type common letter
 #     pairs (th, he, in, er...), how long you usually wait after a sentence, and
@@ -62,32 +89,6 @@
 #     safety timer (0.2 seconds) releases a key that an overlap left down, so
 #     a key can never get stuck and auto-repeat. Preview runs press no keys.
 #     Backspace and shortcuts are still instant. No new packages.
-#
-# v5.31.0 (2026-10-30) -- Editor type
-#   - Added: An Editor Type card on the Window tab with one new setting,
-#     editor_mode (Plain text, Google Docs or Word, or Code editor), saved with
-#     profiles and restored on launch. Plain text is the default and types
-#     exactly as before. The card has its own Reset This Section button.
-#   - Added: Google Docs or Word mode types a line that starts with a list
-#     marker (1. or a) or - or * or + or a round bullet, with up to 12 leading
-#     spaces) as space, Left, marker, Right, so the editor does not turn the
-#     line into a list. The text on screen ends up the same as the file.
-#   - Added: Code editor mode clears the editor's own indent at the start of
-#     every line after the first (Shift+Home, a space, Backspace), so the
-#     line's own spaces are not added on top of it. Blank lines are cleared too.
-#   - Modified: Starter profiles leave the editor type as it is, and the load
-#     message lists it. Auto Profile can pick it, because a saved profile
-#     carries it.
-#   - Notes: New plain functions: normalize_editor_mode(), find_editor_list_marker(),
-#     plan_editor_line_start(), editor_marker_span_is_clear(). The two key
-#     sequences are _run_editor_clear_indent() and _run_editor_list_marker(),
-#     called from one spot in the typing loop. A list marker is typed as one
-#     unit, so it is only used when no format shortcut, pause marker, or left
-#     mistake is planned inside it; otherwise it is typed the normal way. Both
-#     sequences never delete real text and always finish once started. Preview
-#     runs skip them. Not handled: auto-closing brackets, suggestion pop-ups,
-#     and other autocorrect (smart quotes, symbols). Older settings and profile
-#     files without this setting load as Plain text. No new packages.
 #
 # ============================================
 
@@ -3617,6 +3618,63 @@ def clamp_text_size_percent(value):
     if not math.isfinite(number):
         return TEXT_SIZE_DEFAULT
     return min(TEXT_SIZE_CHOICES, key=lambda choice: abs(choice - number))
+
+
+# SIMPLE VIEW AND FIRST-RUN GUIDE (Update #61): new installs open in Simple view,
+# which shows only the file, the window, a starter profile, the speed, and Start.
+# Advanced view is the full tabbed layout. Both are only a choice for this
+# computer, so profiles never carry them.
+VIEW_SIMPLE = "Simple"
+VIEW_ADVANCED = "Advanced"
+VIEW_MODES = (VIEW_SIMPLE, VIEW_ADVANCED)
+SIMPLE_TAB_TITLE = "Simple"
+SETTINGS_SEARCH_MAX_RESULTS = 5
+
+
+def normalize_view_mode(value, fallback=VIEW_ADVANCED):
+    """Returns 'Simple' or 'Advanced' for a saved view choice (any capitals).
+    Anything else, including a number or nothing at all, gives the fallback."""
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        for mode in VIEW_MODES:
+            if cleaned == mode.lower():
+                return mode
+    return fallback
+
+
+def choose_startup_view(settings_file_found, data):
+    """Decides the view and whether the first-run guide was already seen, from
+    last_settings.json. Returns (view_mode, guide_done).
+    No settings file means a new install: Simple view, guide not seen yet.
+    An older settings file (made before this setting) keeps the layout the person
+    already knows: Advanced view, guide counted as seen."""
+    if not settings_file_found:
+        return VIEW_SIMPLE, False
+    if not isinstance(data, dict):
+        return VIEW_ADVANCED, True
+    guide_done = data.get("first_run_guide_done", True)
+    if not isinstance(guide_done, bool):
+        guide_done = True
+    return normalize_view_mode(data.get("view_mode")), guide_done
+
+
+def find_settings_matches(query, index, limit=SETTINGS_SEARCH_MAX_RESULTS):
+    """The settings search. index is a list of dicts with 'title' (the card name)
+    and 'text' (every label inside the card). A card matches when every word in
+    the query appears in its title or text (capitals do not matter). Cards whose
+    title matches come first, then the rest in their order on screen."""
+    words = [word for word in str(query).lower().split() if word]
+    if not words:
+        return []
+    scored = []
+    for position, entry in enumerate(index):
+        title = str(entry.get("title", "")).lower()
+        full_text = title + " " + str(entry.get("text", "")).lower()
+        if all(word in full_text for word in words):
+            title_hit = all(word in title for word in words)
+            scored.append((0 if title_hit else 1, position, entry))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored[: max(int(limit), 0)]]
 
 
 # SCHEDULED START (Update #46): the person picks a clock time and the run waits
@@ -7606,6 +7664,12 @@ def validate_settings():
     if text_size_percent_var.get() != f"{text_size_percent}%":
         text_size_percent_var.set(f"{text_size_percent}%")
 
+    # View (Update #61): Simple or Advanced, and whether the first-run guide was seen.
+    view_mode = normalize_view_mode(view_mode_var.get(), VIEW_SIMPLE)
+    if view_mode_var.get() != view_mode:
+        view_mode_var.set(view_mode)
+    first_run_guide_done = bool(first_run_guide_done_var.get())
+
     # Preview speed (Update #53): only the allowed choices. A box that cannot be
     # read goes back to 1x, and a number between choices snaps to the nearest.
     preview_speed = clamp_preview_speed(preview_speed_var.get())
@@ -7700,6 +7764,8 @@ def validate_settings():
         "sentence_pause_max": sentence_pause_max,
         "theme": theme,
         "text_size_percent": text_size_percent,
+        "view_mode": view_mode,
+        "first_run_guide_done": first_run_guide_done,
         "check_typed_text": check_typed_text,
         "preview_speed": preview_speed,
     }
@@ -9356,7 +9422,9 @@ def refresh_window_list():
         if t not in seen:
             seen.add(t)
             unique_titles.append(t)
-    window_combo.configure(values=unique_titles or [""])
+    for combo in (window_combo, simple_window_combo):
+        if combo is not None:
+            combo.configure(values=unique_titles or [""])
     if unique_titles and not window_var.get():
         window_var.set(unique_titles[0])
 
@@ -9500,6 +9568,8 @@ def get_current_settings_snapshot():
         "skipped_update_version": skipped_update_version_var.get(),
         "theme": theme_var.get(),
         "text_size_percent": clamp_text_size_percent(text_size_percent_var.get()),
+        "view_mode": normalize_view_mode(view_mode_var.get(), VIEW_SIMPLE),
+        "first_run_guide_done": bool(first_run_guide_done_var.get()),
         "check_typed_text": check_typed_text_var.get(),
         "preview_speed": preview_speed_label(clamp_preview_speed(preview_speed_var.get())),
     }
@@ -9616,6 +9686,11 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
         text_size_percent_var.set(
             f"{clamp_text_size_percent(data.get('text_size_percent', TEXT_SIZE_DEFAULT))}%"
         )
+        # The view and the first-run guide are choices for this computer, so shared
+        # profiles never carry them (Update #61). Older files load as Advanced with
+        # the guide counted as seen, so nobody's layout changes under them.
+        view_mode_var.set(normalize_view_mode(data.get("view_mode"), VIEW_ADVANCED))
+        first_run_guide_done_var.set(bool(data.get("first_run_guide_done", True)))
         # Reading the text back uses this computer's clipboard, so it is never
         # saved in shared profiles either (Update #51). Older files load as off.
         check_typed_text_var.set(bool(data.get("check_typed_text", False)))
@@ -9649,6 +9724,8 @@ PROFILE_LOCAL_ONLY_KEYS = (
     "text_size_percent",
     "check_typed_text",
     "preview_speed",
+    "view_mode",
+    "first_run_guide_done",
 )
 
 
@@ -9732,6 +9809,8 @@ AUTO_PROFILE_KEEP_KEYS = (
     "text_size_percent",
     "check_typed_text",
     "preview_speed",
+    "view_mode",
+    "first_run_guide_done",
 )
 
 
@@ -11284,6 +11363,179 @@ def toggle_compact_mode():
         compact_mode_active = True
 
 
+def apply_view_mode(mode, remember=True):
+    """Shows the Simple page (no tab bar, no search box) or the full tabbed
+    Advanced layout, and saves the choice. Nothing typed or set is changed."""
+    mode = normalize_view_mode(mode, VIEW_SIMPLE)
+    view_mode_var.set(mode)
+    if mode == VIEW_SIMPLE:
+        notebook.top_bar.pack_forget()
+        tab_selector.show_tab(SIMPLE_TAB_TITLE)
+        btn_view_toggle.configure(text="Advanced View")
+    else:
+        notebook.top_bar.pack(fill="x", before=notebook.body)
+        tab_selector.show_tab(tab_selector.get())
+        btn_view_toggle.configure(text="Simple View")
+    if remember:
+        save_last_settings()
+
+
+def toggle_view_mode():
+    """Switches between Simple view and Advanced view."""
+    if normalize_view_mode(view_mode_var.get(), VIEW_SIMPLE) == VIEW_SIMPLE:
+        apply_view_mode(VIEW_ADVANCED)
+    else:
+        apply_view_mode(VIEW_SIMPLE)
+
+
+FIRST_RUN_GUIDE_STEPS = (
+    ("1. Pick your text file", "Press Browse and choose a .txt, .md, or .docx file."),
+    ("2. Pick where to type", "Choose the window from the list, then check the lock box so typing only goes there."),
+    ("3. Pick a typing style", "Choose a starter profile and press Load Starter Profile."),
+    ("4. Pick your speed", "Optional. Type a words-per-minute number and press Apply WPM, or press Learn My Speed."),
+    ("5. Press Start", "Then click into the place you want typed in before the countdown ends. Pause and Stop are in the bar at the bottom."),
+)
+
+
+def show_first_run_guide():
+    """A short welcome window with the five Simple view steps. Closing it any way
+    counts as seen, so it opens by itself only once. The Quick Guide button on the
+    Simple page opens it again."""
+    if state.is_running:
+        return
+    guide = modern_toplevel(window, "Welcome to Amanuensis", "500x610", (440, 580))
+
+    def finish(open_advanced=False):
+        first_run_guide_done_var.set(True)
+        guide.destroy()
+        if open_advanced:
+            apply_view_mode(VIEW_ADVANCED, remember=False)
+        save_last_settings()
+
+    holder = modern_frame(guide)
+    holder.pack(fill="both", expand=True, padx=14, pady=14)
+    body = make_modern_card(holder, "Welcome to Amanuensis")
+    modern_label(
+        body,
+        "Amanuensis types your text for you, one key at a time, like a person would. "
+        "Five steps get you going:",
+        wraplength=420,
+    ).pack(anchor="w", pady=(0, 8))
+    for step_title, step_text in FIRST_RUN_GUIDE_STEPS:
+        modern_label(body, step_title, kind="status").pack(anchor="w", pady=(6, 0))
+        modern_label(body, step_text, kind="muted", wraplength=420).pack(anchor="w")
+    modern_label(
+        body,
+        "Want every setting? Press Advanced View in the top bar. You can switch back any time.",
+        wraplength=420,
+    ).pack(anchor="w", pady=(12, 0))
+    button_row = modern_frame(body)
+    button_row.pack(anchor="e", pady=(12, 0))
+    modern_button(button_row, "Open Advanced View", lambda: finish(True), kind="neutral").pack(side="left", padx=(0, 8))
+    modern_button(button_row, "Got It", finish).pack(side="left")
+    guide.protocol("WM_DELETE_WINDOW", finish)
+    guide.after(100, guide.lift)
+
+
+def maybe_show_first_run_guide():
+    """Runs once shortly after launch. Skips itself if the guide was seen, a run
+    is active, or the text size warning is about to open."""
+    if first_run_guide_done_var.get() or state.is_running or text_size_fit_report is not None:
+        return
+    show_first_run_guide()
+
+
+def collect_widget_text(widget, found):
+    """Adds the text of every label, checkbox, and button inside widget to found."""
+    for child in widget.winfo_children():
+        try:
+            text = child.cget("text")
+        except (ValueError, AttributeError, KeyError, TypeError, tk.TclError):
+            text = ""
+        if isinstance(text, str) and text.strip():
+            found.append(text.strip())
+        collect_widget_text(child, found)
+
+
+def find_card_tab(card):
+    """The title of the settings tab that holds this card, or None."""
+    widget = card
+    while widget is not None:
+        for title, frame in tab_frames.items():
+            if widget is frame:
+                return title
+        widget = getattr(widget, "master", None)
+    return None
+
+
+settings_search_index = []
+settings_search_ready = False
+
+
+def build_settings_search_index():
+    """Collects each settings card's title and the text inside it, once, the first
+    time the search box is used (every card exists by then)."""
+    global settings_search_ready
+    settings_search_index.clear()
+    for title, outer in ALL_CARDS:
+        tab = find_card_tab(outer)
+        if tab is None or tab in (SIMPLE_TAB_TITLE, "History"):
+            continue
+        found = []
+        collect_widget_text(outer, found)
+        settings_search_index.append({"title": title, "tab": tab, "text": " ".join(found), "card": outer})
+    settings_search_ready = True
+
+
+def jump_to_settings_card(entry):
+    """Opens the tab that holds a search result, scrolls to its card, and flashes
+    the card's outline so it is easy to spot."""
+    tab = entry["tab"]
+    card = entry["card"]
+    settings_search_results.pack_forget()  # close the list so the tab is not covered
+    tab_selector.set(tab)
+    tab_selector.show_tab(tab)
+    window.update_idletasks()
+    total = max(tab_frames[tab].winfo_height(), 1)
+    tab_canvases[tab].yview_moveto(min(max((card.winfo_y() - 8) / total, 0.0), 1.0))
+
+    def restore():
+        try:
+            card.configure(border_color=PALETTE["border"], border_width=1)
+        except tk.TclError:
+            pass
+
+    try:
+        card.configure(border_color=PALETTE["accent"], border_width=3)
+        window.after(1600, restore)
+    except tk.TclError:
+        pass
+
+
+def refresh_settings_search(*_args):
+    """Rebuilds the list of matching cards under the search box."""
+    for child in settings_search_results.winfo_children():
+        child.destroy()
+    query = settings_search_var.get().strip()
+    if not query:
+        settings_search_results.pack_forget()
+        return
+    if not settings_search_ready:
+        build_settings_search_index()
+    matches = find_settings_matches(query, settings_search_index)
+    settings_search_results.pack(fill="x", pady=(6, 0))
+    if not matches:
+        modern_label(settings_search_results, "No settings matched. Try a shorter or different word.", kind="muted").pack(anchor="w")
+        return
+    for entry in matches:
+        modern_button(
+            settings_search_results,
+            f"{entry['title']}   ({entry['tab']} tab)",
+            lambda chosen=entry: jump_to_settings_card(chosen),
+            kind="neutral",
+        ).pack(fill="x", pady=2)
+
+
 def on_text_size_chosen(_choice=None):
     """Runs when a text size is picked in the Text Size card. Saves it right
     away. Like the theme, the new size shows up the next time Amanuensis
@@ -11417,6 +11669,19 @@ except Exception:
 TEXT_SCALE = startup_text_size / 100.0
 if TEXT_SCALE != 1.0:
     ctk.set_widget_scaling(TEXT_SCALE)
+
+# Startup view check (Update #61): also read straight from last_settings.json,
+# so the right layout is chosen before it is built. No file means a new install.
+_view_file_found = False
+_view_data = None
+try:
+    _view_file_found = os.path.exists(LAST_SETTINGS_PATH)
+    if _view_file_found:
+        with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as _f:
+            _view_data = json.load(_f)
+except Exception:
+    _view_data = None
+startup_view_mode, startup_guide_done = choose_startup_view(_view_file_found, _view_data)
 
 LIGHT_PALETTE = {
     "bg": "#eef1f5",
@@ -11643,6 +11908,10 @@ style.configure(
 # Variables
 theme_var = tk.StringVar(value=startup_theme)
 text_size_percent_var = tk.StringVar(value=f"{startup_text_size}%")
+view_mode_var = tk.StringVar(value=startup_view_mode)  # Simple or Advanced (Update #61)
+first_run_guide_done_var = tk.BooleanVar(value=startup_guide_done)
+settings_search_var = tk.StringVar(value="")  # the Advanced view search box (not saved)
+simple_window_combo = None  # the Simple view's window list, built later
 input_path_var = tk.StringVar(value="input.txt")
 file_queue_var = tk.Variable(value=[])
 
@@ -11987,6 +12256,9 @@ def modern_frame(parent, bordered=False):
     return ctk.CTkFrame(parent, fg_color="transparent")
 
 
+ALL_CARDS = []  # (title, outer frame) of every card made, for the settings search
+
+
 def make_modern_card(parent, title):
     """A rounded card with a title. Returns the body frame, which is where
     the card's widgets are placed with grid()."""
@@ -12009,6 +12281,7 @@ def make_modern_card(parent, title):
     ).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
     body = ctk.CTkFrame(outer, fg_color="transparent")
     body.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 16))
+    ALL_CARDS.append((title, outer))
     return body
 
 
@@ -12163,14 +12436,20 @@ def modern_toplevel(parent, title, size, min_size):
     return top
 
 
-def make_tab_area(parent, titles):
+def make_tab_area(parent, titles, hidden_titles=()):
     """A pill-shaped tab bar plus one page per title. Returns
     (container, pages, selector): pack the container like any frame, put each
-    tab's content in pages[title], and selector is the tab bar itself."""
+    tab's content in pages[title], and selector is the tab bar itself.
+    hidden_titles are pages with no button in the tab bar (the Simple view page);
+    selector.show_tab(title) shows any page. container.top_bar holds everything
+    above the pages (container.search_holder, then the tab bar) so a view can hide
+    it, and container.body holds the pages."""
     container = ctk.CTkFrame(parent, fg_color="transparent")
-    selector_holder = ctk.CTkFrame(container, fg_color="transparent")
+    top_bar = ctk.CTkFrame(container, fg_color="transparent")
+    search_holder = ctk.CTkFrame(top_bar, fg_color="transparent")
+    selector_holder = ctk.CTkFrame(top_bar, fg_color="transparent")
     body = ctk.CTkFrame(container, fg_color="transparent")
-    pages = {title: ctk.CTkFrame(body, fg_color="transparent") for title in titles}
+    pages = {title: ctk.CTkFrame(body, fg_color="transparent") for title in list(titles) + list(hidden_titles)}
 
     def show_tab(title):
         for page in pages.values():
@@ -12192,10 +12471,17 @@ def make_tab_area(parent, titles):
         font=modern_font(bold=True),
     )
     selector.pack(fill="x", padx=4)
+    search_holder.pack(fill="x")
     selector_holder.pack(fill="x", pady=(0, 8))
+    top_bar.pack(fill="x")
     body.pack(fill="both", expand=True)
     selector.set(titles[0])
     show_tab(titles[0])
+    selector.show_tab = show_tab
+    container.top_bar = top_bar
+    container.search_holder = search_holder
+    container.selector_holder = selector_holder
+    container.body = body
     return container, pages, selector
 
 
@@ -12335,6 +12621,10 @@ def make_header_button(text, command):
 btn_compact_toggle = make_header_button("Compact", toggle_compact_mode)
 btn_compact_toggle.pack(side="right", padx=(4, 16), pady=12)
 
+btn_view_toggle = make_header_button("Advanced View", toggle_view_mode)
+btn_view_toggle.configure(width=136)
+btn_view_toggle.pack(side="right", padx=(0, 4), pady=12)
+
 btn_theme_toggle = make_header_button(f"Theme: {theme_var.get().capitalize()}", toggle_theme)
 btn_theme_toggle.pack(side="right", padx=(0, 4), pady=12)
 
@@ -12402,6 +12692,18 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.34.0",
+        "date": "2026-11-12",
+        "title": "Simple view and first-run guide",
+        "changes": [
+            "Added: a Simple view, the default for new installs. One page with five steps: pick your text file, pick the window to type in (with the lock box), pick a starter profile, set your speed (Target WPM, Apply WPM, or Learn My Speed), and press Start.",
+            "Added: Advanced view is the full tabbed layout you already know, now with a Search settings box above the tabs. Type a word like pause or typo, and a click on a match opens its tab, scrolls to the card, and flashes its outline.",
+            "Added: a View button in the top bar to switch between Simple and Advanced any time, and a short first-run guide that opens once on a new install. Show Quick Guide on the Simple page opens it again.",
+            "Added: two new settings (view and first-run guide seen), saved and restored on launch and kept on this computer only: shared profiles, Auto Profiles, and starter profiles never carry or change them, and Reset All Settings leaves them alone.",
+            "Notes: older settings files open in Advanced view with the guide counted as seen, so nobody's layout changes. Both views share the same settings, so a change in one shows in the other. Not yet tried on a real screen, so open both views and the search box and send back what happens. No new packages.",
+        ],
+    },
     {
         "version": "5.33.0",
         "date": "2026-11-11",
@@ -13054,7 +13356,7 @@ APP_VERSION = VERSION_HISTORY[0]["version"]
 # TABBED SETTINGS (fills remaining space above the footer)
 # --------------------------------------------
 TAB_TITLES = ["Input", "Window", "Speed", "Mistakes", "Hotkeys", "Data", "History"]
-notebook, tab_pages, tab_selector = make_tab_area(window, TAB_TITLES)
+notebook, tab_pages, tab_selector = make_tab_area(window, TAB_TITLES, [SIMPLE_TAB_TITLE])
 notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
 
@@ -13100,7 +13402,7 @@ def make_scrollable_tab(parent):
 tab_frames = {}     # tab title -> inner frame that cards are placed in
 tab_canvases = {}   # tab title -> its scroll canvas
 
-for _tab_title in TAB_TITLES:
+for _tab_title in TAB_TITLES + [SIMPLE_TAB_TITLE]:
     tab_frames[_tab_title], tab_canvases[_tab_title] = make_scrollable_tab(tab_pages[_tab_title])
 
 tab_input = tab_frames["Input"]
@@ -13110,6 +13412,7 @@ tab_mistakes = tab_frames["Mistakes"]
 tab_hotkeys = tab_frames["Hotkeys"]
 tab_data = tab_frames["Data"]
 tab_history = tab_frames["History"]
+tab_simple = tab_frames[SIMPLE_TAB_TITLE]
 tab_window_canvas = tab_canvases["Window"]
 
 
@@ -14218,6 +14521,104 @@ modern_label(
     wraplength=520,
 ).grid(row=4, column=0, columnspan=3, sticky="w")
 
+# --- Simple view page (Update #61) ---
+frame_simple_file = make_modern_card(tab_simple, "1. Pick Your Text File")
+frame_simple_window = make_modern_card(tab_simple, "2. Pick Where To Type")
+frame_simple_style = make_modern_card(tab_simple, "3. Pick A Typing Style")
+frame_simple_speed = make_modern_card(tab_simple, "4. Pick Your Speed")
+frame_simple_start = make_modern_card(tab_simple, "5. Press Start")
+
+modern_entry(frame_simple_file, input_path_var, width=40).grid(row=0, column=0, padx=(0, 8), sticky="we")
+modern_button(frame_simple_file, "Browse...", browse_input_file, kind="neutral").grid(row=0, column=1)
+modern_label(
+    frame_simple_file, "Text (.txt), Markdown (.md), and Word (.docx) files all work.", kind="muted", wraplength=420
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+modern_label(frame_simple_file, textvariable=resume_status_var, kind="muted", wraplength=420).grid(
+    row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+)
+frame_simple_file.columnconfigure(0, weight=1)
+
+if HAS_PYGETWINDOW:
+    simple_window_combo = modern_combobox(frame_simple_window, window_var, width=30)
+    simple_window_combo.grid(row=0, column=0, padx=(0, 8), sticky="we")
+
+    def _simple_combo_no_scroll(event):
+        """Same as the Window tab's list: scrolling the page must not change the choice."""
+        tab_canvases[SIMPLE_TAB_TITLE].yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    simple_window_combo.bind("<MouseWheel>", _simple_combo_no_scroll)
+    modern_button(frame_simple_window, "Refresh", refresh_window_list, kind="neutral").grid(row=0, column=1)
+    modern_checkbox(frame_simple_window, "Lock typing to this window", lock_window_var).grid(
+        row=1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+    )
+    frame_simple_window.columnconfigure(0, weight=1)
+    refresh_window_list()
+else:
+    modern_label(
+        frame_simple_window,
+        "pygetwindow not installed \u2014 window lock disabled.\nInstall with: pip install pygetwindow",
+        kind="warning",
+    ).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_simple_window,
+    "After you press Start, click into the place you want typed in before the countdown ends.",
+    kind="muted",
+    wraplength=420,
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+simple_style_combo = modern_combobox(frame_simple_style, starter_profile_choice_var, width=24)
+simple_style_combo.configure(values=get_starter_profile_names())
+simple_style_combo.grid(row=0, column=0, padx=(0, 8), pady=(0, 8), sticky="w")
+modern_button(frame_simple_style, "Load Starter Profile", load_starter_profile).grid(
+    row=0, column=1, pady=(0, 8), sticky="w"
+)
+modern_label(frame_simple_style, textvariable=starter_profile_description_var, kind="muted", wraplength=420).grid(
+    row=1, column=0, columnspan=2, sticky="w"
+)
+
+modern_label(frame_simple_speed, "Target WPM (optional)").grid(row=0, column=0, columnspan=2, sticky="w")
+simple_wpm_entry = modern_entry(frame_simple_speed, target_wpm_var)
+simple_wpm_entry.grid(row=1, column=0, sticky="w", pady=(4, 0))
+simple_wpm_entry.bind("<FocusOut>", apply_target_wpm)
+modern_button(frame_simple_speed, "Apply WPM", apply_target_wpm, kind="neutral").grid(
+    row=1, column=1, sticky="w", padx=(16, 0), pady=(4, 0)
+)
+modern_button(frame_simple_speed, "Learn My Speed", open_learn_speed_window, kind="neutral").grid(
+    row=2, column=0, columnspan=2, sticky="w", pady=(10, 0)
+)
+modern_label(
+    frame_simple_speed,
+    "Leave this alone to keep the speed from your starter profile. Pauses and mistakes "
+    "make the overall pace a little slower than this number.",
+    kind="muted",
+    wraplength=420,
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_label(
+    frame_simple_start,
+    "Press the green Start button at the bottom (or your Start hotkey). Use Pause to take a "
+    "break and Stop to end the run. Progress is saved, so you can resume a stopped run.",
+    wraplength=420,
+).grid(row=0, column=0, columnspan=2, sticky="w")
+modern_button(frame_simple_start, "Show Quick Guide", show_first_run_guide, kind="neutral").grid(
+    row=1, column=0, sticky="w", pady=(10, 0), padx=(0, 8)
+)
+modern_button(frame_simple_start, "Advanced View", lambda: apply_view_mode(VIEW_ADVANCED), kind="neutral").grid(
+    row=1, column=1, sticky="w", pady=(10, 0)
+)
+
+# --- Settings search (Advanced view only, Update #61) ---
+search_row = modern_frame(notebook.search_holder)
+search_row.pack(fill="x", padx=4, pady=(0, 6))
+modern_label(search_row, "Search settings:").pack(side="left", padx=(0, 8))
+settings_search_entry = modern_entry(search_row, settings_search_var, width=26)
+settings_search_entry.pack(side="left", fill="x", expand=True)
+settings_search_entry.bind("<FocusIn>", refresh_settings_search)  # click back in to see the list again
+modern_button(search_row, "Clear", lambda: settings_search_var.set(""), kind="neutral").pack(side="left", padx=(8, 0))
+settings_search_results = modern_frame(notebook.search_holder)
+settings_search_var.trace_add("write", refresh_settings_search)
+
 # --- Logging ---
 modern_checkbox(
     frame_logging,
@@ -14413,6 +14814,7 @@ for _section_name, _section_card in SECTION_CARDS.items():
 # loops. Auto-save happens on close via on_close(), registered below.
 calculate_window_sizes()
 load_last_settings()
+apply_view_mode(view_mode_var.get(), remember=False)
 input_path_var.trace_add("write", lambda *args: refresh_resume_status())
 file_queue_var.trace_add("write", lambda *args: refresh_resume_status())
 refresh_resume_status()
@@ -14426,4 +14828,5 @@ window.after(UPDATE_CLEANUP_DELAY_MS, cleanup_update_leftovers)
 window.after(500, update_gui)
 window.after(50, process_gui_queue)
 window.after(900, fit_text_size_to_screen)
+window.after(400, maybe_show_first_run_guide)
 window.mainloop()
