@@ -9,6 +9,30 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.35.0 (2026-11-13) -- Keyboard layouts
+#   - Added: A Keyboard Layout card on the Window tab with a list of QWERTY (the
+#     default, which types exactly as before), AZERTY, QWERTZ, Dvorak, and
+#     Colemak. The layout decides which keys count as next-door keys for typos and
+#     which finger types each letter. The typed text never changes.
+#   - Added: One new setting, keyboard_layout, wired into validate_settings(), the
+#     settings dict, and both snapshot functions. It stays on this computer: shared
+#     profiles, Auto Profiles, and starter profiles never carry or change it, and
+#     Reset All Settings leaves it alone. Older settings files load as QWERTY, and
+#     a value that is not a known layout goes back to QWERTY.
+#   - Modified: Next-door-key typos, the wrong-letter mistake left for the person
+#     to fix, the typo sorting in Learn My Speed, Finger & Hand Timing, the time
+#     estimate, and the Key Press Timing overlap now read the chosen layout through
+#     get_adjacent_letters() and get_finger_for_letter(). QWERTY keeps its original
+#     hand-made tables, so nothing changes for it. The other layouts are built from
+#     three rows of ten keys, using the same column-to-finger map and the same
+#     neighbor stagger as QWERTY.
+#   - Notes: Only the 26 letters are mapped, so punctuation keys are never neighbors
+#     of a letter (the same as QWERTY before). Common letter pair speed (th, he,
+#     in...), Smart Text Fixes, synonyms, and decision words are still English only.
+#     The layout is the physical keyboard's letter layout and does not press any
+#     different keys. Not yet tried on real AZERTY, QWERTZ, Dvorak, or Colemak
+#     keyboards. No new packages.
+#
 # v5.34.0 (2026-11-12) -- Simple view and first-run guide
 #   - Added: A Simple view, the default for new installs. It is one page with five
 #     steps: pick the text file, pick the window (with the lock box), pick a
@@ -62,33 +86,6 @@
 #     speed from 6 or more pair gaps, and typos from 100 or more letters; anything
 #     less is left alone. Sentence pauses while copying a sample are usually
 #     shorter than while writing your own thoughts. No new packages.
-#
-# v5.32.0 (2026-11-09) -- Real key press timing
-#   - Added: A Key Press Timing card on the Speed tab. When it is on, every
-#     letter and space is pressed down, held for a short random time (40 to 110
-#     milliseconds by default), and then released, instead of being pressed and
-#     released in one instant. The hold time range is set in the card.
-#   - Added: Shift is held for capital letters. Shift goes down just before the
-#     letter and comes up just after it, like a real hand does. It has its own
-#     checkbox and is on by default once Key Press Timing is on.
-#   - Added: Optional overlap, off by default. On a quick pair of letters typed
-#     by opposite hands, the next key goes down just before the first one comes
-#     up, like a fast typist. A chance box sets how often.
-#   - Added: Six new settings (enable_key_hold, key_hold_min_ms, key_hold_max_ms,
-#     enable_shift_hold, enable_key_overlap, key_overlap_chance), each wired into
-#     validate_settings(), the settings dict, both snapshot functions, and a new
-#     Reset This Section list (Key Press Timing). They are saved in profiles.
-#   - Modified: The hold time is taken out of the gap before the next key, so
-#     the typing speed (Target WPM) and the time estimate stay the same.
-#   - Notes: Key Press Timing is off by default. Only plain letters and the
-#     space bar use it. Numbers, punctuation, and other characters are typed the
-#     old way (instant), because pressing them by key name can type a different
-#     character on a non-US keyboard layout. If a key cannot be pressed by name
-#     (for example a non-Latin layout), that character is typed the old way.
-#     Every held key is released on Stop and when the run ends, and a short
-#     safety timer (0.2 seconds) releases a key that an overlap left down, so
-#     a key can never get stuck and auto-repeat. Preview runs press no keys.
-#     Backspace and shortcuts are still instant. No new packages.
 #
 # ============================================
 
@@ -259,18 +256,19 @@ HAND_SWITCH_MULTIPLIER = 0.92
 SAME_FINGER_MULTIPLIER = 1.18
 
 
-def get_finger_timing_multiplier(prev_char, char):
+def get_finger_timing_multiplier(prev_char, char, layout=None):
     """Returns the delay multiplier for typing `char` right after `prev_char`.
     1.0 means no change. Only letter-to-letter pairs change: spaces, digits,
-    punctuation, and a repeated letter (like the double l in "all") stay 1.0."""
+    punctuation, and a repeated letter (like the double l in "all") stay 1.0.
+    `layout` is a keyboard layout name (Update #62); None uses the active one."""
     if not prev_char or not char:
         return 1.0
     prev_letter = prev_char[-1].lower()
     letter = char[0].lower()
     if prev_letter == letter:
         return 1.0
-    prev_finger = FINGER_FOR_LETTER.get(prev_letter)
-    this_finger = FINGER_FOR_LETTER.get(letter)
+    prev_finger = get_finger_for_letter(prev_letter, layout)
+    this_finger = get_finger_for_letter(letter, layout)
     if prev_finger is None or this_finger is None:
         return 1.0
     if prev_finger[0] != this_finger[0]:
@@ -280,30 +278,39 @@ def get_finger_timing_multiplier(prev_char, char):
     return 1.0
 
 
-def _build_finger_pair_shifts():
+def _build_finger_pair_shifts(layout=None):
     """Builds a lookup from a two-letter pair to how far its multiplier is from
-    1.0. The 16 common pairs are left out because they already type at their
-    own fast fixed speed. Used by the time estimate so it stays quick."""
+    1.0 on one keyboard layout. The 16 common pairs are left out because they
+    already type at their own fast fixed speed. Used by the time estimate so it
+    stays quick."""
     shifts = {}
-    for first in FINGER_FOR_LETTER:
-        for second in FINGER_FOR_LETTER:
+    letters = _layout_tables(layout)[0]
+    for first in letters:
+        for second in letters:
             pair = first + second
             if pair in COMMON_PAIRS:
                 continue
-            shift = get_finger_timing_multiplier(first, second) - 1.0
+            shift = get_finger_timing_multiplier(first, second, layout) - 1.0
             if shift != 0.0:
                 shifts[pair] = shift
     return shifts
 
 
-FINGER_PAIR_SHIFTS = _build_finger_pair_shifts()
+# One pair lookup per keyboard layout, built the first time it is needed.
+_FINGER_PAIR_SHIFTS_BY_LAYOUT = {}
 
 
-def estimate_finger_timing_shift(text):
+def estimate_finger_timing_shift(text, layout=None):
     """Adds up how much the finger and hand timing changes the typing time of
-    `text`, counted in average per-character delays (negative means faster)."""
+    `text`, counted in average per-character delays (negative means faster).
+    `layout` is a keyboard layout name (Update #62); None uses the active one."""
+    layout = normalize_keyboard_layout(layout if layout is not None else active_keyboard_layout)
+    shifts = _FINGER_PAIR_SHIFTS_BY_LAYOUT.get(layout)
+    if shifts is None:
+        shifts = _build_finger_pair_shifts(layout)
+        _FINGER_PAIR_SHIFTS_BY_LAYOUT[layout] = shifts
     lowered = text.lower()
-    return sum(FINGER_PAIR_SHIFTS.get(first + second, 0.0)
+    return sum(shifts.get(first + second, 0.0)
                for first, second in zip(lowered, lowered[1:]))
 
 # --------------------------------------------
@@ -316,6 +323,113 @@ QWERTY_ADJACENCY = {
     'h': 'gyujnb', 'j': 'huikmn', 'k': 'jiolm', 'l': 'kop',
     'z': 'asx', 'x': 'zsdc', 'c': 'xdfv', 'v': 'cfgb', 'b': 'vghn', 'n': 'bhjm', 'm': 'njk',
 }
+
+# --------------------------------------------
+# KEYBOARD LAYOUTS (Update #62)
+# --------------------------------------------
+# The typed text never changes with the layout. The layout only decides which
+# keys are neighbors (for next-door-key typos and the Learn My Speed typo
+# sorting) and which finger types each letter (for finger and hand timing and
+# the key overlap). QWERTY keeps the two hand-made tables above, so it types
+# exactly as it did before. The other layouts are worked out from the rows
+# below: each layout is three rows of ten keys, and a dot is a key that holds
+# no letter. A key sits in the same physical spot on every layout, so the
+# fingers come from the column, and the neighbors come from the same stagger
+# the QWERTY table follows (a key touches the keys to its left and right, two
+# keys above, and two keys below).
+KEYBOARD_LAYOUT_QWERTY = "QWERTY"
+KEYBOARD_LAYOUT_AZERTY = "AZERTY"
+KEYBOARD_LAYOUT_QWERTZ = "QWERTZ"
+KEYBOARD_LAYOUT_DVORAK = "Dvorak"
+KEYBOARD_LAYOUT_COLEMAK = "Colemak"
+KEYBOARD_LAYOUTS = (
+    KEYBOARD_LAYOUT_QWERTY,
+    KEYBOARD_LAYOUT_AZERTY,
+    KEYBOARD_LAYOUT_QWERTZ,
+    KEYBOARD_LAYOUT_DVORAK,
+    KEYBOARD_LAYOUT_COLEMAK,
+)
+KEYBOARD_LAYOUT_ROWS = {
+    KEYBOARD_LAYOUT_QWERTY: ("qwertyuiop", "asdfghjkl.", "zxcvbnm..."),
+    KEYBOARD_LAYOUT_AZERTY: ("azertyuiop", "qsdfghjklm", "wxcvbn...."),
+    KEYBOARD_LAYOUT_QWERTZ: ("qwertzuiop", "asdfghjkl.", "yxcvbnm..."),
+    KEYBOARD_LAYOUT_DVORAK: ("...pyfgcrl", "aoeuidhtns", ".qjkxbmwvz"),
+    KEYBOARD_LAYOUT_COLEMAK: ("qwfpgjluy.", "arstdhneio", "zxcvbkm..."),
+}
+# Which hand and finger types each of the ten columns (touch typing).
+KEYBOARD_COLUMN_FINGERS = (
+    ('left', 'pinky'), ('left', 'ring'), ('left', 'middle'), ('left', 'index'),
+    ('left', 'index'), ('right', 'index'), ('right', 'index'), ('right', 'middle'),
+    ('right', 'ring'), ('right', 'pinky'),
+)
+
+# The layout the typing code uses when it is not told one. validate_settings()
+# and the start of every run set it from the Keyboard Layout list, so typos and
+# finger timing deep inside the typing loop agree with the setting.
+active_keyboard_layout = KEYBOARD_LAYOUT_QWERTY
+
+# (fingers, adjacency) for each layout, built the first time it is needed.
+_LAYOUT_TABLES = {}
+
+
+def normalize_keyboard_layout(value):
+    """Returns a known keyboard layout, or QWERTY for anything else (settings
+    and profile files are untrusted input)."""
+    return value if value in KEYBOARD_LAYOUTS else KEYBOARD_LAYOUT_QWERTY
+
+
+def set_active_keyboard_layout(value):
+    """Makes `value` the layout used when a function is not told one."""
+    global active_keyboard_layout
+    active_keyboard_layout = normalize_keyboard_layout(value)
+
+
+def _build_layout_tables(rows):
+    """Works out (fingers, adjacency) for one layout from its three rows.
+    fingers maps a letter to (hand, finger). adjacency maps a letter to a
+    string of the letters on the keys around it."""
+    fingers = {}
+    grid = {}
+    for row_number, row in enumerate(rows):
+        for column, key in enumerate(row):
+            if key != ".":
+                fingers[key] = KEYBOARD_COLUMN_FINGERS[column]
+                grid[(row_number, column)] = key
+    adjacency = {}
+    for (row_number, column), key in grid.items():
+        around = (
+            (row_number, column - 1), (row_number, column + 1),
+            (row_number - 1, column), (row_number - 1, column + 1),
+            (row_number + 1, column - 1), (row_number + 1, column),
+        )
+        adjacency[key] = "".join(grid[spot] for spot in around if spot in grid)
+    return fingers, adjacency
+
+
+def _layout_tables(layout=None):
+    """Returns (fingers, adjacency) for a layout name; None means the active one."""
+    layout = normalize_keyboard_layout(layout if layout is not None else active_keyboard_layout)
+    tables = _LAYOUT_TABLES.get(layout)
+    if tables is None:
+        if layout == KEYBOARD_LAYOUT_QWERTY:
+            tables = (FINGER_FOR_LETTER, QWERTY_ADJACENCY)
+        else:
+            tables = _build_layout_tables(KEYBOARD_LAYOUT_ROWS[layout])
+        _LAYOUT_TABLES[layout] = tables
+    return tables
+
+
+def get_finger_for_letter(letter, layout=None):
+    """(hand, finger) for a lowercase letter, or None if it is not a letter."""
+    return _layout_tables(layout)[0].get(letter)
+
+
+def get_adjacent_letters(char, layout=None):
+    """The letters on the keys around `char`'s key, as a string. Empty when
+    `char` is not one of the 26 letters."""
+    if not isinstance(char, str):
+        return ""
+    return _layout_tables(layout)[1].get(char.lower(), "")
 
 # --------------------------------------------
 # PROTECTED-TEXT MARKERS: [[exact text]]
@@ -1423,7 +1537,7 @@ def _left_letter_kinds(text, index, protection_mask):
     char = text[index]
     previous_char = text[index - 1]
     kinds = []
-    if char.lower() in QWERTY_ADJACENCY:
+    if get_adjacent_letters(char):
         kinds.append("wrong_letter")
     if "a" <= char <= "z":
         # Update #44: one capital in the middle of a word, like the H in "tHe"
@@ -1569,7 +1683,7 @@ def _build_left_mistake(text, kind, start, rng):
     typed in place of text[start:end]."""
     char = text[start]
     if kind == "wrong_letter":
-        wrong = rng.choice(QWERTY_ADJACENCY[char.lower()])
+        wrong = rng.choice(get_adjacent_letters(char))
         return start, start + 1, (wrong.upper() if char.isupper() else wrong)
     if kind == "wrong_case":
         return start, start + 1, char.upper()
@@ -3047,13 +3161,14 @@ def plan_key_press(char, shift_hold=True):
     return None
 
 
-def are_opposite_hand_letters(first, second):
+def are_opposite_hand_letters(first, second, layout=None):
     """True when both are plain lowercase letters and a different hand types
-    each one (the QWERTY map in FINGER_FOR_LETTER)."""
+    each one (on the chosen keyboard layout, Update #62; None means the active
+    one)."""
     if not isinstance(first, str) or not isinstance(second, str):
         return False
-    first_finger = FINGER_FOR_LETTER.get(first)
-    second_finger = FINGER_FOR_LETTER.get(second)
+    first_finger = get_finger_for_letter(first, layout)
+    second_finger = get_finger_for_letter(second, layout)
     if first_finger is None or second_finger is None:
         return False
     return first_finger[0] != second_finger[0]
@@ -5275,7 +5390,7 @@ def _simulate_capital_slip_typo(settings, char, text, idx, protection_mask, use_
 
 def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos,
                                 capital_slip=False):
-    """Simulates an adjacent-key typo on a QWERTY keyboard.
+    """Simulates an adjacent-key typo on the chosen keyboard layout (Update #62).
     When use_extra_typos is False, preserves the original quick wrong-and-backspace behavior.
     When use_extra_typos is True, types 1-3 lookahead characters before pausing and backspacing.
     When capital_slip is True, the wrong character is the same letter as a capital
@@ -5284,7 +5399,7 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
         wrong_char = char.upper()
         slip_name = "capital slip"
     else:
-        wrong_char = random.choice(QWERTY_ADJACENCY[char.lower()])
+        wrong_char = random.choice(get_adjacent_letters(char))
         slip_name = "adjacent-key"
         if char.isupper():
             wrong_char = wrong_char.upper()
@@ -5840,6 +5955,9 @@ def type_text(settings, is_batch=False, is_last=True):
     simulated mistakes, and research breaks, honoring stop/pause/
     focus-lock events throughout."""
 
+    # Typos and finger timing deep in the typing loop read the active layout
+    # (Update #62), so set it from this run's settings first.
+    set_active_keyboard_layout(settings.get("keyboard_layout"))
     input_path = settings["input_path"]
     min_delay = settings["min_delay"]
     max_delay = settings["max_delay"]
@@ -6806,12 +6924,12 @@ def type_text(settings, is_batch=False, is_last=True):
                     )
                     typo_corrected = True
                 elif not use_extra_typos:
-                    if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
+                    if char.isalpha() and get_adjacent_letters(char):
                         _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, False)
                         typo_corrected = True
                 else:
                     candidates = []
-                    if char.isalpha() and char.lower() in QWERTY_ADJACENCY:
+                    if char.isalpha() and get_adjacent_letters(char):
                         candidates.append("adjacent")
                     if (char.isalpha()
                             and idx < len(text) - 1
@@ -6878,7 +6996,7 @@ def type_text(settings, is_batch=False, is_last=True):
                 delay += random.uniform(0.01, 0.03)
             if enable_finger_timing:
                 # Update #28: opposite hands a little faster, same finger a little slower
-                delay *= get_finger_timing_multiplier(prev_char, char)
+                delay *= get_finger_timing_multiplier(prev_char, char, settings.get("keyboard_layout"))
 
         if typing_mood is not None:
             # Update #31: flow makes the key quicker, hesitation slower (before fatigue)
@@ -7130,7 +7248,7 @@ def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seco
     if settings.get("enable_finger_timing", True):
         # Finger and hand timing (Update #28): hand switches are a little faster and
         # same-finger pairs a little slower. The shift is counted in average delays.
-        total_seconds += estimate_finger_timing_shift(text) * avg_delay
+        total_seconds += estimate_finger_timing_shift(text, settings.get("keyboard_layout")) * avg_delay
 
     # Uneven rhythm (Update #40): familiar text quicker, names, technical terms,
     # punctuation, and hedged claims slower. Counted in average delays.
@@ -7676,6 +7794,14 @@ def validate_settings():
     if preview_speed_var.get() != preview_speed_label(preview_speed):
         preview_speed_var.set(preview_speed_label(preview_speed))
 
+    # Keyboard layout (Update #62): only the allowed layouts. Anything else goes
+    # back to QWERTY. It is also made the active layout right away, so the typo
+    # and finger code that reads it agrees with the list.
+    keyboard_layout = normalize_keyboard_layout(keyboard_layout_var.get())
+    if keyboard_layout_var.get() != keyboard_layout:
+        keyboard_layout_var.set(keyboard_layout)
+    set_active_keyboard_layout(keyboard_layout)
+
     return {
         "input_path": input_path if not queue_files else queue_files[0],
         "file_queue": queue_files,
@@ -7768,6 +7894,7 @@ def validate_settings():
         "first_run_guide_done": first_run_guide_done,
         "check_typed_text": check_typed_text,
         "preview_speed": preview_speed,
+        "keyboard_layout": keyboard_layout,
     }
 
 
@@ -9572,6 +9699,7 @@ def get_current_settings_snapshot():
         "first_run_guide_done": bool(first_run_guide_done_var.get()),
         "check_typed_text": check_typed_text_var.get(),
         "preview_speed": preview_speed_label(clamp_preview_speed(preview_speed_var.get())),
+        "keyboard_layout": normalize_keyboard_layout(keyboard_layout_var.get()),
     }
 
 
@@ -9699,6 +9827,9 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
         # Older settings files without it keep the 1x default.
         if "preview_speed" in data:
             preview_speed_var.set(preview_speed_label(clamp_preview_speed(data["preview_speed"])))
+        # The keyboard layout describes this computer's keyboard, so shared
+        # profiles never carry it either (Update #62). Older files load as QWERTY.
+        keyboard_layout_var.set(normalize_keyboard_layout(data.get("keyboard_layout")))
         enable_auto_profile_var.set(bool(data.get("enable_auto_profile", False)))
         set_auto_profile_rules(data.get("auto_profile_rules", []))
         # A scheduled start belongs to this computer and this moment, so shared
@@ -9726,6 +9857,7 @@ PROFILE_LOCAL_ONLY_KEYS = (
     "preview_speed",
     "view_mode",
     "first_run_guide_done",
+    "keyboard_layout",
 )
 
 
@@ -9811,6 +9943,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "preview_speed",
     "view_mode",
     "first_run_guide_done",
+    "keyboard_layout",
 )
 
 
@@ -10309,7 +10442,7 @@ def reset_to_defaults():
         "Reset All Settings",
         "Reset all settings to their default values?\n\n"
         "This will overwrite whatever you currently have entered.\n"
-        "Your theme, text size, input file, and file queue will not change.",
+        "Your theme, text size, keyboard layout, input file, and file queue will not change.",
     ):
         return
     for section_name in SECTION_DEFAULTS:
@@ -10851,8 +10984,8 @@ def classify_typo_fix(erased, retyped, before):
             return "space"
         if before and before[-1].lower() == wrong.lower() and wrong.isalpha():
             return "double"
-        if (right.lower() in QWERTY_ADJACENCY.get(wrong.lower(), "")
-                or wrong.lower() in QWERTY_ADJACENCY.get(right.lower(), "")):
+        if (right.lower() in get_adjacent_letters(wrong)
+                or wrong.lower() in get_adjacent_letters(right)):
             return "adjacent"
         return "other"
     if (len(erased) == 2 and erased[0].lower() != erased[1].lower()
@@ -11058,6 +11191,8 @@ def open_learn_speed_window():
         learn_speed_window.focus_force()
         return
 
+    # Typos are sorted into kinds with the chosen keyboard layout (Update #62).
+    set_active_keyboard_layout(keyboard_layout_var.get())
     learn_win = modern_toplevel(window, "Learn My Speed", "640x700", (480, 620))
     learn_speed_window = learn_win
     session = {"gaps": [], "last_time": None, "events": []}
@@ -12031,6 +12166,7 @@ enable_sound_var = tk.BooleanVar(value=True)
 alert_on_auto_pause_var = tk.BooleanVar(value=False)
 check_typed_text_var = tk.BooleanVar(value=False)
 preview_speed_var = tk.StringVar(value=preview_speed_label(PREVIEW_SPEED_DEFAULT))
+keyboard_layout_var = tk.StringVar(value=KEYBOARD_LAYOUT_QWERTY)
 enable_update_check_var = tk.BooleanVar(value=True)
 skipped_update_version_var = tk.StringVar(value="")
 update_status_var = tk.StringVar(value="Not checked yet this session.")
@@ -12692,6 +12828,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.35.0",
+        "date": "2026-11-13",
+        "title": "Keyboard layouts",
+        "changes": [
+            "Added: a Keyboard Layout card on the Window tab with a list: QWERTY (the default, which types exactly as before), AZERTY, QWERTZ, Dvorak, and Colemak. The layout decides which keys count as next-door keys when a typo happens, and which finger types each letter. The typed text never changes.",
+            "Added: one new setting (keyboard layout), saved and restored on launch and kept on this computer only: shared profiles, Auto Profiles, and starter profiles never carry or change it, and Reset All Settings leaves it alone. Older settings files load as QWERTY.",
+            "Modified: next-door-key typos, the wrong letters left for you to fix, the typo kinds Learn My Speed finds, Finger & Hand Timing, the time estimate, and the Key Press Timing overlap all follow the chosen layout.",
+            "Notes: only the 26 letters are mapped, so punctuation keys are never next-door keys of a letter. Common letter pair speed, Smart Text Fixes, synonyms, and decision words are still English only. Not yet tried on real AZERTY, QWERTZ, Dvorak, or Colemak keyboards. No new packages.",
+        ],
+    },
     {
         "version": "5.34.0",
         "date": "2026-11-12",
@@ -13422,6 +13569,7 @@ frame_file = make_modern_card(tab_input, "Input File")
 # --- Tab: Window (keeps typing going to the right place) ---
 frame_window = make_modern_card(tab_window, "Target Window Lock")
 frame_editor_type = make_modern_card(tab_window, "Editor Type")
+frame_keyboard_layout = make_modern_card(tab_window, "Keyboard Layout")
 frame_start_countdown = make_modern_card(tab_window, "Start Countdown")
 frame_scheduled_start = make_modern_card(tab_window, "Scheduled Start")
 frame_auto_profile = make_modern_card(tab_window, "Auto Profile by Window")
@@ -13679,6 +13827,24 @@ modern_label(
     wraplength=420,
 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+# --- Keyboard layout (Update #62) ---
+modern_label(frame_keyboard_layout, "My keyboard:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+keyboard_layout_combo = modern_combobox(frame_keyboard_layout, keyboard_layout_var, width=22)
+keyboard_layout_combo.configure(values=list(KEYBOARD_LAYOUTS))
+keyboard_layout_combo.grid(row=0, column=1, sticky="w")
+
+modern_label(
+    frame_keyboard_layout,
+    "Pick the letter layout of your keyboard: QWERTY (the default), AZERTY, QWERTZ, "
+    "Dvorak, or Colemak. It decides which keys count as next-door keys for typos "
+    "and which finger types each letter for Finger & Hand Timing and Key Press "
+    "Timing. The typed text never changes. Smart Text Fixes, synonyms, and "
+    "decision words are still English only. This setting stays on this computer: "
+    "profiles do not carry it, and Reset All Settings does not change it.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 # --- Start countdown (Update #43) ---
 modern_label(frame_start_countdown, "Countdown Before Typing (seconds):").grid(
     row=0, column=0, sticky="w", padx=(0, 8)
@@ -13867,7 +14033,8 @@ modern_checkbox(
 
 modern_label(
     frame_finger_timing,
-    "Types like real hands on a QWERTY keyboard. When two letters in a row use "
+    "Types like real hands on the keyboard layout chosen on the Window tab (QWERTY "
+    "by default). When two letters in a row use "
     "opposite hands (like the \"ti\" in \"time\"), the second one comes a little "
     "sooner. When two different letters use the same finger (like \"ed\" or \"lo\"), "
     "it comes a little later.\n\n"
