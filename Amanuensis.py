@@ -9,6 +9,33 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.36.0 (2026-11-15) -- Auto-pause when the screen locks
+#   - Added: An "Auto-pause when the screen locks" checkbox in the Activity
+#     Auto-Pause card on the Window tab, on by default. While a run is typing, it
+#     now pauses when Windows locks the screen or the Windows session is switched
+#     away (fast user switching, a dropped remote session), so no keys are sent
+#     to the lock screen. It works with or without a locked target window.
+#   - Added: The check also runs just before every key goes out, so a screen that
+#     locked during a research break or a long session break pauses the run
+#     before any typing starts again. The waits themselves are not paused.
+#   - Added: One new setting, auto_pause_screen_lock, wired into validate_settings(),
+#     the settings dict, and both snapshot functions. It is saved with profiles, is
+#     part of the Activity Auto-Pause Reset This Section button, and starter
+#     profiles never change it. Older settings files load as on.
+#   - Modified: The pause uses the same pause as the other auto-pauses. The status
+#     bar shows "Screen locked" or "Session changed", the run stays paused after
+#     unlocking until Resume Typing (or the Pause hotkey) is pressed, and the
+#     "Beep when typing pauses by itself" alert also covers it. Preview runs never
+#     check the screen.
+#   - Notes: Windows reports a locked screen by refusing programs access to the
+#     input desktop, and a switched-away session by its connect state, so a new
+#     plain function, read_screen_state(), asks Windows with ctypes from the
+#     standard library, and classify_screen_state() decides. An unreadable answer
+#     counts as fine and other systems never pause, so this check cannot stop a
+#     run by itself. A Windows UAC prompt counts as locked because keys cannot
+#     reach it either. If Resume is pressed while the screen still reads as
+#     locked, the check is switched off for the rest of that run. No new packages.
+#
 # v5.35.0 (2026-11-13) -- Keyboard layouts
 #   - Added: A Keyboard Layout card on the Window tab with a list of QWERTY (the
 #     default, which types exactly as before), AZERTY, QWERTZ, Dvorak, and
@@ -59,33 +86,6 @@
 #     normalize_view_mode(), choose_startup_view(), find_settings_matches(). Not yet
 #     tried on a real screen: open both views, use the search box, and send back
 #     what happens. No new packages.
-#
-# v5.33.0 (2026-11-11) -- Learn my real typing
-#   - Added: Learn My Speed now also learns how fast you type common letter
-#     pairs (th, he, in, er...), how long you usually wait after a sentence, and
-#     which typos you fix with Backspace. The sample is four short sentences, and
-#     you can still type any paragraph you like.
-#   - Added: A Save as Profile button in the Learn My Speed window. It saves a
-#     profile with what was learned (speed, pair delays, sentence pauses, typo
-#     chance, extra typos, capital slips) and then asks if you want to use it now.
-#     Anything the sample could not teach is left as it is.
-#   - Added: Two new settings (pair_delay_min, pair_delay_max), shown under the
-#     Learn My Speed button on the Speed tab, wired into validate_settings(), the
-#     settings dict, both snapshot functions, and the Typing Speed reset list.
-#   - Modified: Common letter pairs used a fixed 0.02 to 0.05 second delay. That
-#     is now the default of the new settings, so typing is unchanged until a
-#     profile or the boxes change it. Learn My Speed's sample has four sentences
-#     so there are enough sentence endings to measure.
-#   - Modified: Profile data for saving now comes from one function,
-#     get_shareable_profile_data(), used by Save Profile and the new button.
-#     delays_for_wpm() is now shared by set_delays_from_wpm().
-#   - Notes: The letters you type in the window are only kept in memory to sort
-#     typos into kinds (next-door key, swapped, doubled, capital, space). They are
-#     never saved: a profile gets numbers and checkboxes only. Typo kinds are a
-#     best guess. A pause is only learned from 2 or more sentence endings, pair
-#     speed from 6 or more pair gaps, and typos from 100 or more letters; anything
-#     less is left alone. Sentence pauses while copying a sample are usually
-#     shorter than while writing your own thoughts. No new packages.
 #
 # ============================================
 
@@ -3606,6 +3606,177 @@ def alert_auto_pause(settings):
     run_on_main_thread(play_auto_pause_alert)
 
 
+# --------------------------------------------
+# AUTO-PAUSE WHEN THE SCREEN LOCKS (Update #63)
+# --------------------------------------------
+# Window lock only helps when a target window is locked. This also pauses the
+# run when Windows locks the screen or the Windows session is switched away, so
+# no keys are sent to the lock screen. It uses the same pause as the other
+# auto-pauses (pause_event), and the person resumes by hand after unlocking.
+#
+# How it can tell:
+#   * Locked screen: Windows swaps in a secure desktop, and a normal program is
+#     refused (access denied) when it asks to open the input desktop. A UAC
+#     prompt does the same, and keys cannot reach it either.
+#   * Session changed: the session's connect state is "disconnected" (fast user
+#     switching, a dropped remote session).
+# Anything that cannot be read counts as fine, so a problem here never stops a
+# run by itself, and computers that are not Windows never pause.
+SCREEN_CHECK_SECONDS = 0.25
+SCREEN_STATE_LOCKED = "locked"
+SCREEN_STATE_SESSION = "session"
+SCREEN_PAUSE_STATUS_TEXT = {
+    SCREEN_STATE_LOCKED: "Screen locked \u2014 paused",
+    SCREEN_STATE_SESSION: "Session changed \u2014 paused",
+}
+SCREEN_STATUS_PREFIXES = ("Screen locked", "Session changed")
+AUTO_PAUSE_STATUS_PREFIXES = ("Activity detected",) + SCREEN_STATUS_PREFIXES
+DESKTOP_SWITCHDESKTOP = 0x0100  # Windows access right to the input desktop
+ERROR_ACCESS_DENIED = 5
+WTS_CURRENT_SESSION = 0xFFFFFFFF
+WTS_CONNECT_STATE_CLASS = 8
+SESSION_STATE_DISCONNECTED = 4  # Windows connect state "WTSDisconnected"
+
+# The person pressed Resume while the screen still read as locked, so the check
+# is wrong on this computer and stays off for the rest of the run.
+screen_guard_override_event = threading.Event()
+_screen_api = {}
+
+
+def _status_is_auto_pause_note():
+    """True while the status bar shows why a run paused by itself (mouse
+    activity, a locked screen, a switched session). The pause waits keep that
+    text instead of replacing it with a plain Paused."""
+    return str(state.status).startswith(AUTO_PAUSE_STATUS_PREFIXES)
+
+
+def _status_is_screen_note():
+    return str(state.status).startswith(SCREEN_STATUS_PREFIXES)
+
+
+def classify_screen_state(desktop_reachable, session_state):
+    """Decides from what Windows said. desktop_reachable is True, False, or None
+    (could not tell). session_state is the Windows connect state number, or None.
+    Returns SCREEN_STATE_LOCKED, SCREEN_STATE_SESSION, or None when typing may go on."""
+    if desktop_reachable is False:
+        return SCREEN_STATE_LOCKED
+    if session_state == SESSION_STATE_DISCONNECTED:
+        return SCREEN_STATE_SESSION
+    return None
+
+
+def _get_screen_api():
+    """Loads the two Windows libraries once, with their argument types set so
+    handles are never cut short on 64-bit Windows."""
+    if "user32" not in _screen_api:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        user32.OpenInputDesktop.restype = wintypes.HANDLE
+        user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+        user32.CloseDesktop.restype = wintypes.BOOL
+        wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+        wtsapi32.WTSQuerySessionInformationW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD),
+        ]
+        wtsapi32.WTSQuerySessionInformationW.restype = wintypes.BOOL
+        wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+        wtsapi32.WTSFreeMemory.restype = None
+        _screen_api["user32"] = user32
+        _screen_api["wtsapi32"] = wtsapi32
+    return _screen_api["user32"], _screen_api["wtsapi32"]
+
+
+def read_screen_state():
+    """Asks Windows two questions and returns (desktop_reachable, session_state).
+    desktop_reachable is True when the normal desktop is the one receiving input,
+    False when Windows refused access to it (a locked screen), and None when it
+    could not be told. session_state is the Windows connect state number, or
+    None. Off Windows, or after any error, both are None, which means fine."""
+    if sys.platform != "win32" or _screen_api.get("failed"):
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32, wtsapi32 = _get_screen_api()
+
+        desktop_reachable = None
+        ctypes.set_last_error(0)
+        desktop = user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+        if desktop:
+            desktop_reachable = True
+            user32.CloseDesktop(desktop)
+        elif ctypes.get_last_error() == ERROR_ACCESS_DENIED:
+            desktop_reachable = False
+
+        session_state = None
+        buffer = ctypes.c_void_p()
+        size = wintypes.DWORD()
+        if wtsapi32.WTSQuerySessionInformationW(
+                None, WTS_CURRENT_SESSION, WTS_CONNECT_STATE_CLASS,
+                ctypes.byref(buffer), ctypes.byref(size)):
+            try:
+                if buffer.value:
+                    session_state = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_int)).contents.value
+            finally:
+                wtsapi32.WTSFreeMemory(buffer)
+        return desktop_reachable, session_state
+    except Exception:
+        _screen_api["failed"] = True
+        return None, None
+
+
+def pause_for_blocked_screen(alert=False):
+    """Pauses the run when the screen is locked or the session is switched away.
+    Called from the typing thread (before each key) and from the watcher below.
+    Returns True when the screen is blocked. It only pauses when the run is not
+    already paused, so the status text and the beep happen once per pause.
+    Everything that touches the window goes through run_on_main_thread()."""
+    if screen_guard_override_event.is_set():
+        return False
+    reason = classify_screen_state(*read_screen_state())
+    if reason is None:
+        return False
+    if not pause_event.is_set():
+        pause_event.set()
+        state.status = SCREEN_PAUSE_STATUS_TEXT[reason]
+        log_event("screen_lock_pause", "screen locked" if reason == SCREEN_STATE_LOCKED else "session changed")
+        run_on_main_thread(lambda: btn_pause.configure(text="Resume Typing"))
+        if alert:
+            run_on_main_thread(play_auto_pause_alert)
+    return True
+
+
+def note_resume_while_screen_blocked():
+    """Called on the main thread when the person presses Resume after a screen
+    pause. If Windows still says the screen is blocked, the person is clearly
+    using the computer, so the check is wrong here and is switched off for the
+    rest of the run. That way a wrong reading can never trap a run in a pause."""
+    if not _status_is_screen_note():
+        return
+    if classify_screen_state(*read_screen_state()) is not None:
+        screen_guard_override_event.set()
+        log_event("screen_lock_override", "resumed while the screen still read as blocked")
+
+
+def _screen_lock_watcher(alert=False):
+    """Checks the screen about four times a second while typing is active, so a
+    lock in the middle of a typo fix or a rework is caught quickly. It skips the
+    start countdown and the long waits where the person is expected to be away,
+    and the check before each key covers the moment typing starts again."""
+    while not stop_event.is_set() and state.is_running:
+        time.sleep(SCREEN_CHECK_SECONDS)
+        if stop_event.is_set() or not state.is_running:
+            break
+        if (state.status.startswith("Starting in") or state.status == "Countdown..."
+                or state.status.startswith("Session break")
+                or state.status.startswith("Waiting to start")):
+            continue
+        pause_for_blocked_screen(alert)
+
+
 def _activity_watcher(sensitivity, alert=False):
     """Monitors mouse cursor position while typing is active.
     If the cursor moves more than `sensitivity` pixels from its resting position,
@@ -5640,7 +5811,7 @@ def _wait_for_session_break(seconds, break_number, break_total):
             while pause_event.is_set():
                 if stop_event.is_set():
                     return False
-                if not state.status.startswith("Activity detected"):
+                if not _status_is_auto_pause_note():
                     state.status = "Paused"
                 time.sleep(0.2)
             _note_blocked_time(time.time() - block_start)
@@ -5692,7 +5863,7 @@ def _wait_for_pause_marker(seconds):
             while pause_event.is_set():
                 if stop_event.is_set():
                     return False
-                if not state.status.startswith("Activity detected"):
+                if not _status_is_auto_pause_note():
                     state.status = "Paused"
                 time.sleep(0.2)
             _note_blocked_time(time.time() - block_start)
@@ -5738,7 +5909,7 @@ def _lookback_gate(settings, check_focus):
         if stop_event.is_set():
             return False
         if pause_event.is_set():
-            if not state.status.startswith("Activity detected"):
+            if not _status_is_auto_pause_note():
                 state.status = "Paused"
         elif check_focus and not _lookback_focus_ok(settings):
             state.status = "Focus lost \u2014 paused"
@@ -6313,6 +6484,10 @@ def type_text(settings, is_batch=False, is_last=True):
 
     prev_char = text[resume_from - 1] if resume_from > 0 else ""
     last_focus_check = 0.0
+    # Screen lock check (Update #63): off in a preview, which has no real screen.
+    screen_lock_guard = bool(settings.get("auto_pause_screen_lock", True)) and not settings.get("preview_mode")
+    alert_on_screen_pause = bool(settings.get("alert_on_auto_pause", False))
+    last_screen_check = 0.0
     # Seed the rework buffer with real text already typed before this
     # point (back to the last paragraph break), so reworks right
     # after resuming still have real context instead of an empty one.
@@ -6585,6 +6760,19 @@ def type_text(settings, is_batch=False, is_last=True):
                         log_event("focus_regained", "")
 
         # --------------------------------
+        # SCREEN LOCK CHECK (Update #63)
+        # Throttled to about 4x/sec. If the screen is locked or the session is
+        # switched away, this sets the normal pause, and the block below waits
+        # before any key is sent. It also covers the moment typing starts again
+        # after a long wait, which the watcher thread skips on purpose.
+        # --------------------------------
+        if screen_lock_guard:
+            screen_now = time.time()
+            if screen_now - last_screen_check >= SCREEN_CHECK_SECONDS:
+                last_screen_check = screen_now
+                pause_for_blocked_screen(alert_on_screen_pause)
+
+        # --------------------------------
         # PAUSE / FOCUS-LOST HANDLING
         # Blocks here until both conditions clear, then folds the
         # elapsed block time into paused_duration exactly once.
@@ -6602,7 +6790,7 @@ def type_text(settings, is_batch=False, is_last=True):
                         if active_title == locked_window:
                             focus_lost_event.clear()
                 elif pause_event.is_set():
-                    if not state.status.startswith("Activity detected"):
+                    if not _status_is_auto_pause_note():
                         state.status = "Paused"
                 time.sleep(0.2)
             _note_blocked_time(time.time() - block_start)
@@ -7526,6 +7714,8 @@ def validate_settings():
     auto_pause_activity = auto_pause_activity_var.get()
     # Auto-pause alert (Update #54): on or off.
     alert_on_auto_pause = bool(alert_on_auto_pause_var.get())
+    # Auto-pause when the screen locks (Update #63): on or off.
+    auto_pause_screen_lock = bool(auto_pause_screen_lock_var.get())
     try:
         activity_sensitivity = parse_finite_float(activity_sensitivity_var.get())
         if activity_sensitivity < 5 or activity_sensitivity > 500:
@@ -7822,6 +8012,7 @@ def validate_settings():
         "auto_profile_rules": auto_profile_rules,
         "auto_pause_activity": auto_pause_activity,
         "alert_on_auto_pause": alert_on_auto_pause,
+        "auto_pause_screen_lock": auto_pause_screen_lock,
         "activity_sensitivity": activity_sensitivity,
         "enable_fatigue": enable_fatigue,
         "fatigue_strength": fatigue_strength,
@@ -8477,6 +8668,7 @@ def start_typing():
     pause_event.clear()
     focus_lost_event.clear()
     skip_break_event.clear()
+    screen_guard_override_event.clear()
     state.in_research_break = False
 
     btn_start.configure(state=tk.DISABLED)
@@ -8498,6 +8690,14 @@ def start_typing():
             daemon=True,
         )
         watcher_thread.start()
+
+    if settings.get("auto_pause_screen_lock", True) and not settings.get("preview_mode"):
+        screen_watcher_thread = threading.Thread(
+            target=_screen_lock_watcher,
+            args=(settings.get("alert_on_auto_pause", False),),
+            daemon=True,
+        )
+        screen_watcher_thread.start()
 
 
 def open_preview_window():
@@ -9409,6 +9609,7 @@ def toggle_pause():
     if not state.is_running:
         return
     if pause_event.is_set():
+        note_resume_while_screen_blocked()
         pause_event.clear()
         btn_pause.configure(text="Pause Typing")
     else:
@@ -9647,6 +9848,7 @@ def get_current_settings_snapshot():
         "enable_notify": enable_notify_var.get(),
         "enable_sound": enable_sound_var.get(),
         "alert_on_auto_pause": alert_on_auto_pause_var.get(),
+        "auto_pause_screen_lock": auto_pause_screen_lock_var.get(),
         "auto_pause_activity": auto_pause_activity_var.get(),
         "activity_sensitivity": activity_sensitivity_var.get(),
         "enable_fatigue": enable_fatigue_var.get(),
@@ -9755,6 +9957,7 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     enable_notify_var.set(data.get("enable_notify", True))
     enable_sound_var.set(data.get("enable_sound", True))
     alert_on_auto_pause_var.set(bool(data.get("alert_on_auto_pause", False)))
+    auto_pause_screen_lock_var.set(bool(data.get("auto_pause_screen_lock", True)))
     auto_pause_activity_var.set(data.get("auto_pause_activity", False))
     activity_sensitivity_var.set(str(data.get("activity_sensitivity", "20")))
     enable_fatigue_var.set(data.get("enable_fatigue", False))
@@ -10295,6 +10498,7 @@ STARTER_PROFILE_KEEP_KEYS = AUTO_PROFILE_KEEP_KEYS + (
     "alert_on_auto_pause",
     "auto_pause_activity",
     "activity_sensitivity",
+    "auto_pause_screen_lock",
     "start_countdown_seconds",
     "editor_mode",
     "enable_target_time",
@@ -12064,6 +12268,7 @@ starter_profile_choice_var.trace_add("write", refresh_starter_profile_descriptio
 refresh_starter_profile_description()
 auto_pause_activity_var = tk.BooleanVar(value=False)
 activity_sensitivity_var = tk.StringVar(value="20")
+auto_pause_screen_lock_var = tk.BooleanVar(value=True)
 
 min_delay_var = tk.StringVar(value="0.05")
 max_delay_var = tk.StringVar(value="0.15")
@@ -12194,7 +12399,7 @@ SECTION_RESET_VARS = {
     "Editor Type": [editor_mode_var],
     "Start Countdown": [start_countdown_seconds_var],
     "Scheduled Start": [enable_scheduled_start_var, scheduled_start_time_var],
-    "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var],
+    "Activity Auto-Pause": [auto_pause_activity_var, activity_sensitivity_var, auto_pause_screen_lock_var],
     "Typing Speed": [min_delay_var, max_delay_var, pair_delay_min_var, pair_delay_max_var, target_wpm_var],
     "Target Time": [enable_target_time_var, target_hours_var, target_minutes_var],
     "Fatigue Drift": [enable_fatigue_var, fatigue_strength_var],
@@ -12828,6 +13033,18 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.36.0",
+        "date": "2026-11-15",
+        "title": "Auto-pause when the screen locks",
+        "changes": [
+            "Added: an Auto-pause when the screen locks checkbox in the Activity Auto-Pause card on the Window tab, on by default. While a run is typing, it now pauses when Windows locks the screen or the Windows session is switched away (for example with Switch user, or a dropped remote session), so no keys are sent to the lock screen. It works with or without a locked target window.",
+            "Added: the check also runs just before every key goes out, so a screen that locked during a research break or a long session break pauses the run before any typing starts again. The waits themselves are not paused.",
+            "Added: one new setting (auto-pause when the screen locks), saved and restored on launch and saved with profiles. It is part of the Activity Auto-Pause Reset This Section button, and starter profiles never change it. Older settings files load as on.",
+            "Modified: it uses the same pause as the other auto-pauses. The status bar shows Screen locked or Session changed, the run stays paused after unlocking until you press Resume Typing (or the Pause hotkey), and the Beep when typing pauses by itself alert covers it too. A preview run never checks the screen.",
+            "Notes: Windows reports a locked screen by refusing programs access to the input desktop, and a switched-away session by its connect state. Anything that cannot be read counts as fine, and other systems never pause, so this check cannot stop a run by itself. A Windows UAC prompt counts as locked because keys cannot reach it either. If you press Resume while the screen still reads as locked, the check is switched off for the rest of that run. No new packages.",
+        ],
+    },
     {
         "version": "5.35.0",
         "date": "2026-11-13",
@@ -13923,6 +14140,20 @@ modern_label(
     kind="muted",
     wraplength=420,
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+modern_checkbox(
+    frame_activity, "Auto-pause when the screen locks", auto_pause_screen_lock_var
+).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 6))
+
+modern_label(
+    frame_activity,
+    "Pauses typing when Windows locks the screen or the Windows session is switched "
+    "away (for example with Switch user), so no keys go to the lock screen. It works "
+    "with or without a locked target window. After unlocking, press Resume Typing or "
+    "the Pause hotkey to carry on.",
+    kind="muted",
+    wraplength=420,
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
 # --- Typing settings ---
 frame_settings.columnconfigure(0, weight=1)

@@ -28,6 +28,7 @@ import os
 import queue
 import random
 import re
+import sys
 import threading
 import time
 import zipfile
@@ -150,7 +151,7 @@ def load_app_namespace():
     namespace = {
         "__name__": "amanuensis_under_test",
         "re": re, "math": math, "random": random, "time": time, "json": json,
-        "os": os, "difflib": difflib, "hashlib": hashlib, "html": html,
+        "os": os, "sys": sys, "difflib": difflib, "hashlib": hashlib, "html": html,
         "zipfile": zipfile, "zlib": zlib, "threading": threading, "queue": queue,
         "collections": collections, "datetime": datetime, "timedelta": timedelta,
         "tk": FakeTkModule,
