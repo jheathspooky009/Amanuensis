@@ -9,6 +9,42 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.37.0 (2026-11-15) -- High-contrast theme
+#   - Added: A High Contrast theme, a black and yellow look for people who need a
+#     very clear picture. The Theme button in the header now goes Light, then Dark,
+#     then High Contrast, then back to Light. Every word has at least a 7 to 1
+#     contrast against the color behind it, buttons with a colored fill use black
+#     text, boxes and buttons have white outlines, and card outlines are thicker.
+#   - Added: A clearer focus outline. In High Contrast the box being typed in gets a
+#     yellow outline that is also thicker (6 pixels instead of 4), so it never
+#     depends on color alone. The card flash from the settings search uses the focus
+#     color and is thicker than the card's outline.
+#     In Light and Dark the focus outline looks exactly as before.
+#   - Modified: No new setting. The existing theme setting now also accepts
+#     high_contrast, is validated by validate_settings(), and is saved and loaded
+#     like before. It stays on this computer: shared profiles, Auto Profiles, and
+#     starter profiles never carry or change it, and Reset All Settings leaves it
+#     alone. Older settings files load as before, and an unknown value goes back to
+#     Light. Like Light and Dark, a new theme takes effect the next time Amanuensis
+#     launches, and it works with every Text Size.
+#   - Modified: Shared profiles no longer carry the theme. Before this, a saved
+#     profile held the theme, so loading one made on another theme could switch the
+#     look on the next launch. Loading a profile now leaves the theme alone, and an
+#     older profile file that still holds a theme is ignored on load.
+#   - Modified: The Theme button is only wider while High Contrast is chosen, so the
+#     header of Light and Dark is the size it always was. Seven new palette keys
+#     (button_text, focus, hover_bg, tab_selected, tab_selected_hover, combo_button,
+#     combo_button_hover) now supply the colors for text on colored fills, check
+#     marks, selected list rows, the focus outline, hover colors, the open tab, and
+#     the dropdown arrow button. Their Light and Dark values are the colors those
+#     parts always used.
+#   - Notes: CustomTkinter draws its own controls, so full screen reader support is
+#     limited and this update does not promise it. The clearer focus outline covers
+#     the text boxes and number boxes where you type. New plain functions:
+#     normalize_theme(), next_theme(), theme_button_text(), theme_button_width(),
+#     refresh_theme_button(). New automatic tests check the palettes and the theme
+#     setting. No new packages.
+#
 # v5.36.0 (2026-11-15) -- Auto-pause when the screen locks
 #   - Added: An "Auto-pause when the screen locks" checkbox in the Activity
 #     Auto-Pause card on the Window tab, on by default. While a run is typing, it
@@ -59,33 +95,6 @@
 #     The layout is the physical keyboard's letter layout and does not press any
 #     different keys. Not yet tried on real AZERTY, QWERTZ, Dvorak, or Colemak
 #     keyboards. No new packages.
-#
-# v5.34.0 (2026-11-12) -- Simple view and first-run guide
-#   - Added: A Simple view, the default for new installs. It is one page with five
-#     steps: pick the text file, pick the window (with the lock box), pick a
-#     starter profile, set the speed (Target WPM, Apply WPM, Learn My Speed), and
-#     press Start. Everything else is hidden until the person wants it.
-#   - Added: Advanced view, which is the full tabbed layout from before, now with a
-#     Search settings box above the tabs. It searches every card's title and the
-#     text inside it, shows up to 5 matches, and a click opens the tab, scrolls to
-#     the card, and flashes its outline.
-#   - Added: A View button in the header (Advanced View or Simple View) and a
-#     first-run guide, a short welcome window with the five steps. It opens once on
-#     a new install, and a Show Quick Guide button on the Simple page opens it again.
-#   - Added: Two new settings, view_mode and first_run_guide_done, wired into
-#     validate_settings(), the settings dict, and both snapshot functions. They stay
-#     on this computer: shared profiles, Auto Profiles, and starter profiles never
-#     carry or change them, and Reset All Settings leaves them alone.
-#   - Modified: make_tab_area() can hold pages with no tab button (hidden_titles) and
-#     exposes top_bar, search_holder, and body. make_modern_card() records each card
-#     in ALL_CARDS for the search. Nothing else about the tabs changed.
-#   - Notes: No settings file means a new install (Simple view, guide shown). An older
-#     settings file keeps the Advanced layout and counts the guide as seen, so nobody
-#     is surprised. The Simple page reuses the same variables as the Advanced tabs,
-#     so a change in one view shows in the other. New plain functions:
-#     normalize_view_mode(), choose_startup_view(), find_settings_matches(). Not yet
-#     tried on a real screen: open both views, use the search box, and send back
-#     what happens. No new packages.
 #
 # ============================================
 
@@ -3904,6 +3913,59 @@ def clamp_text_size_percent(value):
     if not math.isfinite(number):
         return TEXT_SIZE_DEFAULT
     return min(TEXT_SIZE_CHOICES, key=lambda choice: abs(choice - number))
+
+
+# APP THEME (Update #64): the look of the whole app is one of three themes.
+# Light and Dark are the two original looks. High Contrast is a black and yellow
+# look with white outlines and a thicker, yellow outline on the box being typed
+# in, for people who need a very clear picture. The choice is saved in the same
+# "theme" setting as before and takes effect the next time Amanuensis launches.
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+THEME_HIGH_CONTRAST = "high_contrast"
+THEME_CHOICES = (THEME_LIGHT, THEME_DARK, THEME_HIGH_CONTRAST)
+THEME_LABELS = {
+    THEME_LIGHT: "Light",
+    THEME_DARK: "Dark",
+    THEME_HIGH_CONTRAST: "High Contrast",
+}
+
+
+def normalize_theme(value, fallback=THEME_LIGHT):
+    """Returns 'light', 'dark', or 'high_contrast' for a saved theme choice (any
+    capitals, and spaces or dashes count as an underscore, so 'High Contrast'
+    works). Anything else, including a number or nothing at all, gives the
+    fallback."""
+    if isinstance(value, str):
+        cleaned = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if cleaned in THEME_CHOICES:
+            return cleaned
+    return fallback
+
+
+def next_theme(current):
+    """The theme the header button switches to: Light, then Dark, then High
+    Contrast, then back to Light. An unknown value counts as Light."""
+    position = THEME_CHOICES.index(normalize_theme(current))
+    return THEME_CHOICES[(position + 1) % len(THEME_CHOICES)]
+
+
+def theme_button_text(theme):
+    """The words on the header theme button, like 'Theme: High Contrast'."""
+    return "Theme: " + THEME_LABELS[normalize_theme(theme)]
+
+
+def theme_button_width(theme):
+    """Width of the header theme button. Only the longer High Contrast label needs
+    a wider button, so the header of Light and Dark stays the size it always was."""
+    return 168 if normalize_theme(theme) == THEME_HIGH_CONTRAST else 112
+
+
+def refresh_theme_button(theme):
+    """Puts the header theme button's words and width in line with a theme. Does
+    nothing before the header exists."""
+    if "btn_theme_toggle" in globals():
+        btn_theme_toggle.configure(text=theme_button_text(theme), width=theme_button_width(theme))
 
 
 # SIMPLE VIEW AND FIRST-RUN GUIDE (Update #61): new installs open in Simple view,
@@ -7959,9 +8021,7 @@ def validate_settings():
         skipped_update_version = ""
         skipped_update_version_var.set("")
 
-    theme = theme_var.get().strip().lower()
-    if theme not in ("light", "dark"):
-        theme = "light"
+    theme = normalize_theme(theme_var.get())
 
     # Check typed text (Update #51): on or off.
     check_typed_text = bool(check_typed_text_var.get())
@@ -10004,14 +10064,17 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     leave_mistakes_punctuation_var.set(data.get("leave_mistakes_punctuation", True))
     enable_update_check_var.set(bool(data.get("enable_update_check", True)))
     skipped_update_version_var.set(str(data.get("skipped_update_version", "")))
-    saved_theme = data.get("theme", "light")
-    if isinstance(saved_theme, str) and saved_theme in ("light", "dark"):
-        theme_var.set(saved_theme)
-        if "btn_theme_toggle" in globals():
-            btn_theme_toggle.configure(text=f"Theme: {saved_theme.capitalize()}")
     if include_files and "file_queue" in data and isinstance(data["file_queue"], (list, tuple)):
         file_queue_var.set(list(data["file_queue"]))
     if include_files:
+        # The theme belongs to this computer, so shared profiles never carry it
+        # and loading one never changes it (Update #64). Without this, a profile
+        # saved on a Dark theme could switch a High Contrast user back to Dark.
+        # A missing or unknown value leaves the theme as it is.
+        saved_theme = normalize_theme(data.get("theme"), fallback=None)
+        if saved_theme is not None:
+            theme_var.set(saved_theme)
+            refresh_theme_button(saved_theme)
         # The text size belongs to this computer, so shared profiles never carry
         # it (Update #48). Older files load as 100%.
         text_size_percent_var.set(
@@ -10061,6 +10124,7 @@ PROFILE_LOCAL_ONLY_KEYS = (
     "view_mode",
     "first_run_guide_done",
     "keyboard_layout",
+    "theme",
 )
 
 
@@ -11840,12 +11904,12 @@ def jump_to_settings_card(entry):
 
     def restore():
         try:
-            card.configure(border_color=PALETTE["border"], border_width=1)
+            card.configure(border_color=PALETTE["border"], border_width=CARD_BORDER_WIDTH)
         except tk.TclError:
             pass
 
     try:
-        card.configure(border_color=PALETTE["accent"], border_width=3)
+        card.configure(border_color=PALETTE["focus"], border_width=CARD_FLASH_WIDTH)
         window.after(1600, restore)
     except tk.TclError:
         pass
@@ -11892,18 +11956,17 @@ def on_text_size_chosen(_choice=None):
 
 
 def toggle_theme():
-    """Toggle the theme preference between 'light' and 'dark', immediately
-    persisting it to last_settings.json. Informs the user that the theme
-    change will take effect the next time Amanuensis launches."""
-    current = theme_var.get()
-    new_theme = "dark" if current == "light" else "light"
+    """Move the theme preference to the next one (Light, Dark, High Contrast,
+    then Light again), immediately persisting it to last_settings.json. Informs
+    the user that the theme change will take effect the next time Amanuensis
+    launches."""
+    new_theme = next_theme(theme_var.get())
     theme_var.set(new_theme)
-    if "btn_theme_toggle" in globals():
-        btn_theme_toggle.configure(text=f"Theme: {new_theme.capitalize()}")
+    refresh_theme_button(new_theme)
     save_last_settings()
     messagebox.showinfo(
         "Theme Changed",
-        f"Theme set to {new_theme.capitalize()}.\n\nThis will take effect the next time you launch Amanuensis.",
+        f"Theme set to {THEME_LABELS[new_theme]}.\n\nThis will take effect the next time you launch Amanuensis.",
     )
 
 
@@ -11981,16 +12044,14 @@ def update_gui():
 # Startup theme check: read directly from last_settings.json before GUI build.
 # We do not attempt live re-theming of instantiated widgets; theme applies
 # on launch.
-startup_theme = "light"
+startup_theme = THEME_LIGHT
 try:
     if os.path.exists(LAST_SETTINGS_PATH):
         with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as _f:
             _data = json.load(_f)
-            _theme_val = str(_data.get("theme", "light")).strip().lower()
-            if _theme_val in ("light", "dark"):
-                startup_theme = _theme_val
+            startup_theme = normalize_theme(_data.get("theme", THEME_LIGHT))
 except Exception:
-    startup_theme = "light"
+    startup_theme = THEME_LIGHT
 
 # Startup text size check (Update #48): read straight from last_settings.json
 # before any widget is built, just like the theme above. CustomTkinter scales
@@ -12042,6 +12103,15 @@ LIGHT_PALETTE = {
     "header_border": "#3a4658",
     "header_muted": "#9aa7b8",
     "header_text": "#eef1f5",
+    # Added for the High Contrast theme (Update #64). Here they hold the values
+    # the app always used, so Light looks exactly as before.
+    "button_text": "#ffffff",       # words and check marks on colored fills
+    "focus": "#1f6f5c",              # outline of the box being typed in
+    "hover_bg": "#eef1f5",           # a neutral button or list row under the mouse
+    "tab_selected": "#1f6f5c",       # the open tab
+    "tab_selected_hover": "#154d40",
+    "combo_button": "#1f6f5c",       # the arrow button of a dropdown (its arrow is drawn in the text color)
+    "combo_button_hover": "#154d40",
 }
 
 DARK_PALETTE = {
@@ -12064,9 +12134,55 @@ DARK_PALETTE = {
     "header_border": "#2a3140",
     "header_muted": "#9aa7b8",
     "header_text": "#f0f3f6",
+    "button_text": "#ffffff",
+    "focus": "#23866b",
+    "hover_bg": "#181b22",
+    "tab_selected": "#23866b",
+    "tab_selected_hover": "#3ec4a0",
+    "combo_button": "#23866b",
+    "combo_button_hover": "#3ec4a0",
 }
 
-PALETTE = DARK_PALETTE if startup_theme == "dark" else LIGHT_PALETTE
+# High Contrast (Update #64): black and yellow. Every word is at least 7 to 1
+# against the color behind it (the WCAG AAA level), and the outlines are 3 to 1 or
+# better. Text on a colored fill is black, so button_text is black here.
+HIGH_CONTRAST_PALETTE = {
+    "bg": "#000000",
+    "panel_bg": "#000000",
+    "input_bg": "#000000",
+    "border": "#a6a6a6",
+    "border_strong": "#ffffff",
+    "text": "#ffffff",
+    "muted": "#d9d9d9",
+    "accent": "#ffe600",
+    "accent_dark": "#fff59d",
+    "amber": "#ffb000",
+    "amber_hover": "#ffd666",
+    "disabled_bg": "#3d3d3d",
+    "brick": "#ff7a7a",
+    "brick_hover": "#ffadad",
+    "header_bg": "#000000",
+    "header_hover": "#2b2b2b",
+    "header_border": "#ffe600",
+    "header_muted": "#ffe600",
+    "header_text": "#ffffff",
+    "button_text": "#000000",
+    "focus": "#ffe600",
+    "hover_bg": "#333333",
+    "tab_selected": "#5c4a00",
+    "tab_selected_hover": "#7a6200",
+    "combo_button": "#3d3d3d",
+    "combo_button_hover": "#5c4a00",
+}
+
+THEME_PALETTES = {
+    THEME_LIGHT: LIGHT_PALETTE,
+    THEME_DARK: DARK_PALETTE,
+    THEME_HIGH_CONTRAST: HIGH_CONTRAST_PALETTE,
+}
+
+PALETTE = THEME_PALETTES[startup_theme]
+HIGH_CONTRAST = startup_theme == THEME_HIGH_CONTRAST
 
 
 def scaled_font_size(points):
@@ -12127,7 +12243,7 @@ style.configure("Warning.TLabel", background=PALETTE["panel_bg"], foreground=PAL
 style.configure(
     "Danger.TButton",
     background=PALETTE["brick"],
-    foreground="#ffffff",
+    foreground=PALETTE["button_text"],
     bordercolor=PALETTE["brick"],
     lightcolor=PALETTE["brick"],
     darkcolor=PALETTE["brick"],
@@ -12137,7 +12253,7 @@ style.configure(
 style.map(
     "Danger.TButton",
     background=[("active", PALETTE["brick_hover"])],
-    foreground=[("active", "#ffffff")],
+    foreground=[("active", PALETTE["button_text"])],
 )
 
 style.configure("TCheckbutton", background=PALETTE["panel_bg"], foreground=PALETTE["text"], font=FONT_BODY)
@@ -12158,9 +12274,9 @@ style.configure(
 style.map(
     "TEntry",
     foreground=[("disabled", PALETTE["muted"])],
-    bordercolor=[("focus", PALETTE["accent"])],
-    lightcolor=[("focus", PALETTE["accent"])],
-    darkcolor=[("focus", PALETTE["accent"])],
+    bordercolor=[("focus", PALETTE["focus"])],
+    lightcolor=[("focus", PALETTE["focus"])],
+    darkcolor=[("focus", PALETTE["focus"])],
 )
 style.configure(
     "TCombobox",
@@ -12180,21 +12296,21 @@ style.map(
     foreground=[("readonly", PALETTE["text"])],
     fieldbackground=[("readonly", PALETTE["input_bg"])],
     background=[("readonly", PALETTE["input_bg"])],
-    bordercolor=[("focus", PALETTE["accent"])],
-    lightcolor=[("focus", PALETTE["accent"])],
-    darkcolor=[("focus", PALETTE["accent"])],
+    bordercolor=[("focus", PALETTE["focus"])],
+    lightcolor=[("focus", PALETTE["focus"])],
+    darkcolor=[("focus", PALETTE["focus"])],
     arrowcolor=[("disabled", PALETTE["muted"])],
 )
 
 style.configure("TButton", font=FONT_BODY, padding=6)
 
-style.configure("Accent.TButton", background=PALETTE["accent"], foreground="white", font=FONT_STATUS, padding=10)
+style.configure("Accent.TButton", background=PALETTE["accent"], foreground=PALETTE["button_text"], font=FONT_STATUS, padding=10)
 style.map("Accent.TButton", background=[("active", PALETTE["accent_dark"]), ("disabled", "#a9c4bd")])
 
-style.configure("Amber.TButton", background=PALETTE["amber"], foreground="white", font=FONT_STATUS, padding=10)
+style.configure("Amber.TButton", background=PALETTE["amber"], foreground=PALETTE["button_text"], font=FONT_STATUS, padding=10)
 style.map("Amber.TButton", background=[("active", "#8a5c17"), ("disabled", "#dcc59c")])
 
-style.configure("Brick.TButton", background=PALETTE["brick"], foreground="white", font=FONT_STATUS, padding=10)
+style.configure("Brick.TButton", background=PALETTE["brick"], foreground=PALETTE["button_text"], font=FONT_STATUS, padding=10)
 style.map("Brick.TButton", background=[("active", "#7e2e2e"), ("disabled", "#e0b8b8")])
 
 style.configure(
@@ -12491,6 +12607,24 @@ BORDER_WIDTH = 4       # outline thickness of entry boxes, text boxes, dropdowns
 CHECKBOX_BORDER = 3    # outline thickness of checkboxes
 CORNER_RADIUS = 10     # roundness of buttons, entries, and other controls
 
+# High Contrast outlines (Update #64). Card outlines are thicker, and the box
+# being typed in gets a thicker outline on top of the yellow color, so the focus
+# never depends on color alone. The other themes keep the sizes they always had.
+CARD_BORDER_WIDTH = 2 if HIGH_CONTRAST else 1
+CARD_FLASH_WIDTH = CARD_BORDER_WIDTH + 2    # a card found by the settings search
+FOCUS_BORDER_WIDTH = BORDER_WIDTH + 2 if HIGH_CONTRAST else BORDER_WIDTH
+
+
+def show_focus_outline(widget):
+    """Marks a box as the one being typed in: the focus color, and in High
+    Contrast a thicker outline too."""
+    widget.configure(border_color=PALETTE["focus"], border_width=FOCUS_BORDER_WIDTH)
+
+
+def hide_focus_outline(widget):
+    """Puts a box's outline back to the normal look when it loses focus."""
+    widget.configure(border_color=PALETTE["border_strong"], border_width=BORDER_WIDTH)
+
 
 def modern_font(bold=False, size=13):
     """Font used by the CustomTkinter widgets."""
@@ -12543,7 +12677,7 @@ def modern_button(parent, text, command, kind="primary", state="normal"):
         return ModernButton(
             parent,
             fg_color=PALETTE["panel_bg"],
-            hover_color=PALETTE["bg"],
+            hover_color=PALETTE["hover_bg"],
             border_width=2,
             border_color=PALETTE["border_strong"],
             text_color=PALETTE["text"],
@@ -12554,7 +12688,7 @@ def modern_button(parent, text, command, kind="primary", state="normal"):
         parent,
         fg_color=PALETTE[fg_key],
         hover_color=PALETTE[hover_key],
-        text_color="#ffffff",
+        text_color=PALETTE["button_text"],
         **common,
     )
 
@@ -12606,7 +12740,7 @@ def make_modern_card(parent, title):
     outer = ctk.CTkFrame(
         parent,
         corner_radius=16,
-        border_width=1,
+        border_width=CARD_BORDER_WIDTH,
         fg_color=PALETTE["panel_bg"],
         border_color=PALETTE["border"],
         bg_color=PALETTE["bg"],
@@ -12641,8 +12775,8 @@ def modern_entry(parent, var, width=10):
         text_color=PALETTE["text"],
         font=modern_font(),
     )
-    entry.bind("<FocusIn>", lambda _event: entry.configure(border_color=PALETTE["accent"]))
-    entry.bind("<FocusOut>", lambda _event: entry.configure(border_color=PALETTE["border_strong"]))
+    entry.bind("<FocusIn>", lambda _event: show_focus_outline(entry))
+    entry.bind("<FocusOut>", lambda _event: hide_focus_outline(entry))
     return entry
 
 
@@ -12660,7 +12794,7 @@ def modern_checkbox(parent, text, variable):
         hover_color=PALETTE["accent_dark"],
         border_color=PALETTE["border_strong"],
         text_color=PALETTE["text"],
-        checkmark_color="#ffffff",
+        checkmark_color=PALETTE["button_text"],
         font=modern_font(),
     )
 
@@ -12700,8 +12834,8 @@ def modern_textbox(parent, height=120):
         scrollbar_button_color=PALETTE["border_strong"],
         scrollbar_button_hover_color=PALETTE["accent"],
     )
-    box.bind("<FocusIn>", lambda _event: box.configure(border_color=PALETTE["accent"]))
-    box.bind("<FocusOut>", lambda _event: box.configure(border_color=PALETTE["border_strong"]))
+    box.bind("<FocusIn>", lambda _event: show_focus_outline(box))
+    box.bind("<FocusOut>", lambda _event: hide_focus_outline(box))
     return box
 
 
@@ -12718,12 +12852,12 @@ def modern_combobox(parent, var, width=30):
         border_width=BORDER_WIDTH,
         fg_color=PALETTE["input_bg"],
         border_color=PALETTE["border_strong"],
-        button_color=PALETTE["accent"],
-        button_hover_color=PALETTE["accent_dark"],
+        button_color=PALETTE["combo_button"],
+        button_hover_color=PALETTE["combo_button_hover"],
         text_color=PALETTE["text"],
         dropdown_fg_color=PALETTE["panel_bg"],
         dropdown_text_color=PALETTE["text"],
-        dropdown_hover_color=PALETTE["bg"],
+        dropdown_hover_color=PALETTE["hover_bg"],
         font=modern_font(),
         dropdown_font=modern_font(),
     )
@@ -12806,8 +12940,8 @@ def make_tab_area(parent, titles, hidden_titles=()):
         fg_color=PALETTE["header_bg"],
         unselected_color=PALETTE["header_bg"],
         unselected_hover_color=PALETTE["header_hover"],
-        selected_color=PALETTE["accent"],
-        selected_hover_color=PALETTE["accent_dark"],
+        selected_color=PALETTE["tab_selected"],
+        selected_hover_color=PALETTE["tab_selected_hover"],
         text_color=PALETTE["header_text"],
         font=modern_font(bold=True),
     )
@@ -12846,7 +12980,7 @@ def show_modern_dialog(title, message, buttons, kind="info", parent=None, cancel
     card = ctk.CTkFrame(
         dialog,
         corner_radius=16,
-        border_width=1,
+        border_width=CARD_BORDER_WIDTH,
         fg_color=PALETTE["panel_bg"],
         border_color=PALETTE["border"],
         bg_color=PALETTE["bg"],
@@ -12862,7 +12996,7 @@ def show_modern_dialog(title, message, buttons, kind="info", parent=None, cancel
         icon,
         text=icon_symbols[kind],
         fg_color="transparent",
-        text_color="#ffffff",
+        text_color=PALETTE["button_text"],
         font=modern_font(bold=True, size=20),
     ).place(relx=0.5, rely=0.5, anchor="center")
     modern_label(card, title, kind="stat").grid(row=0, column=1, padx=(0, 18), pady=(18, 2), sticky="w")
@@ -12966,7 +13100,8 @@ btn_view_toggle = make_header_button("Advanced View", toggle_view_mode)
 btn_view_toggle.configure(width=136)
 btn_view_toggle.pack(side="right", padx=(0, 4), pady=12)
 
-btn_theme_toggle = make_header_button(f"Theme: {theme_var.get().capitalize()}", toggle_theme)
+btn_theme_toggle = make_header_button(theme_button_text(theme_var.get()), toggle_theme)
+btn_theme_toggle.configure(width=theme_button_width(theme_var.get()))
 btn_theme_toggle.pack(side="right", padx=(0, 4), pady=12)
 
 # --------------------------------------------
@@ -13033,6 +13168,18 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.37.0",
+        "date": "2026-11-15",
+        "title": "High-contrast theme",
+        "changes": [
+            "Added: a High Contrast theme, a black and yellow look for people who need a very clear picture. The Theme button in the top bar now goes Light, then Dark, then High Contrast, then back to Light. Every word has at least a 7 to 1 contrast against the color behind it, buttons with a colored fill use black text, boxes and buttons have white outlines, and card outlines are thicker.",
+            "Added: a clearer focus outline. In High Contrast the box you are typing in gets a yellow outline that is also thicker, so it never depends on color alone. Light and Dark look exactly as before.",
+            "Modified: no new setting. The theme choice is saved like before, takes effect the next time you launch Amanuensis, and works with every Text Size. It stays on this computer: Reset All Settings, Auto Profiles, and starter profiles leave it alone.",
+            "Modified: shared profiles no longer carry the theme, so loading a profile can never switch your theme. An older profile file that still holds a theme is ignored when it is loaded.",
+            "Notes: CustomTkinter draws its own controls, so full screen reader support is limited and this update does not promise it. The clearer focus outline covers the text boxes and number boxes where you type. No new packages.",
+        ],
+    },
     {
         "version": "5.36.0",
         "date": "2026-11-15",
@@ -13858,7 +14005,7 @@ file_queue_listbox = tk.Listbox(
     bg=PALETTE["input_bg"],
     fg=PALETTE["text"],
     selectbackground=PALETTE["accent"],
-    selectforeground="#ffffff",
+    selectforeground=PALETTE["button_text"],
     relief="flat",
     bd=0,
     highlightthickness=0,
@@ -13994,7 +14141,7 @@ auto_profile_listbox = tk.Listbox(
     bg=PALETTE["input_bg"],
     fg=PALETTE["text"],
     selectbackground=PALETTE["accent"],
-    selectforeground="#ffffff",
+    selectforeground=PALETTE["button_text"],
     relief="flat",
     bd=0,
     highlightthickness=0,
