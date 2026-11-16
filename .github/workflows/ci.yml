@@ -37,7 +37,7 @@ jobs:
         run: uv sync --locked --group dev
 
       - name: Syntax check (py_compile)
-        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py tests/app_loader.py tests/test_protected_text.py tests/test_format_markers.py tests/test_smart_fixes.py tests/test_settings.py tests/test_typed_text_check.py tests/test_speed_and_loading.py
+        run: uv run python -m py_compile Amanuensis.py scripts/security_check.py scripts/release_notes.py tests/app_loader.py tests/test_protected_text.py tests/test_format_markers.py tests/test_smart_fixes.py tests/test_settings.py tests/test_typed_text_check.py tests/test_speed_and_loading.py tests/test_release_notes.py
 
       - name: Lint check (pyflakes)
         run: uv run pyflakes Amanuensis.py scripts/security_check.py scripts/release_notes.py tests

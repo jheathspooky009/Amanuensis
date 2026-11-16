@@ -9,6 +9,25 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.37.1 (2026-11-16) -- Release notes list every update since the last release
+#   - Modified: The release notes script (scripts/release_notes.py) has a new
+#     --since option, the tag of the previous release. It lists every update newer
+#     than that version, up to and including the new one, each under its own
+#     version heading. Without --since, only the newest update is listed, as before.
+#   - Modified: The Release workflow finds the previous release tag by itself and
+#     passes it to the script, so a release that holds several updates lists all
+#     of them. The checkout now fetches the full history so the tags are there. A
+#     first release with no earlier tag lists the newest update only.
+#   - Modified: Every VERSION_HISTORY entry is now checked, not only the newest: it
+#     needs a version, a title, and change lines, the list must be newest first,
+#     and no line may say that something has not been tried yet or ask for
+#     something to be sent back. Two older entries (5.34.0 and 5.35.0) had such
+#     sentences, so those sentences were removed.
+#   - Notes: If the combined notes would pass about 100,000 characters (GitHub's
+#     limit is 125,000), the oldest updates are left out and a line says so. New
+#     tests in tests/test_release_notes.py. Nothing in the app itself changes. No
+#     new settings and no new packages.
+#
 # v5.37.0 (2026-11-15) -- High-contrast theme
 #   - Added: A High Contrast theme, a black and yellow look for people who need a
 #     very clear picture. The Theme button in the header now goes Light, then Dark,
@@ -71,30 +90,6 @@
 #     run by itself. A Windows UAC prompt counts as locked because keys cannot
 #     reach it either. If Resume is pressed while the screen still reads as
 #     locked, the check is switched off for the rest of that run. No new packages.
-#
-# v5.35.0 (2026-11-13) -- Keyboard layouts
-#   - Added: A Keyboard Layout card on the Window tab with a list of QWERTY (the
-#     default, which types exactly as before), AZERTY, QWERTZ, Dvorak, and
-#     Colemak. The layout decides which keys count as next-door keys for typos and
-#     which finger types each letter. The typed text never changes.
-#   - Added: One new setting, keyboard_layout, wired into validate_settings(), the
-#     settings dict, and both snapshot functions. It stays on this computer: shared
-#     profiles, Auto Profiles, and starter profiles never carry or change it, and
-#     Reset All Settings leaves it alone. Older settings files load as QWERTY, and
-#     a value that is not a known layout goes back to QWERTY.
-#   - Modified: Next-door-key typos, the wrong-letter mistake left for the person
-#     to fix, the typo sorting in Learn My Speed, Finger & Hand Timing, the time
-#     estimate, and the Key Press Timing overlap now read the chosen layout through
-#     get_adjacent_letters() and get_finger_for_letter(). QWERTY keeps its original
-#     hand-made tables, so nothing changes for it. The other layouts are built from
-#     three rows of ten keys, using the same column-to-finger map and the same
-#     neighbor stagger as QWERTY.
-#   - Notes: Only the 26 letters are mapped, so punctuation keys are never neighbors
-#     of a letter (the same as QWERTY before). Common letter pair speed (th, he,
-#     in...), Smart Text Fixes, synonyms, and decision words are still English only.
-#     The layout is the physical keyboard's letter layout and does not press any
-#     different keys. Not yet tried on real AZERTY, QWERTZ, Dvorak, or Colemak
-#     keyboards. No new packages.
 #
 # ============================================
 
@@ -13169,6 +13164,17 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
     {
+        "version": "5.37.1",
+        "date": "2026-11-16",
+        "title": "Release notes list every update since the last release",
+        "changes": [
+            "Modified: the release notes script has a new option for the previous release's tag. It lists every update newer than that version, up to and including the new one, each under its own version heading. Without it, only the newest update is listed, as before.",
+            "Modified: the release workflow finds the previous release tag by itself, so a release that holds several updates lists all of them. A first release with no earlier tag lists the newest update only.",
+            "Modified: every entry in the version history is now checked, not only the newest. Each needs a version, a title, and change lines, the list must be newest first, and no line may say something has not been tried yet or ask for something to be sent back. Two older entries had such sentences, so those sentences were removed.",
+            "Notes: if the combined notes would pass about 100,000 characters (GitHub's limit is 125,000), the oldest updates are left out and a line says so. Nothing in the app itself changes. No new settings and no new packages.",
+        ],
+    },
+    {
         "version": "5.37.0",
         "date": "2026-11-15",
         "title": "High-contrast theme",
@@ -13200,7 +13206,7 @@ VERSION_HISTORY = [
             "Added: a Keyboard Layout card on the Window tab with a list: QWERTY (the default, which types exactly as before), AZERTY, QWERTZ, Dvorak, and Colemak. The layout decides which keys count as next-door keys when a typo happens, and which finger types each letter. The typed text never changes.",
             "Added: one new setting (keyboard layout), saved and restored on launch and kept on this computer only: shared profiles, Auto Profiles, and starter profiles never carry or change it, and Reset All Settings leaves it alone. Older settings files load as QWERTY.",
             "Modified: next-door-key typos, the wrong letters left for you to fix, the typo kinds Learn My Speed finds, Finger & Hand Timing, the time estimate, and the Key Press Timing overlap all follow the chosen layout.",
-            "Notes: only the 26 letters are mapped, so punctuation keys are never next-door keys of a letter. Common letter pair speed, Smart Text Fixes, synonyms, and decision words are still English only. Not yet tried on real AZERTY, QWERTZ, Dvorak, or Colemak keyboards. No new packages.",
+            "Notes: only the 26 letters are mapped, so punctuation keys are never next-door keys of a letter. Common letter pair speed, Smart Text Fixes, synonyms, and decision words are still English only. No new packages.",
         ],
     },
     {
@@ -13212,7 +13218,7 @@ VERSION_HISTORY = [
             "Added: Advanced view is the full tabbed layout you already know, now with a Search settings box above the tabs. Type a word like pause or typo, and a click on a match opens its tab, scrolls to the card, and flashes its outline.",
             "Added: a View button in the top bar to switch between Simple and Advanced any time, and a short first-run guide that opens once on a new install. Show Quick Guide on the Simple page opens it again.",
             "Added: two new settings (view and first-run guide seen), saved and restored on launch and kept on this computer only: shared profiles, Auto Profiles, and starter profiles never carry or change them, and Reset All Settings leaves them alone.",
-            "Notes: older settings files open in Advanced view with the guide counted as seen, so nobody's layout changes. Both views share the same settings, so a change in one shows in the other. Not yet tried on a real screen, so open both views and the search box and send back what happens. No new packages.",
+            "Notes: older settings files open in Advanced view with the guide counted as seen, so nobody's layout changes. Both views share the same settings, so a change in one shows in the other. No new packages.",
         ],
     },
     {
