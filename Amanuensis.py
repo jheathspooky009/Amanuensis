@@ -9,6 +9,44 @@
 #
 # VERSION HISTORY (most recent first)
 # ------------------------------------------------------------
+# v5.38.0 (2026-11-19) -- Key and wait markers
+#   - Added: Key markers. Write [[key:Tab]], [[key:Enter]], [[key:Shift+Tab]],
+#     [[key:Escape]], an arrow key ([[key:Up]], [[key:Down]], [[key:Left]],
+#     [[key:Right]]), [[key:Home]], [[key:End]], [[key:PageUp]], or
+#     [[key:PageDown]] in a file and Amanuensis presses that key at that exact spot,
+#     so one file can fill in several form fields. Capitals and spaces do not
+#     matter, and a few spellings (Esc, Return) work too. The marker is never typed.
+#   - Added: A [[wait]] marker. Typing stops with the normal pause until you press
+#     Resume Typing (or the Pause hotkey), so you can log in or click a field in
+#     the middle of a file. Moving the mouse during a wait does not trigger the
+#     activity auto-pause. The status bar reads "Waiting for you", the "Beep when
+#     typing pauses by itself" alert covers it, the wait is left out of the typing
+#     speed, and the locked window must be in front before typing goes on.
+#   - Added: A Key & Wait Markers card on the Speed tab with one new setting,
+#     enable_action_markers (on by default), wired into validate_settings(), the
+#     settings dict, and both snapshot functions. It stays on this computer:
+#     shared profiles, Auto Profiles, and starter profiles never carry or change
+#     it. Turned off, the markers are still removed but nothing is pressed. The card
+#     has a Reset This Section button. Older settings files load as on.
+#   - Modified: Typos, reworks, and the other planned edits never move, skip, or
+#     reach across a marker. Typo lookahead stops at a marker, and swapped-letter
+#     and missed-space typos are skipped next to one. The second revision pass,
+#     select and retype, left mistakes, paraphrase drafts, and key overlap all
+#     avoid a marker spot, the rework buffer is cleared at a marker, and Smart Text
+#     Fixes never change text next to one.
+#   - Modified: A preview run presses no keys and never waits. The time estimate
+#     counts key markers and lists the waits separately (their time is unknown). A
+#     real run that pressed keys cannot use Check Typed Text, because Enter and Tab
+#     change what is on screen, and the report says so. A start warning lists any
+#     [[key:...]] marker with a name that is not known, which is typed as text.
+#   - Notes: [[wait]] and [[key:...]] are reserved spellings, so protected text
+#     cannot be exactly those. When resuming, markers at the exact spot where typing
+#     stopped run again, so click where typing should continue. New plain
+#     functions: strip_action_markers(), normalize_action_key_name(),
+#     count_action_markers(), make_planning_format_map(). parse_input_markers()
+#     now returns an action_map as a seventh value. 32 new automatic tests. No new
+#     packages.
+#
 # v5.37.1 (2026-11-16) -- Release notes list every update since the last release
 #   - Modified: The release notes script (scripts/release_notes.py) has a new
 #     --since option, the tag of the previous release. It lists every update newer
@@ -63,33 +101,6 @@
 #     normalize_theme(), next_theme(), theme_button_text(), theme_button_width(),
 #     refresh_theme_button(). New automatic tests check the palettes and the theme
 #     setting. No new packages.
-#
-# v5.36.0 (2026-11-15) -- Auto-pause when the screen locks
-#   - Added: An "Auto-pause when the screen locks" checkbox in the Activity
-#     Auto-Pause card on the Window tab, on by default. While a run is typing, it
-#     now pauses when Windows locks the screen or the Windows session is switched
-#     away (fast user switching, a dropped remote session), so no keys are sent
-#     to the lock screen. It works with or without a locked target window.
-#   - Added: The check also runs just before every key goes out, so a screen that
-#     locked during a research break or a long session break pauses the run
-#     before any typing starts again. The waits themselves are not paused.
-#   - Added: One new setting, auto_pause_screen_lock, wired into validate_settings(),
-#     the settings dict, and both snapshot functions. It is saved with profiles, is
-#     part of the Activity Auto-Pause Reset This Section button, and starter
-#     profiles never change it. Older settings files load as on.
-#   - Modified: The pause uses the same pause as the other auto-pauses. The status
-#     bar shows "Screen locked" or "Session changed", the run stays paused after
-#     unlocking until Resume Typing (or the Pause hotkey) is pressed, and the
-#     "Beep when typing pauses by itself" alert also covers it. Preview runs never
-#     check the screen.
-#   - Notes: Windows reports a locked screen by refusing programs access to the
-#     input desktop, and a switched-away session by its connect state, so a new
-#     plain function, read_screen_state(), asks Windows with ctypes from the
-#     standard library, and classify_screen_state() decides. An unreadable answer
-#     counts as fine and other systems never pause, so this check cannot stop a
-#     run by itself. A Windows UAC prompt counts as locked because keys cannot
-#     reach it either. If Resume is pressed while the screen still reads as
-#     locked, the check is switched off for the rest of that run. No new packages.
 #
 # ============================================
 
@@ -646,16 +657,157 @@ def strip_format_markers(raw_text):
     return "".join(kept_parts), normalize_format_map(format_positions), removed_spans, problems
 
 
+# --------------------------------------------
+# KEY AND WAIT MARKERS: [[key:Tab]] and [[wait]] (Update #65)
+# --------------------------------------------
+# A text file can only hold text, so moving between form fields used to be done
+# by hand. [[key:Tab]] presses that key at that exact spot, and [[wait]] stops
+# the run until the person presses Resume, so they can log in or click a field
+# in the middle of a file. The markers are never typed.
+#
+# Known keys (any capitals, spaces are ignored): Tab, Shift+Tab, Enter, Escape
+# (or Esc), Up, Down, Left, Right, Home, End, PageUp, PageDown. A marker with
+# any other name is NOT removed: it is typed as normal text, and a warning is
+# shown before typing starts (the same way a bad pause marker works).
+#
+# These are removed after the pause and formatting markers and BEFORE
+# [[protected markers]] are read, because [[wait]] would otherwise look like
+# protected text. That makes [[wait]] and [[key:...]] reserved spellings. Each
+# marker is stored as a position in the FINAL clean text, meaning "do this
+# before typing the character at this index", exactly like pauses, so it stays
+# in step with resume checkpoints. Several markers at one spot run in the
+# order they were written.
+#
+# Typos, reworks, and the other planned edits never move, skip, or reach back
+# across one of these markers (see the action_walls and planning_format_map
+# handling in type_text()). A preview run presses no keys and never waits.
+ACTION_KEY = "key"
+ACTION_WAIT = "wait"
+ACTION_KEY_SPECS = {
+    # canonical name: (name shown to the person, keys to press together)
+    "tab": ("Tab", ("tab",)),
+    "shift+tab": ("Shift+Tab", ("shift", "tab")),
+    "enter": ("Enter", ("enter",)),
+    "escape": ("Escape", ("esc",)),
+    "up": ("Up", ("up",)),
+    "down": ("Down", ("down",)),
+    "left": ("Left", ("left",)),
+    "right": ("Right", ("right",)),
+    "home": ("Home", ("home",)),
+    "end": ("End", ("end",)),
+    "pageup": ("Page Up", ("pageup",)),
+    "pagedown": ("Page Down", ("pagedown",)),
+}
+ACTION_KEY_ALIASES = {
+    "esc": "escape",
+    "return": "enter",
+    "pgup": "pageup",
+    "pgdn": "pagedown",
+}
+ACTION_MARKER_PATTERN = re.compile(
+    r"\[\[\s*(?:key\s*:\s*([^\[\]\r\n]{1,30}?)|(wait))\s*\]\]", re.IGNORECASE
+)
+ACTION_KEY_REACH_SECONDS = (0.15, 0.35)  # reaching for the key
+ACTION_KEY_SETTLE_SECONDS = (0.08, 0.2)  # a moment after the press
+ACTION_KEY_ESTIMATE_SECONDS = 0.4  # average time of one key marker
+ACTION_WAIT_STATUS_PREFIX = "Waiting for you"
+ACTION_WAIT_STATUS_TEXT = ACTION_WAIT_STATUS_PREFIX + " \u2014 press Resume Typing to continue"
+
+
+def normalize_action_key_name(name):
+    """Returns the canonical key name for the text inside a [[key:...]] marker
+    (capitals and spaces ignored, a few common spellings accepted), or None when
+    it is not one of the known keys."""
+    cleaned = re.sub(r"\s+", "", str(name)).lower()
+    cleaned = ACTION_KEY_ALIASES.get(cleaned, cleaned)
+    return cleaned if cleaned in ACTION_KEY_SPECS else None
+
+
+def strip_action_markers(raw_text):
+    """Removes valid [[key:Name]] and [[wait]] markers from raw_text.
+
+    Returns (stripped_text, action_positions, removed_spans, problems):
+    - stripped_text: raw_text with every valid marker removed.
+    - action_positions: {index into stripped_text: [(ACTION_KEY, key name) or
+      (ACTION_WAIT, ""), ...]} in the order written. An index equal to
+      len(stripped_text) is after the last character.
+    - removed_spans: (start, end) of each removed marker in raw_text, so other
+      positions can be shifted with shift_position_through_removals().
+    - problems: plain-English notes about markers with an unknown key name.
+      Those are left in the text untouched, so they are typed as normal text."""
+    kept_parts = []
+    action_positions = {}
+    removed_spans = []
+    problems = []
+    last_end = 0
+    stripped_length = 0
+
+    for match in ACTION_MARKER_PATTERN.finditer(raw_text):
+        if match.group(2):
+            action = (ACTION_WAIT, "")
+        else:
+            key_name = normalize_action_key_name(match.group(1))
+            if key_name is None:
+                problems.append(f"{match.group(0)}  (not a known key, will be typed as normal text)")
+                continue
+            action = (ACTION_KEY, key_name)
+
+        before = raw_text[last_end:match.start()]
+        kept_parts.append(before)
+        stripped_length += len(before)
+        removed_spans.append((match.start(), match.end()))
+        action_positions.setdefault(stripped_length, []).append(action)
+        last_end = match.end()
+
+    kept_parts.append(raw_text[last_end:])
+    return "".join(kept_parts), action_positions, removed_spans, problems
+
+
+def count_action_markers(action_map, start_index=0):
+    """Returns (key markers, wait markers) at or after start_index."""
+    key_count = 0
+    wait_count = 0
+    for position, actions in (action_map or {}).items():
+        if position < start_index:
+            continue
+        for action_kind, _key_name in actions:
+            if action_kind == ACTION_WAIT:
+                wait_count += 1
+            else:
+                key_count += 1
+    return key_count, wait_count
+
+
+def has_action_markers(action_map, start_index=0):
+    """True when any key or wait marker sits at or after start_index."""
+    key_count, wait_count = count_action_markers(action_map, start_index)
+    return (key_count + wait_count) > 0
+
+
+def make_planning_format_map(format_map, action_map):
+    """The format map the edit planners look at. Every key or wait marker spot is
+    added as a spot with no style change, so a second revision pass or a select
+    and retype never touches a word at or next to a marker (Update #65). The
+    real format_map is never changed, because it also says which shortcuts to press."""
+    planning_map = dict(format_map)
+    for position in action_map or {}:
+        planning_map.setdefault(position, [])
+    return planning_map
+
+
 def parse_input_markers(raw_text, enable_pause_markers=True):
     """Parses every marker type in the input file in one place.
 
-    Returns (clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
+    Returns (clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers, action_map):
     - clean_text: the exact text that will be typed (no markers left in it).
     - protected_ranges: (start, end) ranges in clean_text for [[protected text]].
     - pause_map: {index into clean_text: seconds to wait before typing that
       character}. An index equal to len(clean_text) is a pause at the very end.
     - format_map: {index into clean_text: ["bold" or "italic", ...]} shortcuts
       to press before typing that character (see strip_format_markers()).
+    - action_map: {index into clean_text: [(ACTION_KEY, key name) or
+      (ACTION_WAIT, ""), ...]} for [[key:Name]] and [[wait]] (Update #65). An
+      index equal to len(clean_text) is after the last character.
     When enable_pause_markers is False, {{pause:N}} is left in the text and
     typed like any other text. Formatting markers are always removed from the
     text (the caller decides whether to press the shortcuts)."""
@@ -675,6 +827,23 @@ def parse_input_markers(raw_text, enable_pause_markers=True):
             shifted_pauses[new_position] = shifted_pauses.get(new_position, 0.0) + seconds
         stripped_pauses = shifted_pauses
 
+    # Key and wait markers (Update #65) go next. Pause and format positions so
+    # far point into the text with these markers still in it, so shift them too.
+    stripped, action_positions, action_removed_spans, _action_problems = strip_action_markers(stripped)
+    if action_removed_spans:
+        if stripped_pauses:
+            shifted_pauses = {}
+            for position, seconds in stripped_pauses.items():
+                new_position = shift_position_through_removals(position, action_removed_spans)
+                shifted_pauses[new_position] = shifted_pauses.get(new_position, 0.0) + seconds
+            stripped_pauses = shifted_pauses
+        if format_positions:
+            shifted_formats = {}
+            for position, kinds in format_positions.items():
+                new_position = shift_position_through_removals(position, action_removed_spans)
+                shifted_formats.setdefault(new_position, []).extend(kinds)
+            format_positions = shifted_formats
+
     clean_text, protected_ranges = parse_protected_spans(stripped)
 
     # Pause and format positions so far point into `stripped`, which still has
@@ -682,7 +851,8 @@ def parse_input_markers(raw_text, enable_pause_markers=True):
     # bracket characters sit before it, so it points into clean_text.
     pause_map = {}
     format_map = {}
-    if stripped_pauses or format_positions:
+    action_map = {}
+    if stripped_pauses or format_positions or action_positions:
         bracket_spans = []
         for match in PROTECTED_MARKER_PATTERN.finditer(stripped):
             bracket_spans.append((match.start(), match.start() + 2))
@@ -694,8 +864,14 @@ def parse_input_markers(raw_text, enable_pause_markers=True):
         for position, kinds in format_positions.items():
             clean_position = shift_position_through_removals(position, bracket_spans)
             format_map.setdefault(clean_position, []).extend(kinds)
+        for position, actions in action_positions.items():
+            clean_position = shift_position_through_removals(position, bracket_spans)
+            action_map.setdefault(clean_position, []).extend(actions)
 
-    return clean_text, protected_ranges, pause_map, normalize_format_map(format_map), invalid_markers, clamped_markers
+    return (
+        clean_text, protected_ranges, pause_map, normalize_format_map(format_map),
+        invalid_markers, clamped_markers, action_map,
+    )
 
 
 # --------------------------------------------
@@ -966,11 +1142,14 @@ class PreparedText:
     about one input file, after markers and smart fixes are handled.
     All positions refer to clean_text (the exact text that gets typed)."""
 
-    def __init__(self, clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers):
+    def __init__(self, clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers,
+                 action_map=None):
         self.clean_text = clean_text
         self.protected_ranges = protected_ranges
         self.pause_map = pause_map
         self.format_map = format_map    # {index in clean_text: ["bold" / "italic", ...]} (Update #29)
+        # {index in clean_text: [(ACTION_KEY, key name) or (ACTION_WAIT, ""), ...]} (Update #65)
+        self.action_map = action_map if action_map is not None else {}
         self.invalid_markers = invalid_markers
         self.clamped_markers = clamped_markers
         self.source_text = clean_text   # the text before smart fixes
@@ -1359,13 +1538,19 @@ def prepare_input_text(raw_text, settings):
     the markers, then (when smart fixes are on) applies them. This is the
     one place every caller goes through, so typing, estimates, and resume
     checks always agree on exactly what the text is."""
-    clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers = parse_input_markers(
+    (clean_text, protected_ranges, pause_map, format_map,
+     invalid_markers, clamped_markers, action_map) = parse_input_markers(
         raw_text, settings.get("enable_pause_markers", True)
     )
     if not settings.get("enable_format_markers", True):
         # The markers are still removed from the text, but no shortcuts get pressed.
         format_map = {}
-    prepared = PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
+    if not settings.get("enable_action_markers", True):
+        # The same for key and wait markers (Update #65): removed, never acted on.
+        action_map = {}
+    prepared = PreparedText(
+        clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers, action_map
+    )
 
     options = get_smart_fix_options(settings)
     if options is None or not clean_text:
@@ -1374,6 +1559,13 @@ def prepare_input_text(raw_text, settings):
     try:
         protection_mask = build_protection_mask(len(clean_text), protected_ranges)
         fixes = find_smart_fixes(clean_text, protection_mask, options)
+        if action_map:
+            # A key or wait marker splits the text into separate fields, so a fix
+            # never touches the text right next to one (Update #65).
+            fixes = [
+                fix for fix in fixes
+                if not any(position in action_map for position in range(fix.start, fix.end + 1))
+            ]
         if not fixes:
             return prepared
 
@@ -1398,15 +1590,23 @@ def prepare_input_text(raw_text, settings):
             new_position = map_position_through_fixes(format_position, fixes)
             new_format_map.setdefault(new_position, []).extend(kinds)
 
+        new_action_map = {}
+        for action_position, actions in action_map.items():
+            new_position = map_position_through_fixes(action_position, fixes)
+            new_action_map.setdefault(new_position, []).extend(actions)
+
         prepared.clean_text = new_text
         prepared.protected_ranges = new_ranges
         prepared.pause_map = new_pause_map
         prepared.format_map = normalize_format_map(new_format_map)
+        prepared.action_map = new_action_map
         prepared.fixes = fixes
         prepared.fix_actions = build_fix_actions(fixes, new_starts)
     except Exception:
         # Default to safety: if the fixer ever fails, type the original text.
-        return PreparedText(clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers)
+        return PreparedText(
+            clean_text, protected_ranges, pause_map, format_map, invalid_markers, clamped_markers, action_map
+        )
     return prepared
 
 
@@ -2699,16 +2899,27 @@ def _read_back_window_text(settings, expected):
     return found, ""
 
 
-def run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path):
+def run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path, action_map=None):
     """Called by type_text() after the last character. A preview run is always
     checked. A real run is checked only when 'Check typed text' is on. The result
     goes in state.text_check_results and the log gets only counts and line
-    numbers, never the text. Returns quietly if Stop was pressed."""
+    numbers, never the text. Returns quietly if Stop was pressed.
+    A real run that pressed key or wait markers cannot be checked: Enter, Tab, and
+    the arrow keys change what is on screen in ways the file does not say
+    (Update #65). A preview presses no keys, so it is still checked."""
     preview = bool(settings.get("preview_mode"))
     if not preview and not settings.get("check_typed_text", False):
         return
     expected = build_expected_typed_text(text, resume_from, left_mistake_map)
     if not normalize_for_check(expected):
+        return
+    if not preview and has_action_markers(action_map, resume_from):
+        reason = "this file has key or wait markers, which change what is on screen"
+        state.text_check_results.append({
+            "file": os.path.basename(input_path), "preview": False, "status": "unreadable", "reason": reason,
+            "expected_length": len(normalize_for_check(expected)), "difference_count": 0, "differences": [],
+        })
+        log_event("text_check", f"could not check: {reason}")
         return
     state.status = "Checking the typed text..."
     file_name = os.path.basename(input_path)
@@ -3445,6 +3656,90 @@ def _press_format_toggles(settings, kinds, active_formats):
 
 
 # --------------------------------------------
+# KEY AND WAIT MARKERS: acting on them (Update #65)
+# --------------------------------------------
+# type_text() calls _run_action_markers() at a spot that holds [[key:Name]] or
+# [[wait]] markers, after the usual pause and window-focus checks. Every key is
+# pressed only after a gate that waits while the run is paused or the locked
+# window is not in front, so a key can never go to the wrong window. A preview
+# run presses no keys and never waits, because it has no target window and the
+# person is only watching.
+def _send_action_key(settings, key_name):
+    """Presses one known key (or key pair, like Shift+Tab). In preview mode
+    nothing is pressed, because the key would go to whatever window has focus."""
+    if settings.get("preview_mode"):
+        return
+    # A key that Key Press Timing left down must come up before another key goes.
+    release_all_held_keys()
+    keys = ACTION_KEY_SPECS[key_name][1]
+    if len(keys) > 1:
+        pyautogui.hotkey(*keys)
+    else:
+        pyautogui.press(keys[0])
+
+
+def _wait_for_person(settings, index):
+    """Handles one [[wait]] marker: stops the run with the normal pause until
+    the person presses Resume Typing (or the Pause hotkey). The activity
+    auto-pause is not a problem, because it ignores mouse movement while the run
+    is paused, so the person can click around freely. Time spent waiting is left
+    out of the typing speed and time estimate like every other pause. A preview
+    run skips it. Returns (ok, seconds waited); ok is False when Stop was pressed."""
+    if settings.get("preview_mode"):
+        log_event("wait_marker", f"skipped in preview, before character {index}")
+        return True, 0.0
+    # If the person already paused the run, let that pause finish first, so it
+    # is not mistaken for the end of this wait.
+    if not _lookback_gate(settings, False):
+        return False, 0.0
+    log_event("wait_marker", f"waiting for you before character {index}")
+    state.status = ACTION_WAIT_STATUS_TEXT
+    pause_event.set()
+    run_on_main_thread(lambda: btn_pause.configure(text="Resume Typing"))
+    alert_auto_pause(settings)
+    wait_start = time.time()
+    while pause_event.is_set():
+        if stop_event.is_set():
+            return False, time.time() - wait_start
+        time.sleep(0.2)
+    waited = time.time() - wait_start
+    _note_blocked_time(waited)
+    log_event("wait_marker_end", f"continued after {waited:.0f}s")
+    state.status = "Typing..."
+    return True, waited
+
+
+def _run_action_markers(settings, actions, index):
+    """Runs the key and wait markers at one spot, in the order they were written.
+    `actions` is a list of (ACTION_KEY, key name) or (ACTION_WAIT, ""). Returns
+    (ok, seconds spent waiting for the person); ok is False when Stop was
+    pressed, so the caller must return right away."""
+    waited_total = 0.0
+    preview = bool(settings.get("preview_mode"))
+    for action_kind, key_name in actions:
+        if stop_event.is_set():
+            return False, waited_total
+        if action_kind == ACTION_WAIT:
+            ok, waited = _wait_for_person(settings, index)
+            waited_total += waited
+            if not ok:
+                return False, waited_total
+            continue
+        # Wait while paused or while the locked window is not in front.
+        if not _lookback_gate(settings, True):
+            return False, waited_total
+        paced_sleep(random.uniform(*ACTION_KEY_REACH_SECONDS))
+        if stop_event.is_set():
+            return False, waited_total
+        _send_action_key(settings, key_name)
+        key_label = ACTION_KEY_SPECS[key_name][0]
+        suffix = " (preview, not pressed)" if preview else ""
+        log_event("key_marker", f"{key_label} before character {index}{suffix}")
+        paced_sleep(random.uniform(*ACTION_KEY_SETTLE_SECONDS))
+    return not stop_event.is_set(), waited_total
+
+
+# --------------------------------------------
 # EDITOR TYPE (Update #58)
 # --------------------------------------------
 # Editors change what is typed into them. Google Docs and Word turn "1. " or
@@ -3634,7 +3929,7 @@ SCREEN_PAUSE_STATUS_TEXT = {
     SCREEN_STATE_SESSION: "Session changed \u2014 paused",
 }
 SCREEN_STATUS_PREFIXES = ("Screen locked", "Session changed")
-AUTO_PAUSE_STATUS_PREFIXES = ("Activity detected",) + SCREEN_STATUS_PREFIXES
+AUTO_PAUSE_STATUS_PREFIXES = ("Activity detected", ACTION_WAIT_STATUS_PREFIX) + SCREEN_STATUS_PREFIXES
 DESKTOP_SWITCHDESKTOP = 0x0100  # Windows access right to the input desktop
 ERROR_ACCESS_DENIED = 5
 WTS_CURRENT_SESSION = 0xFFFFFFFF
@@ -5607,22 +5902,24 @@ def _capital_slip_possible(text, idx, protection_mask):
     return not protection_mask[idx - 1]
 
 
-def _simulate_capital_slip_typo(settings, char, text, idx, protection_mask, use_extra_typos):
+def _simulate_capital_slip_typo(settings, char, text, idx, protection_mask, use_extra_typos, walls=()):
     """Simulates a capital letter slip (Update #44): the letter comes out as a
     capital, the typist notices, backspaces it, and the caller then types the
     correct lowercase letter. Timing matches the adjacent-key typo."""
     _simulate_adjacent_key_typo(
-        settings, char, text, idx, protection_mask, use_extra_typos, capital_slip=True
+        settings, char, text, idx, protection_mask, use_extra_typos, capital_slip=True, walls=walls
     )
 
 
 def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_extra_typos,
-                                capital_slip=False):
+                                capital_slip=False, walls=()):
     """Simulates an adjacent-key typo on the chosen keyboard layout (Update #62).
     When use_extra_typos is False, preserves the original quick wrong-and-backspace behavior.
     When use_extra_typos is True, types 1-3 lookahead characters before pausing and backspacing.
     When capital_slip is True, the wrong character is the same letter as a capital
-    instead of a neighboring key (Update #44)."""
+    instead of a neighboring key (Update #44).
+    `walls` holds the spots of key and wait markers (Update #65): the lookahead
+    never reaches a character after one, so no typo is typed across a marker."""
     if capital_slip:
         wrong_char = char.upper()
         slip_name = "capital slip"
@@ -5648,7 +5945,7 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
     max_k = min(3, len(text) - (idx + 1))
     for offset in range(1, max_k + 1):
         pos = idx + offset
-        if protection_mask[pos] or text[pos] == "\n":
+        if protection_mask[pos] or text[pos] == "\n" or pos in walls:
             break
         lookahead.append(text[pos])
 
@@ -5674,10 +5971,12 @@ def _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, use_
     log_event("typo", f"{slip_name}: typed '{wrong_char}{lookahead_str}', backspaced to retype '{char}'")
 
 
-def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
+def _simulate_swapped_letter_typo(settings, text, idx, protection_mask, walls=()):
     """Simulates swapped adjacent letters inside a word (e.g. 'teh' for 'the').
     Types c2 then c1, followed by 1-3 lookahead characters, pauses, then backspaces
-    all of them so the caller loop can retype the characters in correct order."""
+    all of them so the caller loop can retype the characters in correct order.
+    `walls` holds the spots of key and wait markers (Update #65): the caller never
+    swaps across one, and the lookahead stops at one."""
     c1 = text[idx]
     c2 = text[idx + 1]
 
@@ -5685,7 +5984,7 @@ def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
     max_k = min(3, len(text) - (idx + 2))
     for offset in range(1, max_k + 1):
         pos = idx + 1 + offset
-        if protection_mask[pos] or text[pos] == "\n":
+        if protection_mask[pos] or text[pos] == "\n" or pos in walls:
             break
         lookahead.append(text[pos])
 
@@ -5713,19 +6012,20 @@ def _simulate_swapped_letter_typo(settings, text, idx, protection_mask):
     log_event("typo", f"swapped letters: typed '{c2}{c1}{lookahead_str}', backspaced to retype '{c1}{c2}'")
 
 
-def _simulate_doubled_letter_typo(settings, text, idx, protection_mask):
+def _simulate_doubled_letter_typo(settings, text, idx, protection_mask, walls=()):
     """Simulates an accidental doubled letter ('ttthe' style repeat).
     Types the letter twice, follows with 0-3 lookahead characters, pauses,
     and backspaces the lookahead characters plus the single extra duplicate letter.
     Leaves the original intended letter on screen and returns True so caller
-    knows not to type char a second time."""
+    knows not to type char a second time. `walls` holds the spots of key and wait
+    markers (Update #65): the lookahead stops at one."""
     char = text[idx]
 
     lookahead = []
     max_k = min(3, len(text) - (idx + 1))
     for offset in range(1, max_k + 1):
         pos = idx + offset
-        if protection_mask[pos] or text[pos] == "\n":
+        if protection_mask[pos] or text[pos] == "\n" or pos in walls:
             break
         lookahead.append(text[pos])
 
@@ -5754,15 +6054,17 @@ def _simulate_doubled_letter_typo(settings, text, idx, protection_mask):
     return True
 
 
-def _simulate_missed_space_typo(settings, text, idx, protection_mask):
+def _simulate_missed_space_typo(settings, text, idx, protection_mask, walls=()):
     """Simulates a missed space where two words run together (e.g. 'forthe').
     Does not type the space; instead types 1-3 characters of the next word,
-    pauses, and backspaces them so the caller loop can type the space normally."""
+    pauses, and backspaces them so the caller loop can type the space normally.
+    `walls` holds the spots of key and wait markers (Update #65): the lookahead
+    stops at one."""
     lookahead = []
     max_k = min(3, len(text) - (idx + 1))
     for offset in range(1, max_k + 1):
         pos = idx + offset
-        if protection_mask[pos] or text[pos] in ("\n", " "):
+        if protection_mask[pos] or text[pos] in ("\n", " ") or pos in walls:
             break
         lookahead.append(text[pos])
 
@@ -6265,10 +6567,24 @@ def type_text(settings, is_batch=False, is_last=True):
     protected_ranges = prepared.protected_ranges
     pause_map = prepared.pause_map
     format_map = prepared.format_map
+    action_map = prepared.action_map
+    # Key and wait markers (Update #65). The edit planners and the typo helpers
+    # treat every marker spot as a wall they may not move, skip, or reach across.
+    # planning_format_map is only for the planners; format_map itself is never
+    # changed, because it says which shortcuts to press.
+    action_walls = set(action_map)
+    planning_format_map = make_planning_format_map(format_map, action_map)
     fix_actions = prepared.fix_actions
     state.clean_text = text  # stored so stop_typing() can compute the prefix hash
     protection_mask = build_protection_mask(len(text), protected_ranges)
     paraphrase_map = precompute_paragraph_paraphrases(text, protected_ranges)
+    if action_walls:
+        # No paraphrase draft is typed over a sentence that holds a key or wait
+        # marker, so a draft never reaches across a field boundary (Update #65).
+        paraphrase_map = {
+            start: item for start, item in paraphrase_map.items()
+            if not any(position in action_walls for position in range(start, item[0] + 1))
+        }
 
     resume_from = min(settings.get("resume_from", 0), len(text))
 
@@ -6399,7 +6715,7 @@ def type_text(settings, is_batch=False, is_last=True):
             # those spots are handled like pause markers.
             left_mistake_map = plan_left_mistakes(
                 text, protection_mask, settings, resume_from,
-                set(pause_map) | set(format_map), set(fix_actions.keys())
+                set(pause_map) | set(format_map) | action_walls, set(fix_actions.keys())
             )
         except Exception:
             left_mistake_map = {}
@@ -6452,7 +6768,7 @@ def type_text(settings, is_batch=False, is_last=True):
         try:
             lookback_swaps, lookback_fixes = plan_lookback_edits(
                 text, protection_mask, settings, resume_from,
-                format_map, left_mistake_map, fix_actions, pause_map, cluster_flags
+                planning_format_map, left_mistake_map, fix_actions, pause_map, cluster_flags
             )
         except Exception:
             lookback_swaps = {}
@@ -6470,7 +6786,7 @@ def type_text(settings, is_batch=False, is_last=True):
         try:
             select_retype_plan = plan_select_retypes(
                 text, protection_mask, settings, resume_from,
-                format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps, cluster_flags
+                planning_format_map, left_mistake_map, fix_actions, pause_map, lookback_swaps, cluster_flags
             )
         except Exception:
             select_retype_plan = {}
@@ -6855,6 +7171,31 @@ def type_text(settings, is_batch=False, is_last=True):
             state.status = "Typing..."
 
         # --------------------------------
+        # KEY AND WAIT MARKERS ([[key:Tab]] / [[wait]], Update #65)
+        # Run before this character is typed, after any wait and the focus
+        # check. Every marker spot is a wall: typos, reworks, and the other
+        # edits never cross it (see action_walls and planning_format_map), and
+        # the rework buffer is cleared here so a later rework can never delete
+        # text from before the key press. A wait hands control to the person
+        # until they press Resume; the focus gate then makes sure the right
+        # window is in front before typing goes on. Only the spot and the key
+        # name (never the text) go in the log.
+        # --------------------------------
+        marker_actions = action_map.get(idx)
+        if marker_actions:
+            actions_ok, waited_seconds = _run_action_markers(settings, marker_actions, idx)
+            if not actions_ok:
+                return
+            if waited_seconds > 0:
+                note_warm_up(waited_seconds, "a wait marker", idx)
+                if not _lookback_gate(settings, True):
+                    return
+            state.status = "Typing..."
+            recent_typed_buffer = ""
+            rework_hold = False
+            prev_char = ""
+
+        # --------------------------------
         # EDITOR TYPE (Update #58)
         # Runs at the start of every line, after any wait and the focus check,
         # so the keys go to the right window.
@@ -6879,7 +7220,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     if (editor_marker_span_is_clear(
                             idx, marker_span,
                             (format_map, left_mistake_map, lookback_swaps, select_retype_plan, fix_actions))
-                            and editor_marker_span_is_clear(idx + 1, marker_span - 1, (pause_map,))):
+                            and editor_marker_span_is_clear(idx + 1, marker_span - 1, (pause_map, action_map))):
                         _run_editor_list_marker(settings, editor_lead, editor_marker, min_delay, max_delay)
                         left_skip_until = idx + marker_span
                         state.chars_typed += marker_span
@@ -7165,7 +7506,7 @@ def type_text(settings, is_batch=False, is_last=True):
                     # Capital letter slip (Update #44): takes the place of one
                     # regular typo, so the typo count does not change.
                     _simulate_capital_slip_typo(
-                        settings, char, text, idx, protection_mask, use_extra_typos
+                        settings, char, text, idx, protection_mask, use_extra_typos, action_walls
                     )
                     typo_corrected = True
                 elif not use_extra_typos:
@@ -7180,7 +7521,8 @@ def type_text(settings, is_batch=False, is_last=True):
                             and idx < len(text) - 1
                             and text[idx + 1].isalpha()
                             and not protection_mask[idx + 1]
-                            and char != text[idx + 1]):
+                            and char != text[idx + 1]
+                            and (idx + 1) not in action_walls):
                         candidates.append("swap")
                     if char.isalpha() and idx not in format_map:
                         # (not at a format shortcut: the doubled letter stays on screen)
@@ -7188,19 +7530,24 @@ def type_text(settings, is_batch=False, is_last=True):
                     if (char == " "
                             and idx > 0 and text[idx - 1].isalpha()
                             and idx + 1 < len(text) and text[idx + 1].isalpha()
-                            and not protection_mask[idx + 1]):
+                            and not protection_mask[idx + 1]
+                            and (idx + 1) not in action_walls):
                         candidates.append("missed_space")
 
                     if candidates:
                         chosen_typo = random.choice(candidates)
                         if chosen_typo == "adjacent":
-                            _simulate_adjacent_key_typo(settings, char, text, idx, protection_mask, True)
+                            _simulate_adjacent_key_typo(
+                                settings, char, text, idx, protection_mask, True, walls=action_walls
+                            )
                         elif chosen_typo == "swap":
-                            _simulate_swapped_letter_typo(settings, text, idx, protection_mask)
+                            _simulate_swapped_letter_typo(settings, text, idx, protection_mask, action_walls)
                         elif chosen_typo == "double":
-                            char_already_typed = _simulate_doubled_letter_typo(settings, text, idx, protection_mask)
+                            char_already_typed = _simulate_doubled_letter_typo(
+                                settings, text, idx, protection_mask, action_walls
+                            )
                         elif chosen_typo == "missed_space":
-                            _simulate_missed_space_typo(settings, text, idx, protection_mask)
+                            _simulate_missed_space_typo(settings, text, idx, protection_mask, action_walls)
                         typo_corrected = True
 
         if stop_event.is_set():
@@ -7306,6 +7653,7 @@ def type_text(settings, is_batch=False, is_last=True):
             if (key_overlap_on and idx + 1 < len(text)
                     and (idx + 1) not in format_map
                     and (idx + 1) not in pause_map
+                    and (idx + 1) not in action_map
                     and (idx + 1) not in left_mistake_map):
                 keep_key_down = should_overlap_keys(char, text[idx + 1], delay, key_overlap_chance)
             held_seconds = _send_char(settings, char, allow_overlap=key_overlap_on, keep_down=keep_key_down)
@@ -7379,6 +7727,15 @@ def type_text(settings, is_batch=False, is_last=True):
     if trailing_format and not _press_format_toggles(settings, trailing_format, active_formats):
         return
 
+    # Key and wait markers at the very end of the file come after the last
+    # character (Update #65).
+    trailing_actions = action_map.get(len(text))
+    if trailing_actions:
+        trailing_ok, _trailing_waited = _run_action_markers(settings, trailing_actions, len(text))
+        if not trailing_ok:
+            return
+        state.status = "Typing..."
+
     # A {{pause:N}} marker at the very end of the file waits after the last character.
     trailing_pause = pause_map.get(len(text))
     if trailing_pause:
@@ -7387,7 +7744,7 @@ def type_text(settings, is_batch=False, is_last=True):
             return
 
     # Check that what is on screen matches what was meant to be typed (Update #51).
-    run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path)
+    run_typed_text_check(settings, text, resume_from, left_mistake_map, input_path, action_map)
     if stop_event.is_set():
         return
 
@@ -7421,6 +7778,23 @@ def estimate_format_toggle_seconds(prepared, start_index=0):
     start_index onward. Each press takes about a third of a second."""
     press_count = sum(len(kinds) for index, kinds in prepared.format_map.items() if index >= start_index)
     return press_count * FORMAT_TOGGLE_ESTIMATE_SECONDS
+
+
+def estimate_action_marker_seconds(prepared, start_index=0):
+    """Rough time for the [[key:...]] markers (Update #65) from start_index
+    onward. A [[wait]] is not counted: how long the person takes is unknown."""
+    key_count, _wait_count = count_action_markers(prepared.action_map, start_index)
+    return key_count * ACTION_KEY_ESTIMATE_SECONDS
+
+
+def describe_wait_markers(prepared, start_index=0):
+    """A short note for the estimate line about [[wait]] markers, or an empty
+    string when there are none. Their time is not in the estimate."""
+    _key_count, wait_count = count_action_markers(prepared.action_map, start_index)
+    if wait_count <= 0:
+        return ""
+    noun = "wait" if wait_count == 1 else "waits"
+    return f" \u2022 {wait_count:,} {noun} for you (not in the time)"
 
 
 def estimate_typing_time(text, settings, protection_mask=None, marker_pause_seconds=0.0, extra_seconds=0.0,
@@ -7938,6 +8312,7 @@ def validate_settings():
         editor_mode_var.set(editor_mode)
     enable_pause_markers = bool(enable_pause_markers_var.get())
     enable_format_markers = bool(enable_format_markers_var.get())
+    enable_action_markers = bool(enable_action_markers_var.get())
 
     enable_smart_fixes = bool(enable_smart_fixes_var.get())
     smart_fix_spacing = bool(smart_fix_spacing_var.get())
@@ -8099,6 +8474,7 @@ def validate_settings():
         "target_seconds": target_seconds,
         "enable_pause_markers": enable_pause_markers,
         "enable_format_markers": enable_format_markers,
+        "enable_action_markers": enable_action_markers,
         "enable_smart_fixes": enable_smart_fixes,
         "smart_fix_spacing": smart_fix_spacing,
         "smart_fix_punctuation": smart_fix_punctuation,
@@ -8187,6 +8563,7 @@ def estimate_total_active_seconds(files, settings):
         )
         total_seconds += estimate_smart_fix_seconds(prepared, settings, resume_chars)
         total_seconds += estimate_format_toggle_seconds(prepared, resume_chars)
+        total_seconds += estimate_action_marker_seconds(prepared, resume_chars)
     return total_seconds
 
 
@@ -8229,6 +8606,7 @@ def preview_estimate():
         total_chars = 0
         total_seconds = 0.0
         total_fixes = 0
+        total_waits = 0
         for fpath in queue_files:
             try:
                 text = read_input_file_text(fpath)
@@ -8247,7 +8625,9 @@ def preview_estimate():
             remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
             marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
             extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
-                             + estimate_format_toggle_seconds(prepared, resume_chars or 0))
+                             + estimate_format_toggle_seconds(prepared, resume_chars or 0)
+                             + estimate_action_marker_seconds(prepared, resume_chars or 0))
+            total_waits += count_action_markers(prepared.action_map, resume_chars or 0)[1]
             w_count, c_count, est_sec = estimate_typing_time(
                 remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
             )
@@ -8265,6 +8645,9 @@ def preview_estimate():
         est_mins = int(total_seconds // 60)
         est_secs = int(total_seconds % 60)
         fixes_note = f" \u2022 {total_fixes:,} smart fixes" if total_fixes else ""
+        if total_waits:
+            noun = "wait" if total_waits == 1 else "waits"
+            fixes_note += f" \u2022 {total_waits:,} {noun} for you (not in the time)"
         preview_result_var.set(
             f"Queue ({len(queue_files)} files): ~{total_words:,} words \u2022 {total_chars:,} characters{fixes_note} \u2022 "
             f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
@@ -8293,7 +8676,8 @@ def preview_estimate():
     remaining_mask = protection_mask[resume_chars:] if resume_chars else protection_mask
     marker_seconds = sum(secs for pos, secs in pause_map.items() if pos >= (resume_chars or 0))
     extra_seconds = (estimate_smart_fix_seconds(prepared, settings, resume_chars or 0)
-                     + estimate_format_toggle_seconds(prepared, resume_chars or 0))
+                     + estimate_format_toggle_seconds(prepared, resume_chars or 0)
+                     + estimate_action_marker_seconds(prepared, resume_chars or 0))
 
     word_count, char_count, est_seconds = estimate_typing_time(
         remaining_text, settings, remaining_mask, marker_seconds, extra_seconds
@@ -8302,6 +8686,7 @@ def preview_estimate():
     est_secs = int(est_seconds % 60)
     resume_note = " remaining (resume point saved)" if resume_chars else ""
     fixes_note = f" \u2022 {len(prepared.fixes):,} smart fixes" if prepared.fixes else ""
+    fixes_note += describe_wait_markers(prepared, resume_chars or 0)
     preview_result_var.set(
         f"{word_count:,} words \u2022 {char_count:,} characters{resume_note}{fixes_note} \u2022 "
         f"Estimated time: ~{est_mins}m {est_secs}s (rough estimate)"
@@ -8591,6 +8976,42 @@ def confirm_format_marker_warnings(files, settings):
     )
 
 
+def confirm_action_marker_warnings(files, settings):
+    """Update #65: checks every file about to be typed for [[key:...]] markers
+    with a key name that is not known (a typo such as [[key:Tabb]]), BEFORE typing
+    starts. Such a marker is not removed: it is typed as normal text, which is
+    almost never what the person wanted. Returns True if it is OK to start, False
+    if they chose to go fix the file first."""
+    if not settings.get("enable_action_markers", True):
+        return True
+
+    problems = []
+    for fpath in files:
+        try:
+            raw_text = read_input_file_text(fpath)
+        except OSError:
+            continue  # type_text() already reports unreadable files
+        _stripped, _positions, _spans, file_problems = strip_action_markers(raw_text)
+        file_name = os.path.basename(fpath)
+        for problem in file_problems[:5]:
+            problems.append(f"{file_name}: {problem}")
+        if len(file_problems) > 5:
+            problems.append(f"{file_name}: ...and {len(file_problems) - 5} more")
+
+    if not problems:
+        return True
+
+    key_names = ", ".join(spec[0] for spec in ACTION_KEY_SPECS.values())
+    return messagebox.askokcancel(
+        "Key Marker Warning",
+        "Some key markers need attention:\n\n"
+        + "\n".join(problems)
+        + "\n\nKnown keys: " + key_names + ". A marker looks like [[key:Tab]], and [[wait]] "
+        "stops until you press Resume.\n\n"
+        "Click OK to start anyway, or Cancel to fix the file first.",
+    )
+
+
 def start_typing():
     if state.is_running:
         messagebox.showinfo("Already Running", "The typer is already running.")
@@ -8615,6 +9036,9 @@ def start_typing():
         return
 
     if not confirm_format_marker_warnings(files_to_run, settings):
+        return
+
+    if not confirm_action_marker_warnings(files_to_run, settings):
         return
 
     if not confirm_target_time_plan(files_to_run, settings):
@@ -9937,6 +10361,7 @@ def get_current_settings_snapshot():
         "target_time_minutes": target_minutes_var.get(),
         "enable_pause_markers": enable_pause_markers_var.get(),
         "enable_format_markers": enable_format_markers_var.get(),
+        "enable_action_markers": enable_action_markers_var.get(),
         "enable_smart_fixes": enable_smart_fixes_var.get(),
         "smart_fix_spacing": smart_fix_spacing_var.get(),
         "smart_fix_punctuation": smart_fix_punctuation_var.get(),
@@ -10046,6 +10471,11 @@ def apply_settings_snapshot(data, include_files=True, rebind_hotkeys=True):
     target_minutes_var.set(str(data.get("target_time_minutes", "0")))
     enable_pause_markers_var.set(data.get("enable_pause_markers", True))
     enable_format_markers_var.set(bool(data.get("enable_format_markers", True)))
+    # Whether a file may press keys is a choice for this computer, so shared
+    # profiles never carry it and loading one never changes it (Update #65).
+    # Only the saved last-used settings set it. Older files load as on.
+    if include_files:
+        enable_action_markers_var.set(bool(data.get("enable_action_markers", True)))
     enable_smart_fixes_var.set(data.get("enable_smart_fixes", False))
     smart_fix_spacing_var.set(data.get("smart_fix_spacing", True))
     smart_fix_punctuation_var.set(data.get("smart_fix_punctuation", True))
@@ -10120,6 +10550,7 @@ PROFILE_LOCAL_ONLY_KEYS = (
     "first_run_guide_done",
     "keyboard_layout",
     "theme",
+    "enable_action_markers",
 )
 
 
@@ -10206,6 +10637,7 @@ AUTO_PROFILE_KEEP_KEYS = (
     "view_mode",
     "first_run_guide_done",
     "keyboard_layout",
+    "enable_action_markers",
 )
 
 
@@ -12420,6 +12852,7 @@ sentence_pause_min_var = tk.StringVar(value="5")
 sentence_pause_max_var = tk.StringVar(value="7")
 enable_pause_markers_var = tk.BooleanVar(value=True)
 enable_format_markers_var = tk.BooleanVar(value=True)
+enable_action_markers_var = tk.BooleanVar(value=True)
 
 enable_mistakes_var = tk.BooleanVar(value=True)
 mistake_min_var = tk.StringVar(value="100")
@@ -12539,6 +12972,7 @@ SECTION_RESET_VARS = {
     "Essay Pace": [enable_essay_pace_var, essay_pace_strength_var],
     "Warm-Up After Breaks": [enable_warmup_var, warmup_strength_var],
     "Formatting Markers": [enable_format_markers_var],
+    "Key & Wait Markers": [enable_action_markers_var],
     "Character Typos": [
         enable_typos_var,
         typo_chance_var,
@@ -13163,6 +13597,19 @@ btn_skip_break.pack(side="left", expand=True, padx=(8, 0), fill="x")
 # Each entry: version, date (None if it was never written down), a short
 # title, and a list of plain-English change lines.
 VERSION_HISTORY = [
+    {
+        "version": "5.38.0",
+        "date": "2026-11-19",
+        "title": "Key and wait markers",
+        "changes": [
+            "Added: key markers. Write [[key:Tab]], [[key:Enter]], [[key:Shift+Tab]], [[key:Escape]], an arrow key ([[key:Up]], [[key:Down]], [[key:Left]], [[key:Right]]), [[key:Home]], [[key:End]], [[key:PageUp]], or [[key:PageDown]] in a file and Amanuensis presses that key at that exact spot, so one file can fill in several form fields. Capitals and spaces do not matter. The marker is never typed.",
+            "Added: a [[wait]] marker. Typing stops until you press Resume Typing (or the Pause hotkey), so you can log in or click a field in the middle of a file. Moving the mouse during a wait does not pause anything extra, the wait is left out of the typing speed, and the beep for pauses covers it if you turned that on.",
+            "Added: a Key & Wait Markers card on the Speed tab with one new setting, on by default. It stays on this computer: shared profiles, Auto Profiles, and starter profiles never carry or change it. Turned off, the markers are removed but nothing is pressed. The card has a Reset This Section button.",
+            "Modified: typos, reworks, and the other planned edits never move, skip, or reach across a marker, and Smart Text Fixes never change the text next to one. A preview run presses no keys and never waits.",
+            "Modified: the time estimate counts key markers and lists the waits separately. A real run that pressed keys cannot use Check Typed Text, because Enter and Tab change what is on screen, and the report says so. A key name that is not known is typed as normal text, and you get a warning before typing starts.",
+            "Notes: [[wait]] and [[key:...]] are reserved, so protected text cannot be exactly those. When resuming, markers at the exact spot where typing stopped run again, so click where typing should continue. No new packages.",
+        ],
+    },
     {
         "version": "5.37.1",
         "date": "2026-11-16",
@@ -13962,6 +14409,7 @@ frame_writing_habits = make_modern_card(tab_speed, "Writing Habits")
 frame_essay_pace = make_modern_card(tab_speed, "Essay Pace")
 frame_warmup = make_modern_card(tab_speed, "Warm-Up After Breaks")
 frame_format_markers = make_modern_card(tab_speed, "Formatting Markers")
+frame_action_markers = make_modern_card(tab_speed, "Key & Wait Markers")
 
 # --- Tab: Mistakes (typos, reworks, and research breaks) ---
 frame_typos = make_modern_card(tab_mistakes, "Character Typos")
@@ -14712,6 +15160,29 @@ modern_label(
     wraplength=420,
 ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+# --- Key and wait markers (Update #65) ---
+modern_checkbox(
+    frame_action_markers, "Press keys and wait for me when the file says so", enable_action_markers_var
+).grid(row=0, column=0, sticky="w")
+modern_label(
+    frame_action_markers,
+    "Write [[key:Tab]] or [[key:Enter]] in the file and Amanuensis presses that key "
+    "at that spot, so it can move between form fields. Other keys: Shift+Tab, Escape, "
+    "Up, Down, Left, Right, Home, End, PageUp, PageDown. Write [[wait]] and typing "
+    "stops until you press Resume Typing, so you can log in or click a field in the "
+    "middle of a file. The markers are never typed.\n\n"
+    "Turn this off to remove the markers without pressing anything. It stays on this "
+    "computer: shared profiles never change it.\n\n"
+    "A key name that is not known is typed as normal text, and you get a warning "
+    "first. [[wait]] and [[key:...]] are reserved, so protected text cannot be "
+    "exactly those. Typos and reworks never cross a marker. A preview presses no keys "
+    "and never waits. When resuming, click where typing should continue: markers at "
+    "that exact spot run again. The Typed Text Check cannot check a run that pressed "
+    "keys, because Enter and Tab change what is on screen.",
+    kind="muted",
+    wraplength=420,
+).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
 # --- Character typos ---
 modern_checkbox(frame_typos, "Enable adjacent-key typos", enable_typos_var).grid(
     row=0, column=0, columnspan=2, sticky="w"
@@ -15330,6 +15801,7 @@ SECTION_CARDS = {
     "Essay Pace": frame_essay_pace,
     "Warm-Up After Breaks": frame_warmup,
     "Formatting Markers": frame_format_markers,
+    "Key & Wait Markers": frame_action_markers,
     "Character Typos": frame_typos,
     "Sentence Reworks & Breaks": frame_mistakes,
     "Second Revision Pass": frame_lookback,
